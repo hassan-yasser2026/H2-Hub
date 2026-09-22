@@ -1,0 +1,15 @@
+node_modules
+dist
+.git
+.gradle
+.idea
+app/build
+build
+coverage
+.env
+.env.*
+!.env.example
+*.jks
+debug.keystore
+local.properties
+*.log
