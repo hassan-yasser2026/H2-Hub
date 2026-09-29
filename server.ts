@@ -1,9 +1,9 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
-import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import multer from "multer";
 
 dotenv.config();
 
@@ -26,6 +26,211 @@ app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
+});
+
+const quranAudioUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, callback) => {
+    if (!file.mimetype.startsWith("audio/")) {
+      callback(new Error("Audio file must use an audio MIME type."));
+      return;
+    }
+    callback(null, true);
+  },
+});
+
+const parseQuranAudio = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  quranAudioUpload.single("audio")(req, res, (error) => {
+    if (error instanceof multer.MulterError) {
+      const status = error.code === "LIMIT_FILE_SIZE" ? 413 : 400;
+      res.status(status).json({ error: error.message });
+      return;
+    }
+    if (error) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    next();
+  });
+};
+
+type QuranSurahResponse = {
+  data?: {
+    ayahs?: Array<{ text?: string; numberInSurah?: number }>;
+  };
+};
+
+const quranSurahCache = new Map<number, { expiresAt: number; ayahs: string[] }>();
+
+async function getQuranAyah(surahNumber: number, ayahNumber: number): Promise<string> {
+  const cached = quranSurahCache.get(surahNumber);
+  let ayahs = cached && cached.expiresAt > Date.now() ? cached.ayahs : undefined;
+
+  if (!ayahs) {
+    const response = await fetch(`https://api.alquran.cloud/v1/surah/${surahNumber}`);
+    if (!response.ok) {
+      throw new Error(`Quran source returned HTTP ${response.status}.`);
+    }
+    const body = (await response.json()) as QuranSurahResponse;
+    ayahs = body.data?.ayahs?.map((ayah) => ayah.text?.trim() ?? "");
+    if (!ayahs || ayahs.some((ayah) => !ayah)) {
+      throw new Error("Quran source returned an incomplete surah.");
+    }
+    quranSurahCache.set(surahNumber, {
+      expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+      ayahs,
+    });
+  }
+
+  const ayahText = ayahs[ayahNumber - 1];
+  if (!ayahText) {
+    throw new RangeError("Ayah number is outside the selected surah.");
+  }
+  return ayahText;
+}
+
+app.post("/api/quran/check", parseQuranAudio, async (req, res) => {
+  const surahNumber = Number(req.body.surahNumber);
+  const ayahNumber = Number(req.body.ayahNumber);
+  const audio = req.file;
+
+  if (!Number.isInteger(surahNumber) || surahNumber < 1 || surahNumber > 114) {
+    return res.status(400).json({ error: "surahNumber must be an integer from 1 to 114." });
+  }
+  if (!Number.isInteger(ayahNumber) || ayahNumber < 1) {
+    return res.status(400).json({ error: "ayahNumber must be a positive integer." });
+  }
+  if (!audio || audio.size === 0) {
+    return res.status(400).json({ error: "An audio file is required in the audio field." });
+  }
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(503).json({ error: "Quran recitation checking is not configured on the server." });
+  }
+
+  try {
+    const ayahText = await getQuranAyah(surahNumber, ayahNumber);
+    const audioData = audio.buffer.toString("base64");
+    const transcriptionResponse = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: [{
+        role: "user",
+        parts: [
+          { text: "Transcribe only the Arabic words actually recited in this audio. Do not correct, complete, or infer missing Quranic words. If speech is unclear, mark the unclear words as [غير واضح]. Return only the transcription." },
+          { inlineData: { mimeType: audio.mimetype, data: audioData } },
+        ],
+      }],
+      config: { temperature: 0 },
+    });
+    const transcript = transcriptionResponse.text?.trim();
+    if (!transcript) {
+      return res.status(422).json({ error: "تعذر تفريغ التسجيل الصوتي بوضوح. حاول التسجيل مرة أخرى." });
+    }
+
+    const assessmentResponse = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: [{
+        role: "user",
+        parts: [
+          {
+            text: `Compare this Arabic speech transcription with the exact Quran ayah. Assess audio quality from the attached recording itself, including clarity and disruptive noise. Report only clear differences; do not invent pronunciation or tajweed errors.
+Surah number: ${surahNumber}
+Ayah number: ${ayahNumber}
+Original ayah: ${ayahText}
+Transcription: ${transcript}
+
+Write in Arabic. Give audioQuality as exactly one of: "واضح", "فيه مشاكل", "محتاج تحسين".
+Give performance as exactly one of: "ممتاز", "جيد", "محتاج تدريب".
+List at most 3 short, specific tajweedTips; only give advice supported by the recording and transcription.
+Return a JSON object with: mistakes (array of objects with heard and correct strings), audioQuality, performance, tajweedTips (array of strings).`,
+          },
+          { inlineData: { mimeType: audio.mimetype, data: audioData } },
+        ],
+      }],
+      config: {
+        temperature: 0.2,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            mistakes: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  heard: { type: Type.STRING },
+                  correct: { type: Type.STRING },
+                },
+                required: ["heard", "correct"],
+              },
+            },
+            audioQuality: {
+              type: Type.STRING,
+              enum: ["واضح", "فيه مشاكل", "محتاج تحسين"],
+            },
+            performance: {
+              type: Type.STRING,
+              enum: ["ممتاز", "جيد", "محتاج تدريب"],
+            },
+            tajweedTips: { type: Type.ARRAY, items: { type: Type.STRING } },
+          },
+          required: ["mistakes", "audioQuality", "performance", "tajweedTips"],
+        },
+      },
+    });
+
+    const assessmentText = assessmentResponse.text;
+    if (!assessmentText) {
+      throw new Error("Gemini returned an empty Quran assessment.");
+    }
+    const assessment = JSON.parse(assessmentText) as {
+      mistakes: Array<{ heard: string; correct: string }>;
+      audioQuality: string;
+      performance: string;
+      tajweedTips: string[];
+    };
+    const allowedAudioQuality = new Set(["واضح", "فيه مشاكل", "محتاج تحسين"]);
+    const allowedPerformance = new Set(["ممتاز", "جيد", "محتاج تدريب"]);
+    if (
+      !Array.isArray(assessment.mistakes) ||
+      !Array.isArray(assessment.tajweedTips) ||
+      !allowedAudioQuality.has(assessment.audioQuality) ||
+      !allowedPerformance.has(assessment.performance)
+    ) {
+      throw new Error("Gemini returned an invalid Quran assessment.");
+    }
+
+    const mistakes = assessment.mistakes
+      .filter((mistake) => typeof mistake.heard === "string" && typeof mistake.correct === "string")
+      .slice(0, 3);
+    const tajweedTips = assessment.tajweedTips
+      .filter((tip): tip is string => typeof tip === "string" && tip.trim().length > 0)
+      .slice(0, 3);
+    const mistakeSummary = mistakes.length
+      ? `الكلمات التي تحتاج مراجعة: ${mistakes.map(({ heard, correct }) => `(${heard} ← ${correct})`).join("، ")}`
+      : "ما شاء الله، لم تظهر كلمات مخالفة للآية 🙂";
+    const tipsSummary = tajweedTips.length
+      ? `نصائح التجويد: ${tajweedTips.join(" • ")}`
+      : "استمر على القراءة المتأنية 🐥";
+    const summary = [
+      `جودة الصوت: ${assessment.audioQuality} 🥹`,
+      `الأداء العام: ${assessment.performance} ${assessment.performance === "ممتاز" ? "🙂" : "🙃"}`,
+      mistakeSummary,
+      tipsSummary,
+    ].join("\n");
+
+    return res.json({
+      transcript,
+      mistakes,
+      audioQuality: assessment.audioQuality,
+      performance: assessment.performance,
+      tajweedTips,
+      summary,
+    });
+  } catch (error) {
+    console.error("Quran recitation check failed:", error);
+    return res.status(502).json({ error: "تعذر تحليل التلاوة حالياً. حاول مرة أخرى بعد قليل." });
+  }
 });
 
 app.post("/v1beta/models/*", async (req, res) => {
@@ -563,25 +768,6 @@ Provide ONLY the raw JSON list. Do not surround with markdown codes.`;
   }
 });
 
-// Vite server integrations
-async function startServer() {
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
-  }
-
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server is running on port ${PORT}`);
-  });
-}
-
-startServer();
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`API server is running on port ${PORT}`);
+});
