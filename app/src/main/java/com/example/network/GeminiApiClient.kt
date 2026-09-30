@@ -1,7 +1,5 @@
 package com.example.network
 
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.util.Base64
 import android.util.Log
 import com.example.BuildConfig
@@ -12,7 +10,6 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -81,28 +78,21 @@ object GeminiApiClient {
 
     /**
      * Generates a chat response from Gemini.
-     * Supports thinking mode using gemini-3.1-pro-preview with HIGH thinking level.
-     * If the thinking model is unavailable (e.g. quota exhausted), it automatically
-     * falls back to gemini-3.5-flash so the user always gets an answer.
+     * Uses the Gemini model endpoint verified for the deployed server.
      */
     suspend fun generateChatResponse(
         history: List<ChatMessage>,
         systemInstruction: String,
-        useThinking: Boolean = false
+        @Suppress("UNUSED_PARAMETER") useThinking: Boolean = false
     ): String = withContext(Dispatchers.IO) {
         if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
             return@withContext "خطأ: لم يتم ضبط رابط الخادم."
         }
 
-        val modelsToTry = if (useThinking) {
-            listOf("gemini-3.1-pro-preview", "gemini-3.5-flash")
-        } else {
-            listOf("gemini-3.5-flash")
-        }
+        val modelsToTry = listOf("gemini-2.5-flash")
         var lastError = "لم نتمكن من الحصول على رد من الذكاء الاصطناعي."
 
-        for ((attemptIndex, model) in modelsToTry.withIndex()) {
-            val applyThinkingConfig = useThinking && attemptIndex == 0
+        for (model in modelsToTry) {
             val url = "$baseUrl/v1beta/models/$model:generateContent"
             try {
                 val requestBodyJson = JSONObject()
@@ -135,15 +125,8 @@ object GeminiApiClient {
                 }
 
                 // Generation Config
-                // Thinking models spend tokens on reasoning before answering, so the
-                // budget must be large enough for both the thoughts and the answer.
                 val generationConfig = JSONObject()
                 generationConfig.put("maxOutputTokens", 4096)
-                if (applyThinkingConfig) {
-                    val thinkingConfig = JSONObject()
-                    thinkingConfig.put("thinkingLevel", "HIGH")
-                    generationConfig.put("thinkingConfig", thinkingConfig)
-                }
                 requestBodyJson.put("generationConfig", generationConfig)
 
                 // Up to 2 attempts per model: transient per-minute 429s are retried
@@ -199,7 +182,7 @@ object GeminiApiClient {
         }
 
         // Determine Model
-        val model = if (useThinking) "gemini-3.1-pro-preview" else "gemini-3.5-flash"
+        val model = if (useThinking) "gemini-3.1-pro-preview" else "gemini-2.5-flash"
         val url = "$baseUrl/v1beta/models/$model:generateContent"
 
         try {
@@ -292,181 +275,25 @@ object GeminiApiClient {
     }
 
     /**
-     * Generates an image using gemini-2.5-flash-image
-     */
-    suspend fun generateImage(prompt: String, aspectRatio: String = "1:1"): String? = withContext(Dispatchers.IO) {
-        if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") return@withContext null
-
-        val url = "$baseUrl/v1beta/models/gemini-2.5-flash-image:generateContent"
-
-        try {
-            val requestBodyJson = JSONObject()
-
-            val contentsArray = JSONArray()
-            val contentObj = JSONObject()
-            val partsArray = JSONArray()
-            val partObj = JSONObject()
-            partObj.put("text", prompt)
-            partsArray.put(partObj)
-            contentObj.put("parts", partsArray)
-            contentsArray.put(contentObj)
-            requestBodyJson.put("contents", contentsArray)
-
-            val generationConfig = JSONObject()
-            val imageConfig = JSONObject()
-            imageConfig.put("aspectRatio", aspectRatio)
-            imageConfig.put("imageSize", "1K")
-            generationConfig.put("imageConfig", imageConfig)
-            generationConfig.put("responseModalities", JSONArray(listOf("TEXT", "IMAGE")))
-            requestBodyJson.put("generationConfig", generationConfig)
-
-            val mediaType = "application/json; charset=utf-8".toMediaType()
-            val requestBody = requestBodyJson.toString().toRequestBody(mediaType)
-
-            val request = Request.Builder()
-                .url(url)
-                .post(requestBody)
-                .build()
-
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    val errBody = response.body?.string() ?: ""
-                    Log.e(TAG, "Image generation failed: ${response.code} $errBody")
-                    return@withContext null
-                }
-
-                val bodyStr = response.body?.string() ?: ""
-                val responseJson = JSONObject(bodyStr)
-                val candidates = responseJson.optJSONArray("candidates")
-                if (candidates != null && candidates.length() > 0) {
-                    val firstCandidate = candidates.getJSONObject(0)
-                    val contentObj = firstCandidate.optJSONObject("content")
-                    val parts = contentObj?.optJSONArray("parts")
-                    if (parts != null) {
-                        for (i in 0 until parts.length()) {
-                            val part = parts.getJSONObject(i)
-                            val inlineData = part.optJSONObject("inlineData")
-                            if (inlineData != null) {
-                                val mime = inlineData.optString("mimeType")
-                                if (mime.startsWith("image/")) {
-                                    return@withContext inlineData.optString("data")
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Image generation error", e)
-        }
-        return@withContext null
-    }
-
-    /**
-     * Generates a video using veo-3.1-fast-generate-preview
-     */
-    suspend fun generateVideo(
-        prompt: String,
-        imageBase64: String? = null,
-        aspectRatio: String = "16:9"
-    ): String? = withContext(Dispatchers.IO) {
-        if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") return@withContext null
-
-        val model = "veo-3.1-fast-generate-preview"
-        val url = "$baseUrl/v1beta/models/$model:generateVideos"
-
-        try {
-            val requestBodyJson = JSONObject()
-            requestBodyJson.put("prompt", prompt)
-
-            val config = JSONObject()
-            config.put("numberOfVideos", 1)
-            config.put("resolution", "1080p")
-            config.put("aspectRatio", aspectRatio)
-            requestBodyJson.put("config", config)
-
-            // If there's an image input (Image-to-Video / Animate photo)
-            if (imageBase64 != null) {
-                val imageObj = JSONObject()
-                imageObj.put("mimeType", "image/jpeg")
-                imageObj.put("data", imageBase64)
-                requestBodyJson.put("imageInput", imageObj)
-            }
-
-            val mediaType = "application/json; charset=utf-8".toMediaType()
-            val requestBody = requestBodyJson.toString().toRequestBody(mediaType)
-
-            val request = Request.Builder()
-                .url(url)
-                .post(requestBody)
-                .build()
-
-            client.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    val bodyStr = response.body?.string() ?: ""
-                    val responseJson = JSONObject(bodyStr)
-                    // Veo normally returns an operation name (operations/...)
-                    val operationName = responseJson.optString("name")
-                    if (operationName.isNotEmpty()) {
-                        return@withContext operationName
-                    }
-                } else {
-                    Log.e(TAG, "Veo failed: ${response.code} ${response.body?.string()}")
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Video generation error", e)
-        }
-        return@withContext null
-    }
-
-    private fun getElevenLabsApiKey(): String {
-        return try {
-            val key = BuildConfig.ELEVEN_LABS_API_KEY
-            if (key.isEmpty() || key == "MY_ELEVEN_LABS_API_KEY") "" else key
-        } catch (e: Exception) {
-            ""
-        }
-    }
-
-    /**
-     * Text to Speech using ElevenLabs API with multilingual v2 model
+     * Text to Speech using the server-side ElevenLabs proxy.
      */
     suspend fun generateElevenLabsSpeech(text: String, voiceId: String): String? = withContext(Dispatchers.IO) {
-        val apiKey = getElevenLabsApiKey()
-        if (apiKey.isEmpty()) {
-            Log.d(TAG, "ElevenLabs API key is empty. Falling back to Gemini High-Fi speech API.")
-            return@withContext null
-        }
-
-        val url = "https://api.elevenlabs.io/v1/text-to-speech/$voiceId"
         try {
             val requestBodyJson = JSONObject()
             requestBodyJson.put("text", text)
-            requestBodyJson.put("model_id", "eleven_multilingual_v2")
-
-            val voiceSettings = JSONObject()
-            voiceSettings.put("stability", 0.35)
-            voiceSettings.put("similarity_boost", 0.85)
-            voiceSettings.put("style", 0.3)
-            requestBodyJson.put("voice_settings", voiceSettings)
 
             val mediaType = "application/json; charset=utf-8".toMediaType()
             val requestBody = requestBodyJson.toString().toRequestBody(mediaType)
 
             val request = Request.Builder()
-                .url(url)
-                .addHeader("xi-api-key", apiKey)
+                .url("$baseUrl/api/tts/elevenlabs?voiceId=$voiceId")
                 .post(requestBody)
                 .build()
 
             client.newCall(request).execute().use { response ->
                 if (response.isSuccessful) {
-                    val bytes = response.body?.bytes()
-                    if (bytes != null) {
-                        Log.i(TAG, "Successfully generated ElevenLabs speech audio payload.")
-                        return@withContext Base64.encodeToString(bytes, Base64.NO_WRAP)
-                    }
+                    val audio = JSONObject(response.body?.string().orEmpty()).optString("audio")
+                    if (audio.isNotBlank()) return@withContext audio
                 } else {
                     Log.e(TAG, "ElevenLabs TTS request failed: ${response.code} ${response.message}")
                 }

@@ -1,14 +1,14 @@
 import express from "express";
-import path from "path";
-import fs from "fs";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import multer from "multer";
+import rateLimit from "express-rate-limit";
 
 dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
+app.set("trust proxy", 1);
 
 // Initialize Google Gen AI securely on the server
 const ai = new GoogleGenAI({
@@ -21,19 +21,50 @@ const ai = new GoogleGenAI({
 });
 
 // Setup express middle-wares
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ limit: "50mb", extended: true }));
+app.use("/api", rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "تم تجاوز عدد الطلبات المسموح به مؤقتاً. حاول مرة أخرى لاحقاً." },
+}));
+app.use("/v1beta/models", rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "تم تجاوز عدد طلبات الذكاء الاصطناعي المسموح به مؤقتاً." },
+}));
+app.use(express.json({ limit: "20mb" }));
+app.use(express.urlencoded({ limit: "1mb", extended: true, parameterLimit: 1000 }));
 
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok" });
+  res.json({
+    status: "ok",
+    geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
+    elevenLabsConfigured: Boolean(process.env.ELEVEN_LABS_API_KEY),
+    databaseConfigured: false,
+    persistence: "none",
+  });
 });
 
 const quranAudioUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 15 * 1024 * 1024, files: 1 },
   fileFilter: (_req, file, callback) => {
-    if (!file.mimetype.startsWith("audio/")) {
-      callback(new Error("Audio file must use an audio MIME type."));
+    const supportedAudioTypes = new Set([
+      "audio/aac",
+      "audio/flac",
+      "audio/mp4",
+      "audio/m4a",
+      "audio/mpeg",
+      "audio/ogg",
+      "audio/wav",
+      "audio/webm",
+      "audio/x-wav",
+    ]);
+    if (!supportedAudioTypes.has(file.mimetype.toLowerCase())) {
+      callback(new Error("Unsupported audio format."));
       return;
     }
     callback(null, true);
@@ -68,7 +99,9 @@ async function getQuranAyah(surahNumber: number, ayahNumber: number): Promise<st
   let ayahs = cached && cached.expiresAt > Date.now() ? cached.ayahs : undefined;
 
   if (!ayahs) {
-    const response = await fetch(`https://api.alquran.cloud/v1/surah/${surahNumber}`);
+    const response = await fetch(`https://api.alquran.cloud/v1/surah/${surahNumber}`, {
+      signal: AbortSignal.timeout(20_000),
+    });
     if (!response.ok) {
       throw new Error(`Quran source returned HTTP ${response.status}.`);
     }
@@ -90,7 +123,15 @@ async function getQuranAyah(surahNumber: number, ayahNumber: number): Promise<st
   return ayahText;
 }
 
-app.post("/api/quran/check", parseQuranAudio, async (req, res) => {
+const quranCheckRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "تم تجاوز عدد محاولات تقييم التلاوة مؤقتاً. حاول مرة أخرى بعد قليل." },
+});
+
+app.post("/api/quran/check", quranCheckRateLimit, parseQuranAudio, async (req, res) => {
   const surahNumber = Number(req.body.surahNumber);
   const ayahNumber = Number(req.body.ayahNumber);
   const audio = req.file;
@@ -112,7 +153,7 @@ app.post("/api/quran/check", parseQuranAudio, async (req, res) => {
     const ayahText = await getQuranAyah(surahNumber, ayahNumber);
     const audioData = audio.buffer.toString("base64");
     const transcriptionResponse = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash",
       contents: [{
         role: "user",
         parts: [
@@ -128,7 +169,7 @@ app.post("/api/quran/check", parseQuranAudio, async (req, res) => {
     }
 
     const assessmentResponse = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash",
       contents: [{
         role: "user",
         parts: [
@@ -233,9 +274,21 @@ Return a JSON object with: mistakes (array of objects with heard and correct str
   }
 });
 
+const allowedGeminiModelActions = new Set([
+  "gemini-2.5-flash:generateContent",
+  "gemini-2.5-flash-preview-tts:generateContent",
+  "gemini-3.1-flash-lite-image:generateContent",
+  "gemini-3.1-flash-tts-preview:generateContent",
+  "gemini-3.1-pro-preview:generateContent",
+]);
+
 app.post("/v1beta/models/*", async (req, res) => {
+  const modelAction = String(req.params[0] ?? "").replace(/^\/+|\/+$/g, "");
+  if (!allowedGeminiModelActions.has(modelAction)) {
+    return res.status(404).json({ error: "Gemini model or action is not supported." });
+  }
   if (!process.env.GEMINI_API_KEY) {
-    return res.status(500).json({ error: "GEMINI_API_KEY is not configured." });
+    return res.status(503).json({ error: "Gemini is not configured on the server." });
   }
 
   try {
@@ -245,6 +298,7 @@ app.post("/v1beta/models/*", async (req, res) => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req.body),
+      signal: AbortSignal.timeout(120_000),
     });
     const body = await upstream.text();
     res.status(upstream.status).type(upstream.headers.get("content-type") || "application/json").send(body);
@@ -253,12 +307,6 @@ app.post("/v1beta/models/*", async (req, res) => {
     res.status(502).json({ error: "Unable to contact the Gemini service." });
   }
 });
-
-// Storage folders for Cloud Sync simulation
-const SYNC_DIR = path.join(process.cwd(), "data_sync");
-if (!fs.existsSync(SYNC_DIR)) {
-  fs.mkdirSync(SYNC_DIR, { recursive: true });
-}
 
 // Ensure safe content filters (Content Moderation & NSFW checker)
 function containsProhibitedContent(text: string): { isProhibited: boolean; reason: string | null } {
@@ -388,7 +436,7 @@ Now, execute your role with distinction.`;
 
     // Request response from Gemini
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash",
       contents,
       config: {
         systemInstruction,
@@ -438,7 +486,7 @@ Provide:
 Please write the summary in highly professional Arabic (or English if the document is strictly English).`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash",
       contents: [
         { text: summaryPrompt },
         { text: documentText }
@@ -478,7 +526,7 @@ Include:
 Please write this research study beautifully with markdown. Keep it strictly professional, well-formatted, and completely unique. Prevent any direct copy/paste elements from external cheating worksheets.`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash",
       contents: researchPrompt,
       config: {
         systemInstruction: "You are H&J academic lead and essay author. You produce extremely well-structured, cited, and unique research articles.",
@@ -516,7 +564,7 @@ JSON Format Requirement:
 Provide ONLY the JSON list. No surrounding explanation, no markdown tags.`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash",
       contents: presentationPrompt,
       config: {
         responseMimeType: "application/json",
@@ -545,6 +593,52 @@ Provide ONLY the JSON list. No surrounding explanation, no markdown tags.`;
   } catch (error: any) {
     console.error("Presentation API Error:", error);
     res.status(500).json({ error: "خطأ أثناء إنشاء العرض التقديمي: " + error.message });
+  }
+});
+
+app.post("/api/tts/elevenlabs", async (req, res) => {
+  const apiKey = process.env.ELEVEN_LABS_API_KEY;
+  if (!apiKey) {
+    return res.status(503).json({ error: "ElevenLabs speech is not configured on the server." });
+  }
+
+  const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+  const voiceId = req.query.voiceId;
+  const allowedVoiceIds = new Set(["pNInz6obpgDQGcFmaJgB", "21m00Tcm4TlvDq8ikWAM"]);
+  if (!text || text.length > 5000 || typeof voiceId !== "string" || !allowedVoiceIds.has(voiceId)) {
+    return res.status(400).json({ error: "A valid text and supported voice are required." });
+  }
+
+  const safetyCheck = containsProhibitedContent(text);
+  if (safetyCheck.isProhibited) {
+    return res.status(400).json({ error: "لا يمكن قراءة نصوص تحتوي على ألفاظ أو مواضيع محظورة." });
+  }
+
+  try {
+    const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "xi-api-key": apiKey,
+      },
+      body: JSON.stringify({
+        text,
+        model_id: "eleven_multilingual_v2",
+        voice_settings: { stability: 0.35, similarity_boost: 0.85, style: 0.3 },
+      }),
+      signal: AbortSignal.timeout(60_000),
+    });
+
+    if (!response.ok) {
+      console.error(`ElevenLabs TTS returned HTTP ${response.status}.`);
+      return res.status(502).json({ error: "ElevenLabs speech generation failed." });
+    }
+
+    const audio = Buffer.from(await response.arrayBuffer()).toString("base64");
+    return res.json({ audio });
+  } catch (error) {
+    console.error("ElevenLabs TTS request failed:", error);
+    return res.status(502).json({ error: "Unable to contact ElevenLabs." });
   }
 });
 
@@ -670,45 +764,16 @@ app.post("/api/image/generate", async (req, res) => {
   }
 });
 
-// 7. REAL CLOUD SYNC SYSTEM (Saves/Loads states per-user into server json)
-app.post("/api/sync/save", (req, res) => {
-  try {
-    const { username, data } = req.body;
-    if (!username) {
-      return res.status(400).json({ error: "Username is required for sync" });
-    }
-
-    const sanitizedUsername = username.toLowerCase().replace(/[^a-z0-9]/g, "");
-    const filePath = path.join(SYNC_DIR, `user_${sanitizedUsername}.json`);
-
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf8");
-    res.json({ success: true, timestamp: new Date().toISOString() });
-  } catch (error: any) {
-    console.error("Cloud Sync Save Error:", error);
-    res.status(500).json({ error: "فشل حفظ البيانات سحابياً: " + error.message });
-  }
+app.post("/api/sync/save", (_req, res) => {
+  res.status(503).json({
+    error: "مزامنة الحسابات غير متاحة حتى إعداد تخزين دائم وتسجيل دخول آمن.",
+  });
 });
 
-app.get("/api/sync/load", (req, res) => {
-  try {
-    const { username } = req.query;
-    if (!username) {
-      return res.status(400).json({ error: "Username is required" });
-    }
-
-    const sanitizedUsername = (username as string).toLowerCase().replace(/[^a-z0-9]/g, "");
-    const filePath = path.join(SYNC_DIR, `user_${sanitizedUsername}.json`);
-
-    if (fs.existsSync(filePath)) {
-      const fileData = fs.readFileSync(filePath, "utf8");
-      return res.json({ found: true, data: JSON.parse(fileData) });
-    }
-
-    res.json({ found: false, message: "لم يتم العثور على بيانات سحابية سابقة لهذا الحساب. سيتم بدء ملف جديد." });
-  } catch (error: any) {
-    console.error("Cloud Sync Load Error:", error);
-    res.status(500).json({ error: "فشل تحميل البيانات سحابياً: " + error.message });
-  }
+app.get("/api/sync/load", (_req, res) => {
+  res.status(503).json({
+    error: "مزامنة الحسابات غير متاحة حتى إعداد تخزين دائم وتسجيل دخول آمن.",
+  });
 });
 
 // 8. AUTO-SCHEDULE PLANNER CREATOR (Uses LLM to schedule your day)
@@ -738,7 +803,7 @@ JSON Format Requirement:
 Provide ONLY the raw JSON list. Do not surround with markdown codes.`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash",
       contents: plannerPrompt,
       config: {
         responseMimeType: "application/json",
@@ -766,6 +831,31 @@ Provide ONLY the raw JSON list. Do not surround with markdown codes.`;
     console.error("Planner Creator Error:", error);
     res.status(500).json({ error: "خطأ أثناء جدولة اليوم بالذكاء الاصطناعي: " + error.message });
   }
+});
+
+app.use((_req, res) => {
+  res.status(404).json({ error: "API route not found." });
+});
+
+app.use((
+  error: Error & { status?: number; type?: string },
+  _req: express.Request,
+  res: express.Response,
+  _next: express.NextFunction,
+) => {
+  if (res.headersSent) return;
+
+  const status = error.status === 413 ? 413 : error.status === 400 ? 400 : 500;
+  const message = status === 413
+    ? "حجم الطلب أكبر من الحد المسموح."
+    : status === 400
+      ? "تعذر قراءة الطلب. تحقق من البيانات المرسلة."
+      : "حدث خطأ غير متوقع في الخادم.";
+
+  if (status === 500) {
+    console.error("Unhandled request error:", error);
+  }
+  res.status(status).json({ error: message });
 });
 
 app.listen(PORT, "0.0.0.0", () => {

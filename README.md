@@ -1,20 +1,29 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# H2 Smart Hub
 
-# Run and deploy your AI Studio app
+This repository contains the native Android app and the API server it uses. The web interface has been removed.
 
-This contains everything you need to run your app locally.
+## Android app
 
-View your app in AI Studio: https://ai.studio/apps/776352a4-6d27-43d0-aaf9-e9e22e029b4e
+Open the repository in Android Studio and build the debug app, or run this from the repository root on Windows:
 
-## Run Locally
+```powershell
+.\gradlew.bat :app:assembleDebug
+```
 
-**Prerequisites:**  Node.js
+The APK is written to `app/build/outputs/apk/debug/app-debug.apk`.
 
+The Android app reads `SERVER_URL` from `app/android-defaults.properties`; local overrides belong in the ignored `app/android.properties` file. The production default is `https://h2-smart-hub-production.up.railway.app`.
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+Do not put Gemini or ElevenLabs credentials in Android properties or the app bundle. Configure `GEMINI_API_KEY` and, when needed, `ELEVEN_LABS_API_KEY` only in the server environment (Railway Variables for production).
+
+## API server
+
+The Node.js API server is retained because the Android app uses it as a proxy for Gemini requests. To run it locally, install Node.js, install dependencies with `npm install`, set `GEMINI_API_KEY` in your environment, then run:
+
+```powershell
+npm run dev
+```
+
+For production, `npm run build` bundles the API server and `npm start` runs it. The server listens on `PORT` (default `3000`).
+
+`GET /health` reports whether the AI provider keys are configured and whether persistence is available. The server has no database integration; cloud-sync routes return `503` until persistent storage and authenticated accounts are implemented. The AI routes have per-IP rate limits, and the Gemini proxy accepts only the model actions used by the app.
