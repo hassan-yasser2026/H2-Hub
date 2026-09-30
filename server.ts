@@ -8,6 +8,7 @@ dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
+const GEMINI_TEXT_MODEL = "gemini-3.8-flash";
 app.set("trust proxy", 1);
 
 // Initialize Google Gen AI securely on the server
@@ -153,7 +154,7 @@ app.post("/api/quran/check", quranCheckRateLimit, parseQuranAudio, async (req, r
     const ayahText = await getQuranAyah(surahNumber, ayahNumber);
     const audioData = audio.buffer.toString("base64");
     const transcriptionResponse = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: GEMINI_TEXT_MODEL,
       contents: [{
         role: "user",
         parts: [
@@ -169,7 +170,7 @@ app.post("/api/quran/check", quranCheckRateLimit, parseQuranAudio, async (req, r
     }
 
     const assessmentResponse = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: GEMINI_TEXT_MODEL,
       contents: [{
         role: "user",
         parts: [
@@ -275,6 +276,7 @@ Return a JSON object with: mistakes (array of objects with heard and correct str
 });
 
 const allowedGeminiModelActions = new Set([
+  "gemini-3.8-flash:generateContent",
   "gemini-2.5-flash:generateContent",
   "gemini-2.5-flash-preview-tts:generateContent",
   "gemini-3.1-flash-lite-image:generateContent",
@@ -293,6 +295,9 @@ app.post("/v1beta/models/*", async (req, res) => {
 
   try {
     const target = new URL(`https://generativelanguage.googleapis.com${req.originalUrl}`);
+    if (modelAction === "gemini-2.5-flash:generateContent") {
+      target.pathname = "/v1beta/models/gemini-3.8-flash:generateContent";
+    }
     target.searchParams.set("key", process.env.GEMINI_API_KEY);
     const upstream = await fetch(target, {
       method: "POST",
@@ -436,7 +441,7 @@ Now, execute your role with distinction.`;
 
     // Request response from Gemini
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: GEMINI_TEXT_MODEL,
       contents,
       config: {
         systemInstruction,
@@ -486,7 +491,7 @@ Provide:
 Please write the summary in highly professional Arabic (or English if the document is strictly English).`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: GEMINI_TEXT_MODEL,
       contents: [
         { text: summaryPrompt },
         { text: documentText }
@@ -526,7 +531,7 @@ Include:
 Please write this research study beautifully with markdown. Keep it strictly professional, well-formatted, and completely unique. Prevent any direct copy/paste elements from external cheating worksheets.`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: GEMINI_TEXT_MODEL,
       contents: researchPrompt,
       config: {
         systemInstruction: "You are H&J academic lead and essay author. You produce extremely well-structured, cited, and unique research articles.",
@@ -564,7 +569,7 @@ JSON Format Requirement:
 Provide ONLY the JSON list. No surrounding explanation, no markdown tags.`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: GEMINI_TEXT_MODEL,
       contents: presentationPrompt,
       config: {
         responseMimeType: "application/json",
@@ -803,7 +808,7 @@ JSON Format Requirement:
 Provide ONLY the raw JSON list. Do not surround with markdown codes.`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: GEMINI_TEXT_MODEL,
       contents: plannerPrompt,
       config: {
         responseMimeType: "application/json",

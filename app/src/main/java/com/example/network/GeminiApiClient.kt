@@ -89,7 +89,7 @@ object GeminiApiClient {
             return@withContext "خطأ: لم يتم ضبط رابط الخادم."
         }
 
-        val modelsToTry = listOf("gemini-2.5-flash")
+        val modelsToTry = listOf("gemini-3.8-flash")
         var lastError = "لم نتمكن من الحصول على رد من الذكاء الاصطناعي."
 
         for (model in modelsToTry) {
@@ -182,7 +182,7 @@ object GeminiApiClient {
         }
 
         // Determine Model
-        val model = if (useThinking) "gemini-3.1-pro-preview" else "gemini-2.5-flash"
+        val model = if (useThinking) "gemini-3.1-pro-preview" else "gemini-3.8-flash"
         val url = "$baseUrl/v1beta/models/$model:generateContent"
 
         try {
