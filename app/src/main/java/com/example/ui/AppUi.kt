@@ -460,7 +460,7 @@ private fun LearningProfileScreen(viewModel: AppViewModel) {
 // ==================== SMART CHAT (SMART CAT) SCREEN ====================
 
 @Composable
-@OptIn(ExperimentalLayoutApi::class)
+@OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 fun ChatScreen(viewModel: AppViewModel, onOpenSettings: () -> Unit = {}) {
     val messages by viewModel.currentMessages.collectAsState()
     val currentSessionId by viewModel.currentSessionId.collectAsState()
@@ -469,6 +469,7 @@ fun ChatScreen(viewModel: AppViewModel, onOpenSettings: () -> Unit = {}) {
     val chatActionError by viewModel.chatActionError.collectAsState()
     val socraticModeEnabled by viewModel.socraticModeEnabled.collectAsState()
     val socraticProgress by viewModel.socraticProgress.collectAsState()
+    val thinkingModeEnabled by viewModel.useThinkingMode.collectAsState()
     val isListeningToSpeech by viewModel.isListeningToSpeech.collectAsState()
     val speechInputText by viewModel.speechInputText.collectAsState()
 
@@ -476,13 +477,15 @@ fun ChatScreen(viewModel: AppViewModel, onOpenSettings: () -> Unit = {}) {
     var pendingVisionImagePath by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingCameraUri by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingCameraFilePath by rememberSaveable { mutableStateOf<String?>(null) }
-    var showAttachmentOptions by remember { mutableStateOf(false) }
+    var showComposerSheet by remember { mutableStateOf(false) }
+    var showComposerPlugins by remember { mutableStateOf(false) }
     var showChatHistory by remember { mutableStateOf(false) }
 
     val listState = rememberLazyListState()
     val context = LocalContext.current
     val contentResolver = context.contentResolver
     val chatScope = rememberCoroutineScope()
+    val composerSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     DisposableEffect(Unit) {
         onDispose { viewModel.closeCurrentChatSession() }
     }
@@ -548,6 +551,35 @@ fun ChatScreen(viewModel: AppViewModel, onOpenSettings: () -> Unit = {}) {
             } catch (e: Exception) {
                 android.util.Log.e("ChatScreen", "Failed to attach PDF", e)
             }
+        }
+    }
+
+    fun openCameraCapture() {
+        try {
+            val captureDirectory = File(context.cacheDir, "camera-captures").apply {
+                check(mkdirs() || isDirectory) { "تعذر تجهيز مساحة الكاميرا." }
+            }
+            val captureFile = File.createTempFile("smart-cat-", ".jpg", captureDirectory)
+            val captureUri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                captureFile
+            )
+            pendingCameraUri = captureUri.toString()
+            pendingCameraFilePath = captureFile.absolutePath
+            visionCameraLauncher.launch(captureUri)
+        } catch (e: Exception) {
+            android.util.Log.e("ChatScreen", "Failed to open camera", e)
+            Toast.makeText(context, "تعذر فتح الكاميرا.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun closeComposerSheet(action: () -> Unit) {
+        chatScope.launch {
+            composerSheetState.hide()
+            showComposerSheet = false
+            showComposerPlugins = false
+            action()
         }
     }
 
@@ -813,67 +845,22 @@ fun ChatScreen(viewModel: AppViewModel, onOpenSettings: () -> Unit = {}) {
 
                 IconButton(
                     onClick = {
-                        try {
-                            val captureDirectory = File(context.cacheDir, "camera-captures").apply {
-                                check(mkdirs() || isDirectory) { "تعذر تجهيز مساحة الكاميرا." }
-                            }
-                            val captureFile = File.createTempFile(
-                                "smart-cat-",
-                                ".jpg",
-                                captureDirectory
-                            )
-                            val captureUri = FileProvider.getUriForFile(
-                                context,
-                                "${context.packageName}.fileprovider",
-                                captureFile
-                            )
-                            pendingCameraUri = captureUri.toString()
-                            pendingCameraFilePath = captureFile.absolutePath
-                            visionCameraLauncher.launch(captureUri)
-                        } catch (e: Exception) {
-                            android.util.Log.e("ChatScreen", "Failed to open camera", e)
-                            Toast.makeText(context, "تعذر فتح الكاميرا.", Toast.LENGTH_SHORT).show()
-                        }
+                        showComposerPlugins = false
+                        showComposerSheet = true
                     },
                     modifier = Modifier
-                        .padding(end = 2.dp)
-                        .background(MaterialTheme.colorScheme.secondaryContainer, CircleShape)
-                        .size(40.dp),
+                        .padding(end = 8.dp)
+                        .background(
+                            MaterialTheme.colorScheme.primaryContainer,
+                            CircleShape
+                        )
+                        .size(48.dp),
                     enabled = !isGenerating
                 ) {
                     Icon(
-                        Icons.Default.CameraAlt,
-                        contentDescription = "تصوير المسألة",
-                        tint = MaterialTheme.colorScheme.onSecondaryContainer
-                    )
-                }
-
-                IconButton(
-                    onClick = { visionGalleryLauncher.launch("image/*") },
-                    modifier = Modifier
-                        .padding(end = 2.dp)
-                        .background(MaterialTheme.colorScheme.secondaryContainer, CircleShape)
-                        .size(40.dp),
-                    enabled = !isGenerating
-                ) {
-                    Icon(
-                        Icons.Default.Image,
-                        contentDescription = "اختيار صورة المسألة من المعرض",
-                        tint = MaterialTheme.colorScheme.onSecondaryContainer
-                    )
-                }
-
-                IconButton(
-                    onClick = { showAttachmentOptions = true },
-                    modifier = Modifier
-                        .padding(end = 4.dp)
-                        .background(MaterialTheme.colorScheme.secondaryContainer, CircleShape)
-                        .size(48.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.AttachFile,
-                        contentDescription = "إرفاق صورة أو PDF",
-                        tint = MaterialTheme.colorScheme.onSecondaryContainer
+                        imageVector = Icons.Default.Add,
+                        contentDescription = "فتح أدوات المحادثة",
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer
                     )
                 }
 
@@ -917,40 +904,148 @@ fun ChatScreen(viewModel: AppViewModel, onOpenSettings: () -> Unit = {}) {
                 )
             }
 
-        if (showAttachmentOptions) {
-            AlertDialog(
-                onDismissRequest = { showAttachmentOptions = false },
-                title = { Text("إرفاق ملف") },
-                text = {
-                    Column {
-                        TextButton(
-                            onClick = {
-                                showAttachmentOptions = false
-                                visionGalleryLauncher.launch("image/*")
+        if (showComposerSheet) {
+            ModalBottomSheet(
+                onDismissRequest = {
+                    showComposerSheet = false
+                    showComposerPlugins = false
+                },
+                sheetState = composerSheetState,
+                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+                containerColor = Color(0xFF17171D),
+                contentColor = Color(0xFFF3F0F8),
+                dragHandle = {
+                    BottomSheetDefaults.DragHandle(color = Color(0xFF777681))
+                }
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .navigationBarsPadding()
+                        .padding(start = 20.dp, end = 20.dp, bottom = 24.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (showComposerPlugins) {
+                            IconButton(onClick = { showComposerPlugins = false }) {
+                                Icon(Icons.Default.ArrowBack, contentDescription = "رجوع")
                             }
-                        ) {
-                            Icon(Icons.Default.Image, contentDescription = null)
-                            Spacer(Modifier.width(8.dp))
-                            Text("اختيار صورة")
                         }
-                        TextButton(
+                        Text(
+                            if (showComposerPlugins) "المكونات الإضافية"
+                            else "إضافة إلى المحادثة",
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        IconButton(
                             onClick = {
-                                showAttachmentOptions = false
-                                pdfLauncher.launch("application/pdf")
+                                chatScope.launch {
+                                    composerSheetState.hide()
+                                    showComposerSheet = false
+                                    showComposerPlugins = false
+                                }
                             }
                         ) {
-                            Icon(Icons.Default.PictureAsPdf, contentDescription = null)
-                            Spacer(Modifier.width(8.dp))
-                            Text("اختيار ملف PDF")
+                            Icon(Icons.Default.Close, contentDescription = "إغلاق القائمة")
                         }
                     }
-                },
-                confirmButton = {
-                    TextButton(onClick = { showAttachmentOptions = false }) {
-                        Text("إلغاء")
+                    if (showComposerPlugins) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(16.dp))
+                                .clickable {
+                                    viewModel.setSocraticModeEnabled(!socraticModeEnabled)
+                                }
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.School, contentDescription = null)
+                            Column(
+                                modifier = Modifier.weight(1f).padding(horizontal = 12.dp),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                Text("التدريس السقراطي", fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    "تعلّم خطوة بخطوة عبر الأسئلة",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFFB9B6C2)
+                                )
+                            }
+                            Switch(
+                                checked = socraticModeEnabled,
+                                onCheckedChange = viewModel::setSocraticModeEnabled
+                            )
+                        }
+                        ChatComposerSheetAction(
+                            icon = Icons.Default.AddComment,
+                            title = "محادثة جديدة",
+                            subtitle = "ابدأ محادثة منفصلة",
+                            onClick = {
+                                closeComposerSheet {
+                                    viewModel.startNewSession("محادثة جديدة ${sessions.size + 1}")
+                                }
+                            }
+                        )
+                        ChatComposerSheetAction(
+                            icon = Icons.Default.Settings,
+                            title = "إعدادات Smart Cat",
+                            subtitle = "تفضيلات المساعد",
+                            onClick = { closeComposerSheet(onOpenSettings) }
+                        )
+                    } else {
+                        ChatComposerSheetAction(
+                            icon = Icons.Default.CameraAlt,
+                            title = "الكاميرا",
+                            subtitle = "صوّر مسألة أو صفحة",
+                            onClick = { closeComposerSheet(::openCameraCapture) }
+                        )
+                        ChatComposerSheetAction(
+                            icon = Icons.Default.Image,
+                            title = "الصور",
+                            subtitle = "اختر صورة من المعرض",
+                            onClick = {
+                                closeComposerSheet { visionGalleryLauncher.launch("image/*") }
+                            }
+                        )
+                        ChatComposerSheetAction(
+                            icon = Icons.Default.AttachFile,
+                            title = "الملفات",
+                            subtitle = "إرفاق ملف PDF",
+                            onClick = {
+                                closeComposerSheet { pdfLauncher.launch("application/pdf") }
+                            }
+                        )
+                        ChatComposerSheetAction(
+                            icon = Icons.Default.Extension,
+                            title = "المكونات الإضافية",
+                            subtitle = "التدريس السقراطي وأدوات إضافية",
+                            onClick = { showComposerPlugins = true }
+                        )
+                        ChatComposerSheetAction(
+                            icon = Icons.Default.Psychology,
+                            title = if (thinkingModeEnabled) "إيقاف التفكير الأعمق"
+                            else "فكّر بعمق أكبر",
+                            subtitle = if (thinkingModeEnabled) {
+                                "مفعّل — يستخدم Gemini Pro عند الإرسال"
+                            } else {
+                                "استخدم نموذج Gemini Pro للأسئلة الصعبة"
+                            },
+                            selected = thinkingModeEnabled,
+                            onClick = {
+                                val enabled = !thinkingModeEnabled
+                                viewModel.useThinkingMode.value = enabled
+                                com.example.network.GeminiApiClient.setThinkingModeEnabled(enabled)
+                                closeComposerSheet {}
+                            }
+                        )
                     }
                 }
-            )
+            }
         }
 
         if (showChatHistory) {
@@ -990,6 +1085,37 @@ fun ChatScreen(viewModel: AppViewModel, onOpenSettings: () -> Unit = {}) {
                     TextButton(onClick = { showChatHistory = false }) { Text("إغلاق") }
                 }
             )
+        }
+    }
+}
+
+@Composable
+private fun ChatComposerSheetAction(
+    icon: ImageVector,
+    title: String,
+    subtitle: String,
+    selected: Boolean = false,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(if (selected) Color(0xFF302746) else Color.Transparent)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, contentDescription = null, tint = if (selected) Color(0xFFD1B8FF) else Color(0xFFE4E1EA))
+        Column(
+            modifier = Modifier.weight(1f).padding(horizontal = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            Text(title, fontWeight = FontWeight.SemiBold)
+            Text(subtitle, style = MaterialTheme.typography.bodySmall, color = Color(0xFFB9B6C2))
+        }
+        if (selected) {
+            Icon(Icons.Default.Check, contentDescription = "مفعّل", tint = Color(0xFFD1B8FF))
         }
     }
 }

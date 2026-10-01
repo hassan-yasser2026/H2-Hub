@@ -31,6 +31,12 @@ object GeminiApiClient {
 
     private const val TAG = "GeminiApiClient"
     private val baseUrl: String = BuildConfig.SERVER_URL.trimEnd('/')
+    @Volatile
+    private var thinkingModeEnabled = false
+
+    fun setThinkingModeEnabled(enabled: Boolean) {
+        thinkingModeEnabled = enabled
+    }
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(90, TimeUnit.SECONDS)
@@ -159,7 +165,8 @@ object GeminiApiClient {
     private suspend fun generateLegacyChatFallback(
         history: List<ChatMessage>,
         systemInstruction: String,
-        reason: String
+        reason: String,
+        useThinking: Boolean = thinkingModeEnabled
     ): String {
         Log.w(TAG, "$reason endpoint is missing on the server; using the legacy server-side Gemini proxy")
         val fallbackInstruction = """
@@ -169,7 +176,7 @@ object GeminiApiClient {
             Do not claim that you searched H2 Hub course files or cite course sources.
             Help the student using general knowledge, clearly noting uncertainty when appropriate.
         """.trimIndent()
-        return generateChatResponse(history, fallbackInstruction)
+        return generateChatResponse(history, fallbackInstruction, useThinking)
     }
 
     /**
@@ -179,13 +186,17 @@ object GeminiApiClient {
     suspend fun generateChatResponse(
         history: List<ChatMessage>,
         systemInstruction: String,
-        @Suppress("UNUSED_PARAMETER") useThinking: Boolean = false
+        useThinking: Boolean = thinkingModeEnabled
     ): String = withContext(Dispatchers.IO) {
         if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
             return@withContext "خطأ: لم يتم ضبط رابط الخادم."
         }
 
-        val modelsToTry = listOf("gemini-3.8-flash")
+        val modelsToTry = if (useThinking) {
+            listOf("gemini-3.1-pro-preview", "gemini-3.8-flash")
+        } else {
+            listOf("gemini-3.8-flash")
+        }
         var lastError = "لم نتمكن من الحصول على رد من الذكاء الاصطناعي."
 
         for (model in modelsToTry) {
@@ -223,6 +234,12 @@ object GeminiApiClient {
                 // Generation Config
                 val generationConfig = JSONObject()
                 generationConfig.put("maxOutputTokens", 4096)
+                if (useThinking && model == "gemini-3.1-pro-preview") {
+                    generationConfig.put(
+                        "thinkingConfig",
+                        JSONObject().put("thinkingLevel", "HIGH")
+                    )
+                }
                 requestBodyJson.put("generationConfig", generationConfig)
 
                 // Retry transient provider overloads, but never retry exhausted daily quota.
@@ -283,7 +300,8 @@ object GeminiApiClient {
         systemInstruction: String,
         recentSummaries: List<String> = emptyList(),
         weakTopics: List<String> = emptyList(),
-        forceFullSolution: Boolean = false
+        forceFullSolution: Boolean = false,
+        useThinking: Boolean = thinkingModeEnabled
     ): String = withContext(Dispatchers.IO) {
         if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
             return@withContext "خطأ: لم يتم ضبط رابط الخادم."
@@ -297,6 +315,7 @@ object GeminiApiClient {
             .put("message", latestQuestion)
             .put("systemInstruction", systemInstruction)
             .put("forceFullSolution", forceFullSolution)
+            .put("useThinking", useThinking)
             .put(
                 "studentMemory",
                 JSONObject()
@@ -339,7 +358,8 @@ object GeminiApiClient {
             return@withContext generateLegacyChatFallback(
                 history,
                 systemInstruction,
-                "RAG chat"
+                "RAG chat",
+                useThinking
             )
         }
         val responseJson = try {
@@ -378,7 +398,8 @@ object GeminiApiClient {
         systemInstruction: String,
         recentSummaries: List<String>,
         weakTopics: List<String>,
-        progress: SocraticProgress
+        progress: SocraticProgress,
+        useThinking: Boolean = thinkingModeEnabled
     ): SocraticChatResult? = withContext(Dispatchers.IO) {
         if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
             return@withContext SocraticChatResult("خطأ: لم يتم ضبط رابط الخادم.", progress)
@@ -390,6 +411,7 @@ object GeminiApiClient {
         val body = JSONObject()
             .put("message", latestQuestion)
             .put("systemInstruction", systemInstruction)
+            .put("useThinking", useThinking)
             .put(
                 "studentMemory",
                 JSONObject()
@@ -446,7 +468,8 @@ object GeminiApiClient {
             val fallbackReply = generateLegacyChatFallback(
                 history,
                 fallbackInstruction,
-                "Socratic chat"
+                "Socratic chat",
+                useThinking
             )
             return@withContext SocraticChatResult(fallbackReply, progress)
         }

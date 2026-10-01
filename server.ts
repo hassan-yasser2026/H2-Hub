@@ -625,6 +625,9 @@ app.post("/api/chat-socratic", async (req, res) => {
     "originalQuestion" in rawProgress && typeof rawProgress.originalQuestion === "string"
     ? rawProgress.originalQuestion.trim().slice(0, 8_000)
     : "";
+  const chatModel = req.body?.useThinking === true
+    ? "gemini-3.1-pro-preview"
+    : GEMINI_TEXT_MODEL;
   const safetyCheck = containsProhibitedContent(`${originalQuestion}\n${message}`);
   if (safetyCheck.isProhibited) {
     return res.status(400).json({ error: safetyCheck.reason });
@@ -689,7 +692,7 @@ Original problem: ${originalQuestion || message}
 Retrieved course excerpts:
 ${buildRagContext(chunks)}`;
     const response = await ai.models.generateContent({
-      model: GEMINI_TEXT_MODEL,
+      model: chatModel,
       contents: history,
       config: {
         systemInstruction,
@@ -822,8 +825,11 @@ ${sourceContext}`;
       history.push({ role: "user", parts: [{ text: message }] });
     }
 
+    const chatModel = req.body?.useThinking === true
+      ? "gemini-3.1-pro-preview"
+      : GEMINI_TEXT_MODEL;
     const response = await ai.models.generateContent({
-      model: GEMINI_TEXT_MODEL,
+      model: chatModel,
       contents: history,
       config: {
         systemInstruction,
