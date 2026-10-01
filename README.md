@@ -28,7 +28,7 @@ npm run dev
 
 For production, `npm run build` bundles the API server and `npm start` runs it. The server listens on `PORT` (default `3000`).
 
-`GET /health` reports whether the AI provider keys are configured and whether persistence is available. Qdrant is used only for the course knowledge vector index; account/cloud-sync persistence is not implemented, so cloud-sync routes return `503` until a database and authenticated accounts are added. The AI routes have per-IP rate limits, and the Gemini proxy accepts only the model actions used by the app.
+`GET /health` reports the Railway deployment commit (`deploymentCommit`), whether the feedback routes are present, whether AI provider keys are configured, and whether persistence is available. After a Railway deployment, verify that `deploymentCommit` matches the deployed GitHub SHA and `feedbackRoutesAvailable` is `true`. Qdrant is used only for the course knowledge vector index; account/cloud-sync persistence is not implemented, so cloud-sync routes return `503` until a database and authenticated accounts are added. The AI routes have per-IP rate limits, and the Gemini proxy accepts only the model actions used by the app.
 
 ### Smart Cat knowledge search (RAG)
 

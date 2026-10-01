@@ -57,6 +57,8 @@ app.use(express.urlencoded({ limit: "1mb", extended: true, parameterLimit: 1000 
 app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
+    deploymentCommit: process.env.RAILWAY_GIT_COMMIT_SHA ?? "unknown",
+    feedbackRoutesAvailable: true,
     geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
     openRouterVisionFallbackConfigured: Boolean(process.env.OPENROUTER_API_KEY),
     ragConfigured: Boolean(
