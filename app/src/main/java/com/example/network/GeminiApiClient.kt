@@ -146,6 +146,32 @@ object GeminiApiClient {
         }
     }
 
+    private fun isMissingApiRoute(statusCode: Int, responseBody: String): Boolean {
+        if (statusCode != 404) return false
+        return try {
+            JSONObject(responseBody).optString("error")
+                .contains("API route not found", ignoreCase = true)
+        } catch (_: org.json.JSONException) {
+            responseBody.contains("API route not found", ignoreCase = true)
+        }
+    }
+
+    private suspend fun generateLegacyChatFallback(
+        history: List<ChatMessage>,
+        systemInstruction: String,
+        reason: String
+    ): String {
+        Log.w(TAG, "$reason endpoint is missing on the server; using the legacy server-side Gemini proxy")
+        val fallbackInstruction = """
+            $systemInstruction
+
+            IMPORTANT SERVICE LIMITATION: The server's course-retrieval endpoint is unavailable.
+            Do not claim that you searched H2 Hub course files or cite course sources.
+            Help the student using general knowledge, clearly noting uncertainty when appropriate.
+        """.trimIndent()
+        return generateChatResponse(history, fallbackInstruction)
+    }
+
     /**
      * Generates a chat response from Gemini.
      * Uses the Gemini model endpoint verified for the deployed server.
@@ -309,6 +335,13 @@ object GeminiApiClient {
         val response = postJsonWithNetworkRetries("$baseUrl/api/chat-rag", body)
             ?: return@withContext CONNECTION_ERROR_MESSAGE
         val (code, responseBody) = response
+        if (isMissingApiRoute(code, responseBody)) {
+            return@withContext generateLegacyChatFallback(
+                history,
+                systemInstruction,
+                "RAG chat"
+            )
+        }
         val responseJson = try {
             JSONObject(responseBody)
         } catch (e: Exception) {
@@ -402,6 +435,21 @@ object GeminiApiClient {
         val response = postJsonWithNetworkRetries("$baseUrl/api/chat-socratic", body)
             ?: return@withContext SocraticChatResult(CONNECTION_ERROR_MESSAGE, progress)
         val (code, responseBody) = response
+        if (isMissingApiRoute(code, responseBody)) {
+            val fallbackInstruction = """
+                $systemInstruction
+
+                The dedicated Socratic server endpoint is unavailable. Continue tutoring Socratically:
+                ask one short guiding question at a time, do not reveal the complete solution unless
+                the student explicitly asks for it, and use the conversation history to assess answers.
+            """.trimIndent()
+            val fallbackReply = generateLegacyChatFallback(
+                history,
+                fallbackInstruction,
+                "Socratic chat"
+            )
+            return@withContext SocraticChatResult(fallbackReply, progress)
+        }
         val responseJson = try {
             JSONObject(responseBody)
         } catch (e: Exception) {
