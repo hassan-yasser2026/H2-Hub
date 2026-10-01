@@ -12,9 +12,10 @@
     "start": "node dist/server.cjs",
     "ingest": "tsx scripts/ingest.ts",
     "docs:demo": "tsx scripts/create-demo-docs.ts",
-    "test:rag": "tsx --test src/server/rag.test.ts src/server/student-memory.test.ts src/server/socratic-progress.test.ts",
+    "test:rag": "tsx --test src/server/rag.test.ts src/server/socratic-progress.test.ts",
     "test:safety": "tsx --test src/server/content-safety.test.ts",
     "test:feedback": "tsx --test src/server/feedback-store.test.ts",
+    "test:vision": "tsx --test src/server/vision-model.test.ts",
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "lint": "tsc --noEmit"
   },
