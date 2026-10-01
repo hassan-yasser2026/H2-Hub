@@ -63,12 +63,11 @@ app.get("/health", (_req, res) => {
     openRouterVisionFallbackConfigured: Boolean(process.env.OPENROUTER_API_KEY),
     ragConfigured: Boolean(
       process.env.GEMINI_API_KEY &&
-      process.env.QDRANT_URL &&
-      process.env.QDRANT_API_KEY
+      process.env.DATABASE_URL
     ),
     elevenLabsConfigured: Boolean(process.env.ELEVEN_LABS_API_KEY),
-    databaseConfigured: false,
-    persistence: "none",
+    databaseConfigured: Boolean(process.env.DATABASE_URL),
+    persistence: process.env.DATABASE_URL ? "postgres+pgvector" : "none",
   });
 });
 
@@ -614,9 +613,9 @@ app.post("/api/chat-socratic", async (req, res) => {
   const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
   if (!message) return res.status(400).json({ error: "Message is required." });
   if (message.length > 8_000) return res.status(413).json({ error: "Message is too long." });
-  if (!process.env.GEMINI_API_KEY || !process.env.QDRANT_URL || !process.env.QDRANT_API_KEY) {
+  if (!process.env.GEMINI_API_KEY || !process.env.DATABASE_URL) {
     return res.status(503).json({
-      error: "RAG is not configured. Set the server-side Gemini and Qdrant environment variables.",
+      error: "RAG is not configured. Set GEMINI_API_KEY and DATABASE_URL on the server.",
     });
   }
 
@@ -759,9 +758,9 @@ app.post("/api/chat-rag", async (req, res) => {
   if (message.length > 8_000) {
     return res.status(413).json({ error: "Message is too long." });
   }
-  if (!process.env.GEMINI_API_KEY || !process.env.QDRANT_URL || !process.env.QDRANT_API_KEY) {
+  if (!process.env.GEMINI_API_KEY || !process.env.DATABASE_URL) {
     return res.status(503).json({
-      error: "RAG is not configured. Set the server-side Gemini and Qdrant environment variables.",
+      error: "RAG is not configured. Set GEMINI_API_KEY and DATABASE_URL on the server.",
     });
   }
 

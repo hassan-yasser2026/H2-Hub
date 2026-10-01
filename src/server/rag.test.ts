@@ -7,7 +7,9 @@ import {
   buildRagContext,
   createChunkId,
   formatSourceLabel,
+  serializeEmbedding,
   splitTextIntoChunks,
+  EMBEDDING_DIMENSIONS,
 } from "./rag.js";
 
 test("splits text into overlapping word chunks", () => {
@@ -25,6 +27,16 @@ test("creates stable point IDs for repeat ingestion", () => {
   assert.equal(first, createChunkId("biology.pdf", 2, 0, "Mitochondria release energy."));
   assert.notEqual(first, createChunkId("biology.pdf", 3, 0, "Mitochondria release energy."));
   assert.match(first, /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+});
+
+test("serializes only complete finite pgvector embeddings", () => {
+  const embedding = Array<number>(EMBEDDING_DIMENSIONS).fill(0.25);
+  assert.equal(serializeEmbedding(embedding).split(",").length, EMBEDDING_DIMENSIONS);
+  assert.throws(() => serializeEmbedding([0.25]), /768 finite numbers/u);
+  assert.throws(
+    () => serializeEmbedding([...embedding.slice(0, -1), Number.NaN]),
+    /768 finite numbers/u
+  );
 });
 
 test("builds grounded context with the original file and page", () => {

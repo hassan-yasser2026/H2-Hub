@@ -1,10 +1,10 @@
 import { GoogleGenAI } from "@google/genai";
-import { QdrantClient } from "@qdrant/js-client-rest";
 import { createHash } from "node:crypto";
+import { Pool } from "pg";
 
 export const EMBEDDING_MODEL = "gemini-embedding-001";
 export const EMBEDDING_DIMENSIONS = 768;
-export const DEFAULT_COLLECTION = "h2_hub_knowledge";
+export const KNOWLEDGE_TABLE = "h2_knowledge_chunks";
 export const MAX_CHUNK_WORDS = 700;
 export const CHUNK_OVERLAP_WORDS = 100;
 export const RAG_TOP_K = 5;
@@ -21,8 +21,8 @@ export type KnowledgeChunk = {
 export type RetrievedChunk = KnowledgeChunk & { score: number };
 
 let embeddingClient: GoogleGenAI | undefined;
-let qdrantClient: QdrantClient | undefined;
-let collectionReady: Promise<void> | undefined;
+let databasePool: Pool | undefined;
+let knowledgeStoreReady: Promise<void> | undefined;
 
 export function splitTextIntoChunks(
   text: string,
@@ -85,66 +85,79 @@ export async function embedTexts(
   return embeddings;
 }
 
-export function getQdrantClient(): QdrantClient {
-  const url = process.env.QDRANT_URL?.trim();
-  const apiKey = process.env.QDRANT_API_KEY?.trim();
-  if (!url || !apiKey) {
-    throw new Error("QDRANT_URL and QDRANT_API_KEY must be configured on the server.");
+export function getDatabasePool(): Pool {
+  const connectionString = process.env.DATABASE_URL?.trim();
+  if (!connectionString) {
+    throw new Error("DATABASE_URL must be configured on the server.");
   }
-  qdrantClient ??= new QdrantClient({ url, apiKey, timeout: 20 });
-  return qdrantClient;
+  databasePool ??= new Pool({
+    connectionString,
+    connectionTimeoutMillis: 10_000,
+    idleTimeoutMillis: 30_000,
+    max: 5,
+  });
+  return databasePool;
 }
 
-export function getCollectionName(): string {
-  return process.env.QDRANT_COLLECTION?.trim() || DEFAULT_COLLECTION;
+export function serializeEmbedding(vector: number[]): string {
+  if (
+    vector.length !== EMBEDDING_DIMENSIONS ||
+    vector.some((value) => !Number.isFinite(value))
+  ) {
+    throw new Error(`Embedding vectors must contain ${EMBEDDING_DIMENSIONS} finite numbers.`);
+  }
+  return `[${vector.join(",")}]`;
 }
 
-export async function ensureKnowledgeCollection(): Promise<void> {
-  if (!collectionReady) {
-    collectionReady = (async () => {
-      const client = getQdrantClient();
-      const collectionName = getCollectionName();
-      const collections = await client.getCollections();
-      if (!collections.collections.some((collection) => collection.name === collectionName)) {
-        await client.createCollection(collectionName, {
-          vectors: { size: EMBEDDING_DIMENSIONS, distance: "Cosine" },
-        });
+export async function ensureKnowledgeStore(): Promise<void> {
+  if (!knowledgeStoreReady) {
+    knowledgeStoreReady = (async () => {
+      const pool = getDatabasePool();
+      const extension = await pool.query<{ extversion: string }>(
+        "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+      );
+      if (extension.rowCount !== 1) {
+        throw new Error("The pgvector extension is not enabled in the PostgreSQL database.");
       }
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS ${KNOWLEDGE_TABLE} (
+          id text PRIMARY KEY,
+          source text NOT NULL,
+          page integer,
+          chunk_index integer NOT NULL,
+          content text NOT NULL,
+          embedding vector(${EMBEDDING_DIMENSIONS}) NOT NULL
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS h2_knowledge_chunks_embedding_hnsw_idx
+        ON ${KNOWLEDGE_TABLE} USING hnsw (embedding vector_cosine_ops)
+      `);
     })();
   }
   try {
-    await collectionReady;
+    await knowledgeStoreReady;
   } catch (error) {
-    collectionReady = undefined;
+    knowledgeStoreReady = undefined;
     throw error;
   }
 }
 
 export async function searchKnowledge(question: string, limit = RAG_TOP_K): Promise<RetrievedChunk[]> {
-  await ensureKnowledgeCollection();
+  await ensureKnowledgeStore();
   const [vector] = await embedTexts([question], "RETRIEVAL_QUERY");
-  const response = await getQdrantClient().query(getCollectionName(), {
-    query: vector,
-    limit,
-    score_threshold: RAG_SCORE_THRESHOLD,
-    with_payload: true,
-  });
-  return response.points.flatMap((point) => {
-    const payload = point.payload;
-    const content = payload?.content;
-    const source = payload?.source;
-    if (typeof content !== "string" || typeof source !== "string") return [];
-    const pageValue = payload?.page;
-    const chunkIndexValue = payload?.chunkIndex;
-    return [{
-      id: String(point.id),
-      source,
-      page: typeof pageValue === "number" ? pageValue : null,
-      chunkIndex: typeof chunkIndexValue === "number" ? chunkIndexValue : 0,
-      content,
-      score: point.score,
-    }];
-  });
+  const result = await getDatabasePool().query<RetrievedChunk>(
+    `
+      SELECT id, source, page, chunk_index AS "chunkIndex", content,
+             1 - (embedding <=> $1::vector) AS score
+      FROM ${KNOWLEDGE_TABLE}
+      WHERE 1 - (embedding <=> $1::vector) >= $2
+      ORDER BY embedding <=> $1::vector
+      LIMIT $3
+    `,
+    [serializeEmbedding(vector), RAG_SCORE_THRESHOLD, Math.min(Math.max(limit, 1), RAG_TOP_K)]
+  );
+  return result.rows.map((row) => ({ ...row, score: Number(row.score) }));
 }
 
 export function formatSourceLabel(source: string, page: number | null): string {

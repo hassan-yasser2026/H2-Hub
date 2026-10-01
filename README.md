@@ -28,29 +28,28 @@ npm run dev
 
 For production, `npm run build` bundles the API server and `npm start` runs it. The server listens on `PORT` (default `3000`).
 
-`GET /health` reports the Railway deployment commit (`deploymentCommit`), whether the feedback routes are present, whether AI provider keys are configured, and whether persistence is available. After a Railway deployment, verify that `deploymentCommit` matches the deployed GitHub SHA and `feedbackRoutesAvailable` is `true`. Qdrant is used only for the course knowledge vector index; account/cloud-sync persistence is not implemented, so cloud-sync routes return `503` until a database and authenticated accounts are added. The AI routes have per-IP rate limits, and the Gemini proxy accepts only the model actions used by the app.
+`GET /health` reports the Railway deployment commit (`deploymentCommit`), whether the feedback routes are present, whether AI provider keys are configured, and whether PostgreSQL persistence is configured. After a Railway deployment, verify that `deploymentCommit` matches the deployed GitHub SHA and `feedbackRoutesAvailable` is `true`. The PostgreSQL database is used for the course knowledge vector index; account/cloud-sync persistence is not implemented, so cloud-sync routes return `503` until authenticated accounts are added. The AI routes have per-IP rate limits, and the Gemini proxy accepts only the model actions used by the app.
 
 ### Smart Cat knowledge search (RAG)
 
-Smart Cat's main chat now calls `POST /api/chat-rag`. The server embeds the question with Google's `gemini-embedding-001`, retrieves up to five relevant passages from Qdrant, and asks Gemini to answer only from those passages. Responses include inline passage references and a source list (PDF page numbers are included when available). PDF text is extracted with Mozilla PDF.js and Word `.docx` text with Mammoth.
+When **الرد من المحتوى التعليمي** is enabled in Android settings, Smart Cat calls `POST /api/chat-rag`. The server embeds the question with Google's `gemini-embedding-001`, retrieves up to five relevant passages from PostgreSQL using pgvector cosine distance, and asks Gemini to answer only from those passages. Responses include inline passage references and a source list (PDF page numbers are included when available). PDF text is extracted with `pdf-parse`; Word `.docx` text uses Mammoth. The embedding model is Google's currently documented text embedding model; `text-embedding-004` is not used.
 
-The chosen vector store is **Qdrant Cloud**: its free tier avoids running a separate database service, while the same Qdrant client can also connect to a self-hosted instance. Embeddings use the existing server-side Gemini key; the app never receives either provider key. Free-tier quotas and provider pricing can change, so review both providers' current limits before production use.
+The vector store is the existing Railway PostgreSQL service and its attached volume. No extra hosted vector database is required. Embeddings use the existing server-side Gemini key; the app never receives the database URL or provider key. Use Google's free API tier if available for the key/account, and monitor its quotas; provider limits and free-tier eligibility can change.
 
 Set these variables in the API server environment (for production, Railway Variables). For local ingestion, put them in the ignored root `.env` file or set them in your shell:
 
 - `GEMINI_API_KEY`: server-only Google AI Studio key.
-- `QDRANT_URL`: the HTTPS URL of the Qdrant cluster.
-- `QDRANT_API_KEY`: the cluster's server-only API key.
-- `QDRANT_COLLECTION`: optional collection name; defaults to `h2_hub_knowledge`.
+- `DATABASE_URL`: PostgreSQL connection string. In Railway, add a reference from the API service to the Postgres service's `DATABASE_URL` variable, for example `${{Postgres.DATABASE_URL}}`.
+- PostgreSQL must have the `vector` extension enabled. The app expects `CREATE EXTENSION IF NOT EXISTS vector;` to have been run in that database.
 
 To add course notes:
 
 1. Put `.pdf`, `.docx`, or `.txt` files in the repository's `docs/` folder. Legacy `.doc` files must be saved as `.docx` first.
-2. In an environment with the server variables above, run `npm install` once and then `npm run ingest`.
-3. The script extracts text, splits it into 700-word chunks with 100 words of overlap, embeds the chunks, and synchronizes Qdrant. PDF sources retain page numbers; DOCX/TXT sources are labelled without a page number. Check extraction without credentials first with `npm run ingest -- --dry-run`.
-4. Deploy/restart the API server. The app's Smart Cat chat then uses the updated knowledge base.
+2. Ensure `DATABASE_URL` and `GEMINI_API_KEY` are available to the ingestion process. Do not put production secrets in Android configuration or commit them.
+3. Run `npm run ingest`. The script extracts text, splits it into 700-word chunks with 100 words of overlap, embeds the chunks, and replaces the indexed corpus in PostgreSQL in one transaction. PDF sources retain page numbers; DOCX/TXT sources are labelled without a page number. Check extraction without credentials first with `npm run ingest -- --dry-run`.
+4. The updated corpus is available to the live endpoint as soon as ingestion commits; no server redeploy is needed.
 
-Five original, small educational PDFs are included under `docs/` as examples. To regenerate them, run `npm run docs:demo`. Run focused offline checks with `npm run test:rag` and type-check/build with `npm run lint` and `npm run build`. A live end-to-end answer additionally requires valid Gemini and Qdrant credentials and an ingested collection.
+Five original, small educational PDFs are included under `docs/` as examples. To regenerate them, run `npm run docs:demo`. Run focused extraction checks with `npm run test:rag` and type-check/build with `npm run lint` and `npm run build`. Live answers additionally require valid Gemini and PostgreSQL variables and an ingested corpus.
 
 To exercise the endpoint, send a `POST` to `/api/chat-rag` with JSON such as:
 
@@ -72,7 +71,7 @@ The server uses `GEMINI_VISION_MODEL` (default `gemini-2.5-flash`) with the exis
 
 As an optional quota fallback, configure a server-side `OPENROUTER_API_KEY`. The server then tries `OPENROUTER_VISION_MODEL` (default `qwen/qwen3.8-27b:free`) only after Gemini returns a quota/rate-limit error. The server rejects fallback model names without the `:free` suffix; OpenRouter free models still have changing availability and request limits. Without the OpenRouter key, Gemini quota errors return an explicit message and no other provider is contacted. Both provider keys stay on the server. Images are capped at 1 MiB, and the server limits image-analysis requests to 30 per IP per 15 minutes.
 
-The Smart Cat composer has one **+** menu for camera capture, gallery images, PDF files, plugins/tools, and deeper reasoning. The tools submenu includes the Socratic tutoring toggle, settings, and a new-chat shortcut. **فكّر بعمق أكبر** selects `gemini-3.1-pro-preview` for the next chat request and falls back to the standard flash model if needed; the selection can be toggled back off. Gemini keys remain server-only. If the dedicated RAG/Socratic route is missing on an old deployment, the app uses the existing Gemini proxy as described above; source grounding or Socratic progress then remains unavailable until the matching server deploy is active.
+The Smart Cat composer has one **+** menu for camera capture, gallery images, PDF files, plugins/tools, and deeper reasoning. The tools submenu includes the Socratic tutoring toggle, settings, and a new-chat shortcut. **فكّر بعمق أكبر** selects `gemini-3.1-pro-preview` for the next chat request and falls back to the standard flash model if needed; the selection can be toggled back off. Gemini keys remain server-only. In educational-content mode, the app does not fall back to ungrounded chat if the RAG endpoint is unavailable.
 
 ### Student learning profile
 

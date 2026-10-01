@@ -1,38 +1,18 @@
 import { readFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import path from "node:path";
 import mammoth from "mammoth";
-import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
+import { PDFParse } from "pdf-parse";
 
 export type PageText = { page: number | null; text: string };
 
-const projectRequire = createRequire(path.join(process.cwd(), "package.json"));
-const pdfjsBuildPath = projectRequire.resolve("pdfjs-dist/legacy/build/pdf.mjs");
-const standardFontDataPath = path.resolve(
-  path.dirname(pdfjsBuildPath),
-  "../../standard_fonts"
-) + path.sep;
-
 async function extractPdfPages(buffer: Buffer): Promise<PageText[]> {
-  const document = await getDocument({
-    data: new Uint8Array(buffer),
-    standardFontDataUrl: standardFontDataPath,
-  }).promise;
-  const pages: PageText[] = [];
+  const parser = new PDFParse({ data: buffer });
   try {
-    for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber++) {
-      const page = await document.getPage(pageNumber);
-      const content = await page.getTextContent();
-      const text = content.items
-        .map((item) => ("str" in item ? item.str : ""))
-        .join(" ")
-        .trim();
-      if (text) pages.push({ page: pageNumber, text });
-    }
+    const result = await parser.getText();
+    return result.pages.map(({ num, text }) => ({ page: num, text: text.trim() }));
   } finally {
-    await document.destroy();
+    await parser.destroy();
   }
-  return pages;
 }
 
 export async function extractDocument(filePath: string): Promise<PageText[]> {
