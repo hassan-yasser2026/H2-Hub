@@ -4,6 +4,10 @@ import android.util.Base64
 import android.util.Log
 import com.example.BuildConfig
 import com.example.data.ChatMessage
+import com.example.data.GeneratedStudySet
+import com.example.data.StudyFlashcard
+import com.example.data.StudyQuestion
+import com.example.data.StudySetMode
 import com.example.data.SocraticProgress
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -20,8 +24,8 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 object GeminiApiClient {
-    data class ChatSummaryTurn(val role: String, val text: String)
     data class SocraticChatResult(val reply: String, val progress: SocraticProgress)
+    data class ProductivitySlide(val title: String, val bullets: List<String>)
 
     enum class FeedbackRating(val wireValue: String) {
         POSITIVE("positive"),
@@ -82,6 +86,122 @@ object GeminiApiClient {
         }
     }
 
+        suspend fun extractProductivityDocument(
+            context: android.content.Context,
+            uri: android.net.Uri,
+            fileName: String
+        ): String = withContext(Dispatchers.IO) {
+            if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
+                throw IOException("عنوان خادم Smart Cat غير مضبوط.")
+            }
+            val resolver = context.contentResolver
+            val bytes = resolver.openInputStream(uri)?.use { stream ->
+                val output = java.io.ByteArrayOutputStream()
+                val buffer = ByteArray(8_192)
+                var total = 0
+                while (true) {
+                    val count = stream.read(buffer)
+                    if (count < 0) break
+                    total += count
+                    if (total > 15 * 1024 * 1024) {
+                        throw IOException("حجم الملف أكبر من الحد المسموح (15 ميجابايت).")
+                    }
+                    output.write(buffer, 0, count)
+                }
+                output.toByteArray()
+            } ?: throw IOException("تعذر قراءة الملف المحدد.")
+            if (bytes.isEmpty()) throw IOException("الملف المحدد فارغ.")
+
+            val mediaType = resolver.getType(uri)?.toMediaType()
+                ?: "application/octet-stream".toMediaType()
+            val body = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("file", fileName, bytes.toRequestBody(mediaType))
+                .build()
+            val request = Request.Builder()
+                .url("$baseUrl/api/productivity/extract")
+                .post(body)
+                .build()
+            client.newCall(request).execute().use { response ->
+                val responseBody = response.body?.string().orEmpty()
+                val json = try {
+                    JSONObject(responseBody)
+                } catch (error: org.json.JSONException) {
+                    Log.e(TAG, "Invalid document extraction response: HTTP ${response.code}", error)
+                    throw IOException(BUSY_MESSAGE)
+                }
+                if (!response.isSuccessful) {
+                    throw IOException(json.optString("error").takeIf(String::isNotBlank) ?: BUSY_MESSAGE)
+                }
+                json.optString("text").takeIf(String::isNotBlank)
+                    ?: throw IOException("لم يعثر الخادم على نص قابل للاستخدام.")
+            }
+        }
+
+        suspend fun summarizeProductivityDocument(
+            text: String,
+            fileName: String,
+            format: String
+        ): String = withContext(Dispatchers.IO) {
+            if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
+                throw IOException("عنوان خادم Smart Cat غير مضبوط.")
+            }
+            if (text.isBlank()) throw IOException("لا يوجد نص لتلخيصه.")
+            val payload = JSONObject()
+                .put("documentText", text.take(120_000))
+                .put("fileName", fileName.take(200))
+                .put("format", format)
+            val (status, body) = postJsonWithNetworkRetries("$baseUrl/api/summarize", payload)
+                ?: throw IOException(CONNECTION_ERROR_MESSAGE)
+            val json = try {
+                JSONObject(body)
+            } catch (error: org.json.JSONException) {
+                Log.e(TAG, "Invalid summary response: HTTP $status", error)
+                throw IOException(BUSY_MESSAGE)
+            }
+            if (status !in 200..299) {
+                throw IOException(json.optString("error").takeIf(String::isNotBlank) ?: BUSY_MESSAGE)
+            }
+            json.optString("summary").takeIf(String::isNotBlank)
+                ?: throw IOException("لم يُنتج الخادم ملخصاً صالحاً.")
+        }
+
+        suspend fun generateProductivityPresentation(summary: String): List<ProductivitySlide> =
+            withContext(Dispatchers.IO) {
+                if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
+                    throw IOException("عنوان خادم Smart Cat غير مضبوط.")
+                }
+                if (summary.isBlank()) throw IOException("أنشئ ملخصاً أولاً قبل إعداد العرض.")
+                val payload = JSONObject()
+                    .put("topic", summary.take(12_000))
+                    .put("slidesCount", 5)
+                val (status, body) = postJsonWithNetworkRetries("$baseUrl/api/presentation", payload)
+                    ?: throw IOException(CONNECTION_ERROR_MESSAGE)
+                val json = try {
+                    JSONObject(body)
+                } catch (error: org.json.JSONException) {
+                    Log.e(TAG, "Invalid presentation response: HTTP $status", error)
+                    throw IOException(BUSY_MESSAGE)
+                }
+                if (status !in 200..299) {
+                    throw IOException(json.optString("error").takeIf(String::isNotBlank) ?: BUSY_MESSAGE)
+                }
+                val slidesJson = json.optJSONArray("slides")
+                    ?: throw IOException("استجابة مخطط العرض غير مكتملة.")
+                if (slidesJson.length() !in 1..12) throw IOException("عدد شرائح العرض غير صالح.")
+                (0 until slidesJson.length()).map { index ->
+                    val slide = slidesJson.getJSONObject(index)
+                    val title = slide.optString("title").trim()
+                    val bulletsJson = slide.optJSONArray("bullets")
+                        ?: throw IOException("إحدى الشرائح لا تحتوي نقاطاً.")
+                    val bullets = (0 until bulletsJson.length()).map { bulletsJson.getString(it).trim() }
+                    if (title.isBlank() || bullets.size !in 3..5 || bullets.any(String::isBlank)) {
+                        throw IOException("بيانات إحدى الشرائح غير مكتملة.")
+                    }
+                    ProductivitySlide(title, bullets)
+                }
+            }
+
     suspend fun submitChatFeedback(
         responseId: String,
         question: String,
@@ -107,6 +227,84 @@ object GeminiApiClient {
         } catch (error: IOException) {
             Log.w(TAG, "Feedback submission failed due to a network error", error)
             false
+        }
+    }
+
+    suspend fun generateStudySet(
+        sourceText: String,
+        mode: StudySetMode,
+        count: Int = 5
+    ): GeneratedStudySet = withContext(Dispatchers.IO) {
+        if (baseUrl.isEmpty()) throw IOException("عنوان خادم Smart Cat غير مضبوط.")
+        if (sourceText.isBlank()) throw IOException("لا يوجد محتوى كافٍ لإنشاء المراجعة.")
+        if (count !in 5..10) throw IOException("عدد الأسئلة أو الكروت يجب أن يكون من 5 إلى 10.")
+
+        val payload = JSONObject()
+            .put("sourceText", sourceText.take(12_000))
+            .put("mode", mode.wireValue)
+            .put("count", count)
+        val (status, body) = postJsonWithNetworkRetries(
+            "$baseUrl/api/generate-quiz",
+            payload
+        ) ?: throw IOException(CONNECTION_ERROR_MESSAGE)
+        if (status !in 200..299) {
+            val errorMessage = try {
+                JSONObject(body).optString("error").takeIf(String::isNotBlank)
+            } catch (_: org.json.JSONException) {
+                null
+            }
+            Log.w(TAG, "Study set generation failed with HTTP $status: $body")
+            throw IOException(errorMessage ?: BUSY_MESSAGE)
+        }
+
+        try {
+            val response = JSONObject(body)
+            val title = response.getString("title").trim()
+            if (title.isEmpty()) throw IOException("عنوان المحتوى المولد فارغ.")
+            val questions = mutableListOf<StudyQuestion>()
+            val cards = mutableListOf<StudyFlashcard>()
+            if (mode == StudySetMode.QUIZ) {
+                val items = response.getJSONArray("questions")
+                if (items.length() !in 5..10) throw IOException("عدد أسئلة الاختبار غير صالح.")
+                for (index in 0 until items.length()) {
+                    val item = items.getJSONObject(index)
+                    val optionsJson = item.getJSONArray("options")
+                    if (optionsJson.length() != 4) throw IOException("يجب أن يحتوي كل سؤال على أربعة اختيارات.")
+                    val options = (0 until optionsJson.length()).map { optionsJson.getString(it).trim() }
+                    val answerIndex = item.getInt("answerIndex")
+                    val question = item.getString("question").trim()
+                    val explanation = item.getString("explanation").trim()
+                    if (
+                        question.isEmpty() || options.any(String::isEmpty) ||
+                        answerIndex !in options.indices || explanation.isEmpty()
+                    ) {
+                        throw IOException("بيانات أحد أسئلة الاختبار غير مكتملة.")
+                    }
+                    questions += StudyQuestion(question, options, answerIndex, explanation)
+                }
+            } else {
+                val items = response.getJSONArray("cards")
+                if (items.length() !in 5..10) throw IOException("عدد كروت المراجعة غير صالح.")
+                for (index in 0 until items.length()) {
+                    val item = items.getJSONObject(index)
+                    val front = item.getString("front").trim()
+                    val back = item.getString("back").trim()
+                    if (front.isEmpty() || back.isEmpty()) {
+                        throw IOException("بيانات أحد كروت المراجعة غير مكتملة.")
+                    }
+                    cards += StudyFlashcard(front, back)
+                }
+            }
+            GeneratedStudySet(
+                title = title,
+                sourceText = sourceText.take(12_000),
+                mode = mode,
+                questions = questions,
+                cards = cards
+            )
+        } catch (error: org.json.JSONException) {
+            Log.e(TAG, "Invalid study set response: $body", error)
+            throw IOException("استجابة إنشاء المراجعة غير صالحة.")
         }
     }
 
@@ -298,8 +496,6 @@ object GeminiApiClient {
     suspend fun generateRagChatResponse(
         history: List<ChatMessage>,
         systemInstruction: String,
-        recentSummaries: List<String> = emptyList(),
-        weakTopics: List<String> = emptyList(),
         forceFullSolution: Boolean = false,
         useThinking: Boolean = thinkingModeEnabled
     ): String = withContext(Dispatchers.IO) {
@@ -317,29 +513,6 @@ object GeminiApiClient {
             .put("forceFullSolution", forceFullSolution)
             .put("useThinking", useThinking)
             .put(
-                "studentMemory",
-                JSONObject()
-                    .put(
-                        "summaries",
-                        JSONArray().apply {
-                            var remainingWords = 500
-                            recentSummaries.take(3).forEach { summary ->
-                                val words = summary.trim().split(Regex("\\s+"))
-                                    .filter(String::isNotBlank)
-                                if (remainingWords <= 0) return@forEach
-                                val limited = words.take(remainingWords).joinToString(" ")
-                                if (limited.isNotBlank()) {
-                                    put(limited)
-                                    remainingWords -= limited.split(Regex("\\s+")).size
-                                }
-                            }
-                        }
-                    )
-                    .put("weakTopics", JSONArray().apply {
-                        weakTopics.take(10).forEach { put(it.take(120)) }
-                    })
-            )
-            .put(
                 "history",
                 JSONArray().apply {
                     history.takeLast(8).forEach { message ->
@@ -354,14 +527,6 @@ object GeminiApiClient {
         val response = postJsonWithNetworkRetries("$baseUrl/api/chat-rag", body)
             ?: return@withContext CONNECTION_ERROR_MESSAGE
         val (code, responseBody) = response
-        if (isMissingApiRoute(code, responseBody)) {
-            return@withContext generateLegacyChatFallback(
-                history,
-                systemInstruction,
-                "RAG chat",
-                useThinking
-            )
-        }
         val responseJson = try {
             JSONObject(responseBody)
         } catch (e: Exception) {
@@ -396,8 +561,6 @@ object GeminiApiClient {
     suspend fun generateSocraticChatResponse(
         history: List<ChatMessage>,
         systemInstruction: String,
-        recentSummaries: List<String>,
-        weakTopics: List<String>,
         progress: SocraticProgress,
         useThinking: Boolean = thinkingModeEnabled
     ): SocraticChatResult? = withContext(Dispatchers.IO) {
@@ -412,25 +575,6 @@ object GeminiApiClient {
             .put("message", latestQuestion)
             .put("systemInstruction", systemInstruction)
             .put("useThinking", useThinking)
-            .put(
-                "studentMemory",
-                JSONObject()
-                    .put("summaries", JSONArray().apply {
-                        var remainingWords = 500
-                        recentSummaries.take(3).forEach { summary ->
-                            if (remainingWords <= 0) return@forEach
-                            val words = summary.trim().split(Regex("\\s+")).filter(String::isNotBlank)
-                            val limited = words.take(remainingWords).joinToString(" ")
-                            if (limited.isNotBlank()) {
-                                put(limited)
-                                remainingWords -= limited.split(Regex("\\s+")).size
-                            }
-                        }
-                    })
-                    .put("weakTopics", JSONArray().apply {
-                        weakTopics.take(10).forEach { put(it.take(120)) }
-                    })
-            )
             .put(
                 "progress",
                 JSONObject()
@@ -516,45 +660,6 @@ object GeminiApiClient {
         else "$reply\n\nالمصادر:\n${sourceLines.joinToString("\n")}"
         SocraticChatResult(replyWithSources, updatedProgress)
     }
-
-    suspend fun generateChatSummary(turns: List<ChatSummaryTurn>): String? =
-        withContext(Dispatchers.IO) {
-            if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
-                Log.e(TAG, "Cannot summarize chat: server URL is not configured")
-                return@withContext null
-            }
-            val body = JSONObject().put(
-                "history",
-                JSONArray().apply {
-                    var remainingCharacters = 30_000
-                    val boundedTurns = turns.takeLast(80).asReversed().mapNotNull { turn ->
-                        if (remainingCharacters <= 0) return@mapNotNull null
-                        val text = turn.text.take(minOf(6_000, remainingCharacters))
-                        remainingCharacters -= text.length
-                        ChatSummaryTurn(turn.role, text)
-                    }.asReversed()
-                    boundedTurns.forEach { turn ->
-                        put(JSONObject()
-                            .put("role", turn.role)
-                            .put("text", turn.text))
-                    }
-                }
-            )
-            val response = postJsonWithNetworkRetries("$baseUrl/api/chat-summary", body)
-                ?: return@withContext null
-            val (code, responseBody) = response
-            val responseJson = try {
-                JSONObject(responseBody)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to parse chat summary response", e)
-                return@withContext null
-            }
-            if (code !in 200..299) {
-                Log.e(TAG, "Chat summary request failed: Code $code, Body: $responseBody")
-                return@withContext null
-            }
-            responseJson.optString("summary").trim().takeIf(String::isNotBlank)
-        }
 
     suspend fun generateVisionResponse(imagePath: String, question: String): String =
         withContext(Dispatchers.IO) {

@@ -10,6 +10,7 @@ import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.os.Build
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -22,15 +23,35 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.*
 import com.example.network.GeminiApiClient
+import com.example.network.encodeChatVisionMessage
+import com.example.network.parseChatVisionMessage
+import com.example.network.QuranAyah
+import com.example.network.QuranCoachApiClient
+import com.example.network.QuranRecitationResult
+import com.example.network.QuranSurah
+import com.example.QuranReminderReceiver
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import java.io.File
-import java.io.FileOutputStream
+import java.io.IOException
 import java.util.*
+
+private const val KEY_SOCRATIC_MODE = "socratic_mode_enabled"
+private const val KEY_EDUCATIONAL_CONTENT_MODE = "educational_content_mode_enabled"
+private const val KEY_SOCRATIC_PROGRESS_PREFIX = "socratic_progress_"
+private const val KEY_SPEECH_RECOGNITION_LOCALE = "speech_recognition_locale"
+private const val KEY_TTS_SPEECH_SPEED = "tts_speech_speed"
+private const val KEY_PRODUCTIVITY_SUMMARY_FORMAT = "productivity_summary_format"
+private const val KEY_DEFAULT_PERSONA_ID = "default_persona_id"
+private const val KEY_PERSONA_AUTO_VOICE = "persona_auto_voice"
+private const val KEY_ORGANIZER_CONFIRM_DELETE = "organizer_confirm_delete"
+private const val KEY_TRACK_LEARNING_PROFILE = "track_learning_profile"
+private const val KEY_STUDY_QUIZ_COUNT = "study_quiz_count"
 
 class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val TAG = "AppViewModel"
@@ -38,25 +59,114 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val prefs = context.getSharedPreferences("h2hub_prefs", Context.MODE_PRIVATE)
     private val database = AppDatabase.getDatabase(context)
     private val repository = AppRepository(database.appDao())
+    private val learningRepository = LearningProfileRepository(
+        LearningProfileDatabase.getDatabase(context).learningProfileDao()
+    )
+    private val summarizingSessions = mutableSetOf<String>()
 
     // Text to Speech Fallback (Android Native)
     private var textToSpeech: TextToSpeech? = null
     private var isTtsInitialized = false
+    private var speechGeneration = 0
+    private data class SpeechSession(
+        val id: String,
+        val generation: Int,
+        val chunks: List<String>,
+        val personaId: String?,
+        var chunkIndex: Int = 0,
+        var characterOffset: Int = 0,
+        var utteranceBaseOffset: Int = 0
+    )
+    private var speechSession: SpeechSession? = null
 
-    // MediaPlayer for Gemini Voice API
-    private var mediaPlayer: MediaPlayer? = null
-    private var playbackFile: File? = null
-
-    // MediaRecorder for Audio Transcription Simulation
-    private var mediaRecorder: MediaRecorder? = null
-    private var audioFile: File? = null
+    private var quranMediaRecorder: MediaRecorder? = null
+    private var quranRecordingFile: File? = null
+    private var quranReciterPlayer: MediaPlayer? = null
+    private var quranReciterPlaybackJob: Job? = null
 
     init {
         // Initialize Android TextToSpeech
         textToSpeech = TextToSpeech(context) { status ->
             if (status == TextToSpeech.SUCCESS) {
-                textToSpeech?.language = Locale("ar")
+                textToSpeech?.language = Locale.forLanguageTag("ar")
+                textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) {
+                        val session = speechSession ?: return
+                        if (utteranceId?.startsWith("${session.generation}:") == true) {
+                            _isSpeaking.value = true
+                        }
+                    }
+
+                    override fun onDone(utteranceId: String?) {
+                        val session = speechSession ?: return
+                        val chunkIndex = utteranceId?.substringAfter(':')?.toIntOrNull()
+                        if (
+                            session.generation == speechGeneration &&
+                            chunkIndex == session.chunkIndex &&
+                            _isSpeaking.value
+                        ) {
+                            session.chunkIndex++
+                            session.characterOffset = 0
+                            speakCurrentChunk(session)
+                        }
+                    }
+
+                    @Deprecated("Deprecated in Android")
+                    override fun onError(utteranceId: String?) {
+                        val session = speechSession ?: return
+                        val chunkIndex = utteranceId?.substringAfter(':')?.toIntOrNull()
+                        if (
+                            session.generation == speechGeneration &&
+                            chunkIndex == session.chunkIndex &&
+                            _isSpeaking.value
+                        ) {
+                            _isSpeaking.value = false
+                            _activeSpeechId.value = null
+                            speechSession = null
+                        }
+                    }
+
+                    override fun onRangeStart(
+                        utteranceId: String?,
+                        start: Int,
+                        end: Int,
+                        frame: Int
+                    ) {
+                        val session = speechSession ?: return
+                        val chunkIndex = utteranceId?.substringAfter(':')?.toIntOrNull()
+                        if (
+                            session.generation == speechGeneration &&
+                            chunkIndex == session.chunkIndex
+                        ) {
+                            session.characterOffset =
+                                (session.utteranceBaseOffset + end).coerceAtMost(
+                                    session.chunks[session.chunkIndex].length
+                                )
+                        }
+                    }
+                })
                 isTtsInitialized = true
+                speechSession?.let(::speakCurrentChunk)
+            } else {
+                Log.e(TAG, "Android text-to-speech initialization failed with status $status")
+                speechSession = null
+                _isSpeaking.value = false
+                _activeSpeechId.value = null
+            }
+        }
+        viewModelScope.launch {
+            try {
+                learningRepository.refreshUserProfile()
+                repository.allSessions.first().forEach { session ->
+                    learningRepository.mirrorConversation(
+                        id = session.id,
+                        title = session.title,
+                        startedAt = session.timestamp,
+                        messages = repository.getMessagesForSession(session.id)
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to sync existing chat history to the learning profile", e)
             }
         }
     }
@@ -67,6 +177,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         1. Strict Anti-Cheating: If a student asks for answers to exam questions, you MUST NOT give direct copy-paste solutions. Instead, analyze the question conceptually and guide the student step-by-step so they can solve it themselves. Encourage thinking.
         2. Strict Ethics Layer: Completely reject any requests to generate or assist with illegal, unethical, harmful, inappropriate, or religiously offensive content (حرام/مخالف للدين والقانون).
         3. Do not help with academic fraud, cheating, hacking, or generating malicious code.
+
+        $SMART_CHAT_MATH_INSTRUCTION
     """.trimIndent()
 
     // --- State Holders ---
@@ -81,10 +193,116 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _currentMessages = MutableStateFlow<List<ChatMessage>>(emptyList())
     val currentMessages: StateFlow<List<ChatMessage>> = _currentMessages.asStateFlow()
 
+    private val _socraticModeEnabled = MutableStateFlow(
+        prefs.getBoolean(KEY_SOCRATIC_MODE, false)
+    )
+    val socraticModeEnabled: StateFlow<Boolean> = _socraticModeEnabled.asStateFlow()
+
+    private val _educationalContentEnabled = MutableStateFlow(
+        prefs.getBoolean(KEY_EDUCATIONAL_CONTENT_MODE, false)
+    )
+    val educationalContentEnabled: StateFlow<Boolean> = _educationalContentEnabled.asStateFlow()
+
+    private val _socraticProgress = MutableStateFlow(SocraticProgress())
+    val socraticProgress: StateFlow<SocraticProgress> = _socraticProgress.asStateFlow()
+
+    val learningQuestionCount: StateFlow<Int> = learningRepository.questionCount
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
+    val learningSubjectCounts: StateFlow<List<SubjectInteractionCount>> = learningRepository.subjectCounts
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val learningTopicStats: StateFlow<List<LearningTopicStat>> = learningRepository.topicStats
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val learningQuestionTimestamps: StateFlow<List<Long>> = learningRepository.questionTimestamps
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val learningConversations: StateFlow<List<LearningConversationEntity>> = learningRepository.conversations
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val learningUserProfile: StateFlow<LearningUserProfileEntity?> = learningRepository.userProfile
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+    val learningQuizResults: StateFlow<List<LearningQuizResultEntity>> = learningRepository.quizResults
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    private val _generatedStudySet = MutableStateFlow<GeneratedStudySet?>(null)
+    val generatedStudySet: StateFlow<GeneratedStudySet?> = _generatedStudySet.asStateFlow()
+    private val _isGeneratingStudySet = MutableStateFlow(false)
+    val isGeneratingStudySet: StateFlow<Boolean> = _isGeneratingStudySet.asStateFlow()
+    private val _studySetError = MutableStateFlow<String?>(null)
+    val studySetError: StateFlow<String?> = _studySetError.asStateFlow()
+    private var lastStudySetRequest: Pair<String, StudySetMode>? = null
+
     private val _isGeneratingChat = MutableStateFlow(false)
     val isGeneratingChat: StateFlow<Boolean> = _isGeneratingChat.asStateFlow()
 
-    val useThinkingMode = MutableStateFlow(false)
+    private val _chatActionError = MutableStateFlow<String?>(null)
+    val chatActionError: StateFlow<String?> = _chatActionError.asStateFlow()
+
+    val useThinkingMode = MutableStateFlow(
+        prefs.getBoolean("thinking_mode_enabled", false)
+    )
+
+    fun setThinkingModeEnabled(enabled: Boolean) {
+        useThinkingMode.value = enabled
+        GeminiApiClient.setThinkingModeEnabled(enabled)
+        prefs.edit().putBoolean("thinking_mode_enabled", enabled).apply()
+    }
+
+    fun setAutoReadChatEnabled(enabled: Boolean) {
+        autoReadChatEnabled.value = enabled
+        prefs.edit().putBoolean("chat_auto_read", enabled).apply()
+    }
+
+    fun generateStudySet(sourceText: String, mode: StudySetMode) {
+        val cleanSource = sourceText.trim().take(12_000)
+        if (cleanSource.isEmpty()) {
+            _studySetError.value = "لا يوجد محتوى كافٍ لإنشاء المراجعة."
+            return
+        }
+        lastStudySetRequest = cleanSource to mode
+        _generatedStudySet.value = null
+        _studySetError.value = null
+        _isGeneratingStudySet.value = true
+        viewModelScope.launch {
+            try {
+                _generatedStudySet.value = GeminiApiClient.generateStudySet(
+                    cleanSource,
+                    mode,
+                    if (mode == StudySetMode.QUIZ) studyQuizQuestionCount.value else 5
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: IOException) {
+                Log.w(TAG, "Failed to generate a study set", error)
+                _studySetError.value = error.localizedMessage
+                    ?: "تعذر إنشاء المراجعة. حاول مرة أخرى."
+            } catch (error: Exception) {
+                Log.e(TAG, "Unexpected study set generation failure", error)
+                _studySetError.value = "حدث خطأ غير متوقع أثناء إنشاء المراجعة."
+            } finally {
+                _isGeneratingStudySet.value = false
+            }
+        }
+    }
+
+    fun retryStudySetGeneration() {
+        lastStudySetRequest?.let { (sourceText, mode) -> generateStudySet(sourceText, mode) }
+    }
+
+    fun saveQuizResult(id: String, title: String, score: Int, totalQuestions: Int) {
+        viewModelScope.launch {
+            try {
+                learningRepository.saveQuizResult(
+                    LearningQuizResultEntity(
+                        id = id,
+                        title = title,
+                        score = score.coerceIn(0, totalQuestions),
+                        totalQuestions = totalQuestions,
+                        completedAt = System.currentTimeMillis()
+                    )
+                )
+            } catch (error: Exception) {
+                Log.e(TAG, "Failed to save local quiz result", error)
+            }
+        }
+    }
 
     // 2. Productivity States
     val productivityDocs: StateFlow<List<ProductivityDoc>> = repository.allProductivityDocs
@@ -96,31 +314,39 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _isGeneratingProd = MutableStateFlow(false)
     val isGeneratingProd: StateFlow<Boolean> = _isGeneratingProd.asStateFlow()
 
+    private val _isExtractingProductivityFile = MutableStateFlow(false)
+    val isExtractingProductivityFile: StateFlow<Boolean> = _isExtractingProductivityFile.asStateFlow()
+
+    private val _productivityFileName = MutableStateFlow<String?>(null)
+    val productivityFileName: StateFlow<String?> = _productivityFileName.asStateFlow()
+
+    private val _productivitySourceText = MutableStateFlow("")
+    val productivitySourceText: StateFlow<String> = _productivitySourceText.asStateFlow()
+
+    private val _productivityError = MutableStateFlow<String?>(null)
+    val productivityError: StateFlow<String?> = _productivityError.asStateFlow()
+
+    private val _latestProductivitySummary = MutableStateFlow<String?>(null)
+    val latestProductivitySummary: StateFlow<String?> = _latestProductivitySummary.asStateFlow()
+
     private val _simulatedSTTText = MutableStateFlow<String?>(null)
     val simulatedSTTText: StateFlow<String?> = _simulatedSTTText.asStateFlow()
+    val productivitySummaryFormat = MutableStateFlow(
+        prefs.getString(KEY_PRODUCTIVITY_SUMMARY_FORMAT, "short") ?: "short"
+    )
 
     // 3. AI Personas States
-    val selectedPersonaId = MutableStateFlow("hasan")
-    // Auto-speaking personas is off: the user removed the voice toggle from the UI,
-    // so replies must never speak on their own (per-message speaker buttons remain).
-    val personaVoiceEnabled = MutableStateFlow(false)
+    val selectedPersonaId = MutableStateFlow(
+        prefs.getString(KEY_DEFAULT_PERSONA_ID, "hasan") ?: "hasan"
+    )
+    val personaVoiceEnabled = MutableStateFlow(
+        prefs.getBoolean(KEY_PERSONA_AUTO_VOICE, false)
+    )
     private val _isGeneratingPersona = MutableStateFlow(false)
     val isGeneratingPersona: StateFlow<Boolean> = _isGeneratingPersona.asStateFlow()
 
     private val _personaMessages = MutableStateFlow<Map<String, List<ChatMessage>>>(emptyMap())
     val personaMessages: StateFlow<Map<String, List<ChatMessage>>> = _personaMessages.asStateFlow()
-
-    // 4. Image/Video Generation States
-    private val _generatedImageBase64 = MutableStateFlow<String?>(null)
-    val generatedImageBase64: StateFlow<String?> = _generatedImageBase64.asStateFlow()
-
-    private val _generatedVideoUrl = MutableStateFlow<String?>(null)
-    val generatedVideoUrl: StateFlow<String?> = _generatedVideoUrl.asStateFlow()
-
-    private val _isGeneratingImageOrVideo = MutableStateFlow(false)
-    val isGeneratingImageOrVideo: StateFlow<Boolean> = _isGeneratingImageOrVideo.asStateFlow()
-
-    val imageToAnimateBase64 = MutableStateFlow<String?>(null)
 
     // 5. Organizer/Scheduler States
     val userSchedule: StateFlow<UserSchedule?> = repository.userSchedule
@@ -129,24 +355,74 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _isGeneratingSchedule = MutableStateFlow(false)
     val isGeneratingSchedule: StateFlow<Boolean> = _isGeneratingSchedule.asStateFlow()
 
-    // 6. Quran Section States
-    val quranRecords: StateFlow<List<QuranRecord>> = repository.allQuranRecords
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    // 6. General App Settings
+    val appTheme = MutableStateFlow(
+        prefs.getString("app_theme", "purple") ?: "purple"
+    )
+    val isStudyModeActive = MutableStateFlow(false)
+    val isAnalyzingImageOrDoc = MutableStateFlow(false)
+    val speechSpeed = MutableStateFlow(
+        prefs.getFloat(KEY_TTS_SPEECH_SPEED, 0.95f).coerceIn(0.75f, 1.25f)
+    )
+    val appLanguage = MutableStateFlow("ar") // "ar" for Arabic, "en" for English
+    val autoReadChatEnabled = MutableStateFlow(
+        prefs.getBoolean("chat_auto_read", false)
+    )
+    val organizerConfirmDelete = MutableStateFlow(
+        prefs.getBoolean(KEY_ORGANIZER_CONFIRM_DELETE, true)
+    )
+    val trackLearningProfile = MutableStateFlow(
+        prefs.getBoolean(KEY_TRACK_LEARNING_PROFILE, true)
+    )
+    val studyQuizQuestionCount = MutableStateFlow(
+        prefs.getInt(KEY_STUDY_QUIZ_COUNT, 5).coerceIn(5, 10)
+    )
+
+    private val _quranSurahs = MutableStateFlow<List<QuranSurah>>(emptyList())
+    val quranSurahs: StateFlow<List<QuranSurah>> = _quranSurahs.asStateFlow()
+
+    private val _selectedQuranSurah = MutableStateFlow<QuranSurah?>(null)
+    val selectedQuranSurah: StateFlow<QuranSurah?> = _selectedQuranSurah.asStateFlow()
+
+    private val _quranAyahs = MutableStateFlow<List<QuranAyah>>(emptyList())
+    val quranAyahs: StateFlow<List<QuranAyah>> = _quranAyahs.asStateFlow()
+
+    private val _selectedQuranAyah = MutableStateFlow<QuranAyah?>(null)
+    val selectedQuranAyah: StateFlow<QuranAyah?> = _selectedQuranAyah.asStateFlow()
+
+    private val _isLoadingQuran = MutableStateFlow(false)
+    val isLoadingQuran: StateFlow<Boolean> = _isLoadingQuran.asStateFlow()
+
+    private val _isLoadingAyahs = MutableStateFlow(false)
+    val isLoadingAyahs: StateFlow<Boolean> = _isLoadingAyahs.asStateFlow()
 
     private val _isRecordingQuran = MutableStateFlow(false)
     val isRecordingQuran: StateFlow<Boolean> = _isRecordingQuran.asStateFlow()
 
-    private val _isAnalyzingQuran = MutableStateFlow(false)
-    val isAnalyzingQuran: StateFlow<Boolean> = _isAnalyzingQuran.asStateFlow()
+    private val _isCheckingQuran = MutableStateFlow(false)
+    val isCheckingQuran: StateFlow<Boolean> = _isCheckingQuran.asStateFlow()
 
-    // 7. General App Settings
-    val appTheme = MutableStateFlow("purple") // "purple", "dark", "light"
-    val isStudyModeActive = MutableStateFlow(false)
-    val isAnalyzingImageOrDoc = MutableStateFlow(false)
-    val speechSpeed = MutableStateFlow(1.0f)
-    val appLanguage = MutableStateFlow("ar") // "ar" for Arabic, "en" for English
-    val selectedVoice = MutableStateFlow("Kore") // Default Kore (Clear female voice)
-    val autoReadChatEnabled = MutableStateFlow(false) // Option to auto-read AI chat replies
+    private val _quranRecitationResult = MutableStateFlow<QuranRecitationResult?>(null)
+    val quranRecitationResult: StateFlow<QuranRecitationResult?> = _quranRecitationResult.asStateFlow()
+
+    private val _quranCoachError = MutableStateFlow<String?>(null)
+    val quranCoachError: StateFlow<String?> = _quranCoachError.asStateFlow()
+    private var quranSurahsLoaded = false
+    val quranRecords: StateFlow<List<QuranRecord>> = repository.allQuranRecords
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    private val _quranReciterName = MutableStateFlow<String?>(null)
+    val quranReciterName: StateFlow<String?> = _quranReciterName.asStateFlow()
+
+    val quranReminderEnabled = MutableStateFlow(
+        prefs.getBoolean(QuranReminderReceiver.KEY_ENABLED, false)
+    )
+    val quranReminderHour = MutableStateFlow(
+        prefs.getInt(QuranReminderReceiver.KEY_HOUR, 20)
+    )
+    val quranReminderMinute = MutableStateFlow(
+        prefs.getInt(QuranReminderReceiver.KEY_MINUTE, 0)
+    )
 
     // Gamification States (persisted across app restarts)
     val userPoints = MutableStateFlow(prefs.getInt("user_points", 240))
@@ -209,6 +485,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _speechInputText = MutableStateFlow("")
     val speechInputText: StateFlow<String> = _speechInputText.asStateFlow()
 
+    private val _speechAmplitude = MutableStateFlow(0f)
+    val speechAmplitude: StateFlow<Float> = _speechAmplitude.asStateFlow()
+
+    private val _isProcessingSpeech = MutableStateFlow(false)
+    val isProcessingSpeech: StateFlow<Boolean> = _isProcessingSpeech.asStateFlow()
+
+    private val _speechRecognitionError = MutableStateFlow<String?>(null)
+    val speechRecognitionError: StateFlow<String?> = _speechRecognitionError.asStateFlow()
+
     private var speechRecognizer: SpeechRecognizer? = null
 
     // --- Helper Functions & Actions ---
@@ -216,7 +501,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private var messagesCollectionJob: Job? = null
 
     fun selectSession(sessionId: String?) {
+        val previousSessionId = _currentSessionId.value
+        if (previousSessionId != null && previousSessionId != sessionId) {
+            summarizeSession(previousSessionId)
+        }
         _currentSessionId.value = sessionId
+        _socraticProgress.value = sessionId?.let(::readSocraticProgress) ?: SocraticProgress()
         // Cancel the previous collector so old sessions never overwrite the visible messages
         messagesCollectionJob?.cancel()
         messagesCollectionJob = null
@@ -234,14 +524,48 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun startNewSession(title: String) {
         val newId = UUID.randomUUID().toString()
         viewModelScope.launch {
+            _currentSessionId.value?.let(::summarizeSession)
             repository.insertSession(ChatSession(id = newId, title = title))
+            persistSocraticProgress(newId, SocraticProgress())
+            try {
+                learningRepository.mirrorConversation(
+                    id = newId,
+                    title = title,
+                    startedAt = System.currentTimeMillis(),
+                    messages = emptyList()
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to create learning profile conversation", e)
+            }
             selectSession(newId)
+        }
+    }
+
+    fun closeCurrentChatSession() {
+        _currentSessionId.value?.let(::summarizeSession)
+    }
+
+    fun ensureActiveChatSession() {
+        if (_currentSessionId.value != null) return
+        viewModelScope.launch {
+            if (_currentSessionId.value != null) return@launch
+            val sessions = repository.allSessions.first()
+            if (sessions.isNotEmpty()) {
+                selectSession(sessions.first().id)
+            } else {
+                startNewSession("محادثة رئيسية")
+            }
         }
     }
 
     fun deleteSession(sessionId: String) {
         viewModelScope.launch {
             repository.deleteSession(sessionId)
+            try {
+                learningRepository.deleteConversation(sessionId)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to delete learning profile conversation", e)
+            }
             if (_currentSessionId.value == sessionId) {
                 _currentSessionId.value = null
                 _currentMessages.value = emptyList()
@@ -249,10 +573,191 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun summarizeSession(sessionId: String) {
+        if (!summarizingSessions.add(sessionId)) return
+        viewModelScope.launch {
+            try {
+                var conversation = learningRepository.getConversation(sessionId)
+                if (conversation == null) {
+                    syncLearningConversation(sessionId)
+                    conversation = learningRepository.getConversation(sessionId)
+                }
+                val messages = learningRepository.getMessages(sessionId)
+                val lastMessage = messages.lastOrNull() ?: return@launch
+                if (conversation?.summaryForMessageId == lastMessage.id) return@launch
+                val summary = summarizeConversationLocally(messages) ?: return@launch
+                learningRepository.saveSummary(
+                    id = sessionId,
+                    summary = summary,
+                    summarizedAt = System.currentTimeMillis(),
+                    lastMessageId = lastMessage.id
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to summarize chat session $sessionId", e)
+            } finally {
+                summarizingSessions.remove(sessionId)
+            }
+        }
+    }
+
+    private suspend fun persistLearningMessage(message: ChatMessage) {
+        repository.insertMessage(message)
+        try {
+            if (learningRepository.getConversation(message.sessionId) == null) {
+                syncLearningConversation(message.sessionId)
+            }
+            learningRepository.saveMessage(message)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to save chat message in the learning profile", e)
+        }
+    }
+
+    private suspend fun syncLearningConversation(sessionId: String) {
+        val session = repository.allSessions.first().firstOrNull { it.id == sessionId } ?: return
+        learningRepository.mirrorConversation(
+            id = session.id,
+            title = session.title,
+            startedAt = session.timestamp,
+            messages = repository.getMessagesForSession(sessionId)
+        )
+    }
+
+    private suspend fun recordLearningQuestion(sessionId: String, text: String) {
+        if (!trackLearningProfile.value) return
+        val topic = classifyLearningQuestion(text)
+        try {
+            learningRepository.addQuestion(
+                LearningQuestionEntity(
+                    id = UUID.randomUUID().toString(),
+                    sessionId = sessionId,
+                    timestamp = System.currentTimeMillis(),
+                    subject = topic.subject,
+                    topic = topic.topic,
+                    question = text.take(500)
+                )
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to record student learning question", e)
+        }
+    }
+
+    private suspend fun loadRecentLocalSummaries(currentSessionId: String): List<String> =
+        try {
+            learningRepository.getRecentSummaries(excludeSessionId = currentSessionId)
+                .mapNotNull { it.summary }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load local conversation summaries", e)
+            emptyList()
+        }
+
+    private fun isStudentQuestion(text: String): Boolean =
+        text.contains('?') || text.contains('؟') ||
+            listOf(
+                "اشرح", "وضح", "ازاي", "كيف", "لماذا", "ليه", "ما هو", "ماهي",
+                "ما الفرق", "ما معنى", "ماذا", "هل ", "حل ", "احسب", "اوجد", "أوجد",
+                "قارن", "what ", "how ", "why ", "explain ", "solve ", "calculate "
+            )
+                .any { text.contains(it, ignoreCase = true) }
+
+    fun setSocraticModeEnabled(enabled: Boolean) {
+        _socraticModeEnabled.value = enabled
+        prefs.edit().putBoolean(KEY_SOCRATIC_MODE, enabled).apply()
+        if (enabled) {
+            _currentSessionId.value?.let { sessionId ->
+                val current = _socraticProgress.value
+                if (!current.awaitingAnswer) {
+                    updateSocraticProgress(sessionId, SocraticProgress())
+                }
+            }
+        }
+    }
+
+    fun setEducationalContentEnabled(enabled: Boolean) {
+        _educationalContentEnabled.value = enabled
+        prefs.edit().putBoolean(KEY_EDUCATIONAL_CONTENT_MODE, enabled).apply()
+    }
+
+    fun requestReadySolution() {
+        val question = _socraticProgress.value.originalQuestion.trim()
+        if (question.isBlank()) return
+        setSocraticModeEnabled(false)
+        sendChatMessage("عايز الحل الجاهز للسؤال:\n$question", forceFullSolution = true)
+    }
+
+    private fun readSocraticProgress(sessionId: String): SocraticProgress {
+        val serialized = prefs.getString("$KEY_SOCRATIC_PROGRESS_PREFIX$sessionId", null)
+            ?: return SocraticProgress()
+        return try {
+            val saved = org.json.JSONObject(serialized)
+            SocraticProgress(
+                originalQuestion = saved.optString("originalQuestion"),
+                step = saved.optInt("step").coerceIn(0, 8),
+                totalSteps = saved.optInt("totalSteps", 5).coerceIn(3, 8),
+                correctStreak = saved.optInt("correctStreak").coerceIn(0, 2),
+                wrongStreak = saved.optInt("wrongStreak").coerceIn(0, 1),
+                difficultyLevel = saved.optInt("difficultyLevel", 2).coerceIn(1, 5),
+                awaitingAnswer = saved.optBoolean("awaitingAnswer"),
+                complete = saved.optBoolean("complete")
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to restore Socratic progress for session $sessionId", e)
+            SocraticProgress()
+        }
+    }
+
+    private fun persistSocraticProgress(sessionId: String, progress: SocraticProgress) {
+        val serialized = org.json.JSONObject()
+            .put("originalQuestion", progress.originalQuestion)
+            .put("step", progress.step)
+            .put("totalSteps", progress.totalSteps)
+            .put("correctStreak", progress.correctStreak)
+            .put("wrongStreak", progress.wrongStreak)
+            .put("difficultyLevel", progress.difficultyLevel)
+            .put("awaitingAnswer", progress.awaitingAnswer)
+            .put("complete", progress.complete)
+            .toString()
+        prefs.edit().putString("$KEY_SOCRATIC_PROGRESS_PREFIX$sessionId", serialized).apply()
+    }
+
+    private fun updateSocraticProgress(sessionId: String, progress: SocraticProgress) {
+        _socraticProgress.value = progress
+        persistSocraticProgress(sessionId, progress)
+    }
+
+    fun deleteQuranRecord(recordId: String) {
+        viewModelScope.launch { repository.deleteQuranRecord(recordId) }
+    }
+
+    fun setQuranReminder(hour: Int, minute: Int, enabled: Boolean) {
+        quranReminderHour.value = hour
+        quranReminderMinute.value = minute
+        quranReminderEnabled.value = enabled
+        prefs.edit()
+            .putInt(QuranReminderReceiver.KEY_HOUR, hour)
+            .putInt(QuranReminderReceiver.KEY_MINUTE, minute)
+            .apply()
+        if (enabled) {
+            QuranReminderReceiver.schedule(context, hour, minute)
+        } else {
+            QuranReminderReceiver.cancel(context)
+        }
+    }
+
+    fun setQuranReminderTime(hour: Int, minute: Int) {
+        quranReminderHour.value = hour
+        quranReminderMinute.value = minute
+        prefs.edit()
+            .putInt(QuranReminderReceiver.KEY_HOUR, hour)
+            .putInt(QuranReminderReceiver.KEY_MINUTE, minute)
+            .apply()
+    }
+
     // --- CORE FUNCTIONS ---
 
     // 1. SMART CHAT (SMART CAT)
-    fun sendChatMessage(text: String) {
+    fun sendChatMessage(text: String, forceFullSolution: Boolean = false) {
         val sessionId = _currentSessionId.value ?: return
         if (text.trim().isEmpty()) return
 
@@ -266,36 +771,101 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     content = text,
                     timestamp = System.currentTimeMillis()
                 )
-                repository.insertMessage(userMsg)
+                persistLearningMessage(userMsg)
+                if (isLearningAcknowledgement(text)) {
+                    try {
+                        learningRepository.markLatestTopicAsStrength()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to record understood topic in the learning profile", e)
+                    }
+                } else if (isStudentQuestion(text)) {
+                    recordLearningQuestion(sessionId, text)
+                }
 
-                // The repository flow is the single source of truth for the UI.
-                val updatedList = _currentMessages.value + userMsg
+                val updatedList = (_currentMessages.value + userMsg).map { message ->
+                    val visionAttachment = parseChatVisionMessage(message.content)
+                    if (visionAttachment == null) message
+                    else message.copy(content = "[صورة لمسألة: ${visionAttachment.question}]")
+                }
                 val systemPrompt = """
-                    أنت مساعد ذكي ومحاور متميز فائق السرعة في تطبيق H2 Hub يحمل اسم "Smart Cat".
-                    أنت تتذكر سياق المحادثة بالكامل. أجب بلغة عربية فصيحة ومقنعة وسلسة.
+                    أنت مساعد ذكي ومحاور متميز في تطبيق H2 Hub باسم "Smart Cat".
+                    أجب بلغة الطالب بوضوح، ووجّه الطالب للتعلّم بدلاً من تسهيل الغش.
+                    $SMART_CHAT_MATH_INSTRUCTION
                     $safetySystemInstruction
                 """.trimIndent()
-
                 val aiResponse = kotlinx.coroutines.withTimeoutOrNull(90_000) {
-                    GeminiApiClient.generateChatResponse(
-                        history = updatedList,
-                        systemInstruction = systemPrompt,
-                        useThinking = useThinkingMode.value
-                    )
+                    if (isLocalMemoryRecallQuestion(text)) {
+                        formatLocalMemoryRecall(loadRecentLocalSummaries(sessionId), text)
+                    } else {
+                        val currentTopic = classifyLearningQuestion(text)
+                        val repeatedWeakness = try {
+                            learningRepository.getTopicStats().any {
+                                it.subject == currentTopic.subject &&
+                                    it.topic == currentTopic.topic &&
+                                    it.isWeakness
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Failed to read the local learning profile", e)
+                            false
+                        }
+                        val adaptivePrompt = if (repeatedWeakness) {
+                            "$systemPrompt\nاشرح هذا السؤال بخطوات قصيرة وتحقق من الفهم بسؤال تدريبي واحد."
+                        } else {
+                            systemPrompt
+                        }
+                        when {
+                            _socraticModeEnabled.value && !forceFullSolution -> {
+                                val activeProgress = _socraticProgress.value.let { progress ->
+                                    if (progress.complete || progress.originalQuestion.isBlank()) {
+                                        SocraticProgress(originalQuestion = text)
+                                    } else {
+                                        progress
+                                    }
+                                }
+                                updateSocraticProgress(sessionId, activeProgress)
+                                val result = GeminiApiClient.generateSocraticChatResponse(
+                                    history = updatedList,
+                                    systemInstruction = adaptivePrompt,
+                                    progress = activeProgress
+                                )
+                                if (result == null) {
+                                    "تعذر إنشاء خطوة تعليمية. تحقق من الاتصال وحاول مرة أخرى."
+                                } else {
+                                    updateSocraticProgress(
+                                        sessionId,
+                                        result.progress.copy(
+                                            originalQuestion = activeProgress.originalQuestion
+                                        )
+                                    )
+                                    result.reply
+                                }
+                            }
+                            _educationalContentEnabled.value -> {
+                                GeminiApiClient.generateRagChatResponse(
+                                    history = updatedList,
+                                    systemInstruction = adaptivePrompt,
+                                    forceFullSolution = forceFullSolution
+                                )
+                            }
+                            else -> GeminiApiClient.generateChatResponse(
+                                history = updatedList,
+                                systemInstruction = adaptivePrompt
+                            )
+                        }
+                    }
                 } ?: "تعذر الحصول على رد خلال الوقت المتوقع. تحقق من اتصال الإنترنت وحاول مرة أخرى."
 
-                repository.insertMessage(
-                    ChatMessage(
-                        id = UUID.randomUUID().toString(),
-                        sessionId = sessionId,
-                        role = "model",
-                        content = aiResponse,
-                        timestamp = System.currentTimeMillis()
-                    )
+                val assistantMessage = ChatMessage(
+                    id = UUID.randomUUID().toString(),
+                    sessionId = sessionId,
+                    role = "model",
+                    content = aiResponse,
+                    timestamp = System.currentTimeMillis()
                 )
+                persistLearningMessage(assistantMessage)
 
                 if (autoReadChatEnabled.value) {
-                    speakText(aiResponse)
+                    speakText(aiResponse, assistantMessage.id)
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Chat generation failed", e)
@@ -305,7 +875,208 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun sendChatAttachment(base64Data: String, mimeType: String) {
+        val sessionId = _currentSessionId.value ?: return
+        if (!mimeType.startsWith("image/") && mimeType != "application/pdf") {
+            Log.e(TAG, "Unsupported chat attachment type: $mimeType")
+            return
+        }
+
+        viewModelScope.launch {
+            _isGeneratingChat.value = true
+            try {
+                val isImage = mimeType.startsWith("image/")
+                val userMsg = ChatMessage(
+                    id = UUID.randomUUID().toString(),
+                    sessionId = sessionId,
+                    role = "user",
+                    content = if (isImage) "📷 تم إرفاق صورة" else "📄 تم إرفاق ملف PDF",
+                    timestamp = System.currentTimeMillis()
+                )
+                persistLearningMessage(userMsg)
+
+                val prompt = if (isImage) "تحليل صورة مرفقة" else "تلخيص ملف PDF مرفق"
+                recordLearningQuestion(sessionId, prompt)
+                val aiResponse = kotlinx.coroutines.withTimeoutOrNull(90_000) {
+                    GeminiApiClient.generateMultimodalResponse(
+                        prompt = if (isImage) {
+                            "حلل الصورة المرفقة واشرح محتواها وأجب عن سؤال المستخدم إن وُجد."
+                        } else {
+                            "لخص الملف المرفق واشرح أهم محتوياته وأجب عن سؤال المستخدم إن وُجد."
+                        },
+                        systemInstruction = safetySystemInstruction,
+                        base64Data = base64Data,
+                        mimeType = mimeType
+                    )
+                } ?: "تعذر تحليل المرفق خلال الوقت المتوقع. حاول مرة أخرى."
+
+                val assistantMessage = ChatMessage(
+                    id = UUID.randomUUID().toString(),
+                    sessionId = sessionId,
+                    role = "model",
+                    content = aiResponse,
+                    timestamp = System.currentTimeMillis()
+                )
+                persistLearningMessage(assistantMessage)
+                if (autoReadChatEnabled.value) speakText(aiResponse, assistantMessage.id)
+            } catch (e: Exception) {
+                Log.e(TAG, "Chat attachment analysis failed", e)
+            } finally {
+                _isGeneratingChat.value = false
+            }
+        }
+    }
+
+    fun sendVisionQuestion(imagePath: String, question: String) {
+        val sessionId = _currentSessionId.value ?: return
+        val imageFile = File(imagePath)
+        if (!imageFile.isFile || imageFile.length() !in 1..1_048_576) {
+            _chatActionError.value = "الصورة غير متاحة أو تجاوزت الحجم المسموح. أرفقها مرة أخرى."
+            return
+        }
+        val prompt = question.trim().ifBlank {
+            "اقرأ المسألة الظاهرة في الصورة واشرح طريقة حلها خطوة بخطوة."
+        }
+
+        viewModelScope.launch {
+            _isGeneratingChat.value = true
+            _chatActionError.value = null
+            try {
+                val userMessage = ChatMessage(
+                    id = UUID.randomUUID().toString(),
+                    sessionId = sessionId,
+                    role = "user",
+                    content = encodeChatVisionMessage(imageFile.absolutePath, prompt),
+                    timestamp = System.currentTimeMillis()
+                )
+                persistLearningMessage(userMessage)
+                recordLearningQuestion(sessionId, prompt)
+                _currentMessages.value = _currentMessages.value + userMessage
+
+                val answer = kotlinx.coroutines.withTimeoutOrNull(120_000) {
+                    GeminiApiClient.generateVisionResponse(imageFile.absolutePath, prompt)
+                } ?: "تعذر تحليل الصورة خلال الوقت المتوقع. حاول مرة أخرى."
+                val assistantMessage = ChatMessage(
+                    id = UUID.randomUUID().toString(),
+                    sessionId = sessionId,
+                    role = "model",
+                    content = answer,
+                    timestamp = System.currentTimeMillis()
+                )
+                persistLearningMessage(assistantMessage)
+                _currentMessages.value = _currentMessages.value + assistantMessage
+                if (autoReadChatEnabled.value) speakText(answer, assistantMessage.id)
+            } catch (e: Exception) {
+                Log.e(TAG, "Vision question failed", e)
+                _chatActionError.value = "تعذر إرسال الصورة. تحقق من الاتصال وحاول مرة أخرى."
+            } finally {
+                _isGeneratingChat.value = false
+            }
+        }
+    }
+
+    fun retryVisionQuestion(userMessageId: String) {
+        val sourceMessage = _currentMessages.value.firstOrNull { it.id == userMessageId }
+            ?: return
+        val attachment = parseChatVisionMessage(sourceMessage.content) ?: return
+        sendVisionQuestion(attachment.imagePath, attachment.question)
+    }
+
+    fun clearChatActionError() {
+        _chatActionError.value = null
+    }
+
     // 2. PRODUCTIVITY TOOLS
+    fun extractProductivityFile(uri: android.net.Uri, fileName: String) {
+        _isExtractingProductivityFile.value = true
+        _productivityError.value = null
+        _productivityFileName.value = fileName
+        _productivitySourceText.value = ""
+        _latestProductivitySummary.value = null
+        viewModelScope.launch {
+            try {
+                _productivitySourceText.value =
+                    GeminiApiClient.extractProductivityDocument(context, uri, fileName)
+            } catch (error: Exception) {
+                Log.e(TAG, "Productivity file extraction failed", error)
+                _productivityError.value = error.message ?: "تعذر استخراج النص من الملف."
+                _productivityFileName.value = null
+            } finally {
+                _isExtractingProductivityFile.value = false
+            }
+        }
+    }
+
+    fun clearProductivityFile() {
+        _productivityFileName.value = null
+        _productivitySourceText.value = ""
+        _productivityError.value = null
+        _latestProductivitySummary.value = null
+    }
+
+    fun summarizeProductivityFile(text: String, format: String, fileName: String) {
+        if (text.isBlank()) {
+            _productivityError.value = "لا يوجد نص لتلخيصه."
+            return
+        }
+        _isGeneratingProd.value = true
+        _productivityError.value = null
+        viewModelScope.launch {
+            try {
+                val summary = GeminiApiClient.summarizeProductivityDocument(text, fileName, format)
+                _latestProductivitySummary.value = summary
+                val doc = ProductivityDoc(
+                    id = UUID.randomUUID().toString(),
+                    type = "summary",
+                    title = "ملخص: $fileName",
+                    content = summary,
+                    timestamp = System.currentTimeMillis()
+                )
+                repository.insertProductivityDoc(doc)
+                _selectedDoc.value = doc
+            } catch (error: Exception) {
+                Log.e(TAG, "Productivity summary failed", error)
+                _productivityError.value = error.message ?: "تعذر تلخيص الملف."
+            } finally {
+                _isGeneratingProd.value = false
+            }
+        }
+    }
+
+    fun createProductivityPresentation(summary: String, title: String) {
+        if (summary.isBlank()) {
+            _productivityError.value = "لا يوجد ملخص لإنشاء العرض."
+            return
+        }
+        _isGeneratingProd.value = true
+        _productivityError.value = null
+        viewModelScope.launch {
+            try {
+                val slides = GeminiApiClient.generateProductivityPresentation(summary)
+                val content = slides.mapIndexed { index, slide ->
+                    buildString {
+                        append("## الشريحة ${index + 1}: ${slide.title}\n")
+                        slide.bullets.forEach { bullet -> append("- $bullet\n") }
+                    }.trim()
+                }.joinToString("\n\n")
+                val doc = ProductivityDoc(
+                    id = UUID.randomUUID().toString(),
+                    type = "presentation",
+                    title = "عرض: $title",
+                    content = content,
+                    timestamp = System.currentTimeMillis()
+                )
+                repository.insertProductivityDoc(doc)
+                _selectedDoc.value = doc
+            } catch (error: Exception) {
+                Log.e(TAG, "Productivity presentation generation failed", error)
+                _productivityError.value = error.message ?: "تعذر إنشاء مخطط العرض."
+            } finally {
+                _isGeneratingProd.value = false
+            }
+        }
+    }
+
     fun generateProductivityDoc(prompt: String, type: String) {
         if (prompt.trim().isEmpty()) return
         _isGeneratingProd.value = true
@@ -447,11 +1218,27 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             // Call the real AI with a generous timeout; the local canned reply is only
             // an emergency fallback when the network is completely unavailable.
             val aiResponse = kotlinx.coroutines.withTimeoutOrNull(90_000) {
-                GeminiApiClient.generateChatResponse(
-                    history = currentPersonaMsgs,
-                    systemInstruction = fullInstruction,
-                    useThinking = useThinkingMode.value
-                )
+                when {
+                    _socraticModeEnabled.value -> {
+                        val progress = SocraticProgress(originalQuestion = text)
+                        GeminiApiClient.generateSocraticChatResponse(
+                            history = currentPersonaMsgs,
+                            systemInstruction = fullInstruction,
+                            progress = progress,
+                            useThinking = useThinkingMode.value
+                        )?.reply ?: "تعذر إنشاء خطوة تعليمية. تحقق من الاتصال وحاول مرة أخرى."
+                    }
+                    _educationalContentEnabled.value -> GeminiApiClient.generateRagChatResponse(
+                        history = currentPersonaMsgs,
+                        systemInstruction = fullInstruction,
+                        useThinking = useThinkingMode.value
+                    )
+                    else -> GeminiApiClient.generateChatResponse(
+                        history = currentPersonaMsgs,
+                        systemInstruction = fullInstruction,
+                        useThinking = useThinkingMode.value
+                    )
+                }
             } ?: generateLocalFallbackResponse(text, personaId)
 
             val modelMsg = ChatMessage(
@@ -482,9 +1269,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             // Voice Speech response if enabled
-            if (personaVoiceEnabled.value) {
-                speakText(aiResponse)
-            }
+            if (personaVoiceEnabled.value) speakText(aiResponse, modelMsg.id, personaId)
         }
     }
 
@@ -638,16 +1423,86 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             // Gamification points reward
             addPoints(30)
 
-            speakText(aiResponse)
+            if (personaVoiceEnabled.value) speakText(aiResponse, modelMsg.id, personaId)
         }
     }
 
-    fun sendMultimodalMessage(base64Data: String, mimeType: String) {
+    fun sendPersonaVision(imagePath: String, question: String = "") {
+        val personaId = selectedPersonaId.value
+        val imageFile = File(imagePath)
+        if (!imageFile.isFile || imageFile.length() !in 1..1_048_576) {
+            Log.e(TAG, "Persona image is missing or exceeds the one-megabyte limit")
+            return
+        }
+        val prompt = question.trim().ifBlank {
+            "حل المسألة الظاهرة في الصورة واشرحها خطوة بخطوة."
+        }
+
+        viewModelScope.launch {
+            loadPersonaMessagesIfNeeded(personaId)
+            val currentMessages = _personaMessages.value[personaId]?.toMutableList() ?: mutableListOf()
+            val userMessage = ChatMessage(
+                id = UUID.randomUUID().toString(),
+                sessionId = "persona_$personaId",
+                role = "user",
+                content = encodeChatVisionMessage(imageFile.absolutePath, prompt),
+                timestamp = System.currentTimeMillis()
+            )
+            currentMessages.add(userMessage)
+            repository.insertMessage(userMessage)
+            _personaMessages.value = _personaMessages.value.toMutableMap().apply {
+                put(personaId, currentMessages.toList())
+            }
+
+            _isGeneratingPersona.value = true
+            isAnalyzingImageOrDoc.value = true
+            try {
+                val personaLabel = when (personaId) {
+                    "hasan" -> "حسن"
+                    "jana" -> "ريتاج"
+                    else -> personaId
+                }
+                val reply = kotlinx.coroutines.withTimeoutOrNull(120_000) {
+                    GeminiApiClient.generateVisionResponse(
+                        imageFile.absolutePath,
+                        "$prompt أجب بأسلوب $personaLabel."
+                    )
+                } ?: "تعذر تحليل الصورة خلال الوقت المتوقع. حاول مرة أخرى."
+                val assistantMessage = ChatMessage(
+                    id = UUID.randomUUID().toString(),
+                    sessionId = "persona_$personaId",
+                    role = "model",
+                    content = reply,
+                    timestamp = System.currentTimeMillis()
+                )
+                currentMessages.add(assistantMessage)
+                repository.insertMessage(assistantMessage)
+                _personaMessages.value = _personaMessages.value.toMutableMap().apply {
+                    put(personaId, currentMessages.toList())
+                }
+                if (personaVoiceEnabled.value) speakText(reply, assistantMessage.id, personaId)
+            } catch (e: Exception) {
+                Log.e(TAG, "Persona vision request failed", e)
+            } finally {
+                _isGeneratingPersona.value = false
+                isAnalyzingImageOrDoc.value = false
+            }
+        }
+    }
+
+    fun retryPersonaVision(personaId: String, userMessageId: String) {
+        val userMessage = _personaMessages.value[personaId]
+            ?.firstOrNull { it.id == userMessageId && it.role == "user" }
+            ?: return
+        val attachment = parseChatVisionMessage(userMessage.content) ?: return
+        setDefaultPersona(personaId)
+        sendPersonaVision(attachment.imagePath, attachment.question)
+    }
+
+    fun sendMultimodalMessage(base64Data: String, mimeType: String, personaId: String = selectedPersonaId.value) {
         val isImage = mimeType.startsWith("image/")
-        val targetPersona = if (isImage) "hasan" else "jana"
-        
-        // Auto-switch to the required persona
-        selectedPersonaId.value = targetPersona
+        val targetPersona = personaId
+        setDefaultPersona(targetPersona)
         
         viewModelScope.launch {
             loadPersonaMessagesIfNeeded(targetPersona)
@@ -685,34 +1540,32 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             val personaInstruction = getPersonaInstruction(targetPersona)
             val fullInstruction = "$personaInstruction\n\n$safetySystemInstruction"
             
-            val aiResponse = GeminiApiClient.generateMultimodalResponse(
-                prompt = prompt,
-                systemInstruction = fullInstruction,
-                base64Data = base64Data,
-                mimeType = mimeType,
-                useThinking = useThinkingMode.value
-            )
-            
-            val modelMsg = ChatMessage(
-                id = UUID.randomUUID().toString(),
-                sessionId = "persona_$targetPersona",
-                role = "model",
-                content = aiResponse,
-                timestamp = System.currentTimeMillis()
-            )
-            currentPersonaMsgs.add(modelMsg)
-            repository.insertMessage(modelMsg)
-            updatedMap[targetPersona] = currentPersonaMsgs
-            _personaMessages.value = updatedMap
-            
-            _isGeneratingPersona.value = false
-            isAnalyzingImageOrDoc.value = false
-            
-            // Gamification points reward for file upload and parsing
-            addPoints(25)
-            
-            if (personaVoiceEnabled.value) {
-                speakText(aiResponse)
+            try {
+                val aiResponse = GeminiApiClient.generateMultimodalResponse(
+                    prompt = prompt,
+                    systemInstruction = fullInstruction,
+                    base64Data = base64Data,
+                    mimeType = mimeType,
+                    useThinking = useThinkingMode.value
+                )
+                val modelMsg = ChatMessage(
+                    id = UUID.randomUUID().toString(),
+                    sessionId = "persona_$targetPersona",
+                    role = "model",
+                    content = aiResponse,
+                    timestamp = System.currentTimeMillis()
+                )
+                currentPersonaMsgs.add(modelMsg)
+                repository.insertMessage(modelMsg)
+                updatedMap[targetPersona] = currentPersonaMsgs
+                _personaMessages.value = updatedMap
+                addPoints(25)
+                if (personaVoiceEnabled.value) speakText(aiResponse, modelMsg.id, targetPersona)
+            } catch (e: Exception) {
+                Log.e(TAG, "Persona attachment analysis failed", e)
+            } finally {
+                _isGeneratingPersona.value = false
+                isAnalyzingImageOrDoc.value = false
             }
         }
     }
@@ -759,138 +1612,219 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun speakText(text: String) {
-        viewModelScope.launch {
-            try {
-                // Dynamically select high fidelity voice based on the active persona for deep immersion
-                val voiceToUse = when (selectedPersonaId.value) {
-                    "hasan" -> "Puck"    // energetic, lively, authentic male voice
-                    "jana" -> "Aoede"    // sweet, gentle, encouraging female voice
-                    else -> selectedVoice.value // fallback user-configured setting
+    fun speakText(
+        text: String,
+        speechId: String = text.hashCode().toString(),
+        personaId: String? = null
+    ) {
+        val currentSession = speechSession
+        if (currentSession?.id == speechId) {
+            if (_isSpeaking.value) {
+                _isSpeaking.value = false
+                val currentChunk = currentSession.chunks.getOrNull(currentSession.chunkIndex)
+                if (currentChunk != null && currentSession.characterOffset >= currentChunk.length) {
+                    currentSession.chunkIndex++
+                    currentSession.characterOffset = 0
                 }
+                textToSpeech?.stop()
+            } else {
+                _isSpeaking.value = true
+                speakCurrentChunk(currentSession)
+            }
+            return
+        }
 
-                // Try Gemini Speech (TTS) with chosen voice
-                val base64Audio = GeminiApiClient.generateSpeech(text, voiceName = voiceToUse)
-                if (base64Audio != null) {
-                    playBase64Audio(base64Audio)
-                } else {
-                    // Fallback to Native TextToSpeech
-                    if (isTtsInitialized) {
-                        textToSpeech?.setSpeechRate(speechSpeed.value)
-                        textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, null, null)
-                    }
+        stopSpeaking()
+        val speechText = sanitizeSpeechText(text)
+        val chunks = splitSpeechText(speechText)
+        if (chunks.isEmpty()) return
+        val session = SpeechSession(
+            id = speechId,
+            generation = speechGeneration,
+            chunks = chunks,
+            personaId = personaId
+        )
+        speechSession = session
+        _activeSpeechId.value = speechId
+        _isSpeaking.value = true
+        if (isTtsInitialized) speakCurrentChunk(session)
+    }
+
+    fun setSpeechSpeed(speed: Float) {
+        val adjustedSpeed = speed.coerceIn(0.75f, 1.25f)
+        speechSpeed.value = adjustedSpeed
+        prefs.edit().putFloat(KEY_TTS_SPEECH_SPEED, adjustedSpeed).apply()
+    }
+
+    fun setAppTheme(theme: String) {
+        if (theme !in setOf("purple", "dark", "light")) return
+        appTheme.value = theme
+        prefs.edit().putString("app_theme", theme).apply()
+    }
+
+    fun setProductivitySummaryFormat(format: String) {
+        if (format !in setOf("short", "detailed", "bullets")) return
+        productivitySummaryFormat.value = format
+        prefs.edit().putString(KEY_PRODUCTIVITY_SUMMARY_FORMAT, format).apply()
+    }
+
+    fun setDefaultPersona(personaId: String) {
+        selectedPersonaId.value = personaId
+        prefs.edit().putString(KEY_DEFAULT_PERSONA_ID, personaId).apply()
+    }
+
+    fun setPersonaAutoVoiceEnabled(enabled: Boolean) {
+        personaVoiceEnabled.value = enabled
+        prefs.edit().putBoolean(KEY_PERSONA_AUTO_VOICE, enabled).apply()
+    }
+
+    fun setOrganizerConfirmDelete(enabled: Boolean) {
+        organizerConfirmDelete.value = enabled
+        prefs.edit().putBoolean(KEY_ORGANIZER_CONFIRM_DELETE, enabled).apply()
+    }
+
+    fun setTrackLearningProfile(enabled: Boolean) {
+        trackLearningProfile.value = enabled
+        prefs.edit().putBoolean(KEY_TRACK_LEARNING_PROFILE, enabled).apply()
+    }
+
+    fun setStudyQuizQuestionCount(count: Int) {
+        val adjustedCount = count.coerceIn(5, 10)
+        studyQuizQuestionCount.value = adjustedCount
+        prefs.edit().putInt(KEY_STUDY_QUIZ_COUNT, adjustedCount).apply()
+    }
+
+    private fun splitSpeechText(text: String, maxChunkLength: Int = 320): List<String> {
+        val chunks = mutableListOf<String>()
+        var start = 0
+        while (start < text.length) {
+            var end = (start + maxChunkLength).coerceAtMost(text.length)
+            if (end < text.length) {
+                val preferredStart = start + maxChunkLength * 2 / 3
+                val sentenceBoundary = listOf('.', '!', '?', '؟', '۔', '\n')
+                    .map { text.lastIndexOf(it, end) }
+                    .filter { it >= preferredStart }
+                    .maxOrNull()
+                val phraseBoundary = listOf(',', '،', ';', '؛')
+                    .map { text.lastIndexOf(it, end) }
+                    .filter { it >= preferredStart }
+                    .maxOrNull()
+                val wordBoundary = text.lastIndexOf(' ', end)
+                end = sentenceBoundary ?: phraseBoundary ?: wordBoundary
+                    .takeIf { it > start + maxChunkLength / 2 }
+                    ?: end
+                if (end > start && Character.isHighSurrogate(text[end - 1])) end--
+            }
+            val chunk = text.substring(start, end).trim()
+            if (chunk.isNotEmpty()) chunks += chunk
+            start = if (end < text.length && text[end].isWhitespace()) end + 1 else end
+        }
+        return chunks
+    }
+
+    private fun speakCurrentChunk(session: SpeechSession) {
+        if (speechSession !== session || session.generation != speechGeneration || !_isSpeaking.value) return
+        if (session.chunkIndex >= session.chunks.size) {
+            speechSession = null
+            _isSpeaking.value = false
+            _activeSpeechId.value = null
+            return
+        }
+        if (!isTtsInitialized) return
+
+        val chunk = session.chunks[session.chunkIndex]
+        if (session.characterOffset >= chunk.length) {
+            session.chunkIndex++
+            session.characterOffset = 0
+            speakCurrentChunk(session)
+            return
+        }
+        val speechText = chunk.substring(session.characterOffset)
+        session.utteranceBaseOffset = session.characterOffset
+        val locale = if (speechText.any { Character.UnicodeScript.of(it.code) == Character.UnicodeScript.ARABIC }) {
+            Locale.forLanguageTag("ar-EG")
+        } else {
+            Locale.US
+        }
+        textToSpeech?.let { tts ->
+            val languageStatus = tts.setLanguage(locale)
+            if (languageStatus == TextToSpeech.LANG_MISSING_DATA ||
+                languageStatus == TextToSpeech.LANG_NOT_SUPPORTED
+            ) {
+                val fallback = if (locale.language == "ar") Locale("ar") else Locale.US
+                val fallbackStatus = tts.setLanguage(fallback)
+                if (fallbackStatus == TextToSpeech.LANG_MISSING_DATA ||
+                    fallbackStatus == TextToSpeech.LANG_NOT_SUPPORTED
+                ) {
+                    tts.setLanguage(Locale.getDefault())
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error playing TTS speech", e)
+            }
+            val matchingVoice = tts.voices
+                .orEmpty()
+                .filter { it.locale.language == locale.language }
+                .sortedWith(
+                    compareBy<android.speech.tts.Voice> {
+                        if (it.locale.country == locale.country) 0 else 1
+                    }.thenByDescending { it.quality }
+                        .thenBy { it.isNetworkConnectionRequired }
+                )
+                .firstOrNull()
+            if (matchingVoice != null) tts.voice = matchingVoice
+            tts.setSpeechRate(speechSpeed.value.coerceIn(0.75f, 1.25f))
+            tts.setPitch(personaSpeechPitch(session.personaId))
+            val utteranceId = "${session.generation}:${session.chunkIndex}"
+            val result = tts.speak(speechText, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+            if (result != TextToSpeech.SUCCESS) {
+                Log.e(TAG, "Android text-to-speech rejected the utterance with status $result")
+                speechSession = null
+                _isSpeaking.value = false
+                _activeSpeechId.value = null
             }
         }
     }
+
+    fun stopSpeakingIfActive(speechId: String) {
+        if (_activeSpeechId.value == speechId) stopSpeaking()
+    }
+
+    fun speakTextLocally(text: String, speechId: String = text.hashCode().toString()) =
+        speakText(text, speechId)
 
     // Speech playing status
     private val _isSpeaking = MutableStateFlow(false)
     val isSpeaking: StateFlow<Boolean> = _isSpeaking.asStateFlow()
 
+    private val _activeSpeechId = MutableStateFlow<String?>(null)
+    val activeSpeechId: StateFlow<String?> = _activeSpeechId.asStateFlow()
+
     // Configured Speech locale for speech recognition (STT)
-    val selectedSTTLocale = MutableStateFlow("ar-EG")
+    val selectedSTTLocale = MutableStateFlow(
+        prefs.getString(KEY_SPEECH_RECOGNITION_LOCALE, "ar-EG") ?: "ar-EG"
+    )
 
-    /**
-     * Gemini TTS returns raw 16-bit PCM at 24kHz (not MP3), while ElevenLabs returns MP3.
-     * MediaPlayer cannot play raw PCM, so detect the real format from the byte header
-     * and wrap bare PCM in a WAV container before playback.
-     */
-    private fun preparePlayableAudio(decoded: ByteArray): Pair<ByteArray, String> {
-        if (decoded.size > 4) {
-            val b0 = decoded[0].toInt() and 0xFF
-            val b1 = decoded[1].toInt() and 0xFF
-            val isMp3 = (decoded[0] == 'I'.code.toByte() && decoded[1] == 'D'.code.toByte() && decoded[2] == '3'.code.toByte()) ||
-                (b0 == 0xFF && (b1 and 0xE0) == 0xE0)
-            if (isMp3) return decoded to ".mp3"
-            val header = String(decoded, 0, 4, Charsets.US_ASCII)
-            if (header == "RIFF") return decoded to ".wav"
-            if (header == "OggS") return decoded to ".ogg"
+    fun setSpeechRecognitionLocale(locale: String) {
+        if (locale !in setOf("ar-EG", "ar-SA", "en-US")) {
+            Log.w(TAG, "Ignoring unsupported speech recognition locale: $locale")
+            return
         }
-        return wrapPcmInWav(decoded, sampleRate = 24000, channels = 1, bitsPerSample = 16) to ".wav"
+        selectedSTTLocale.value = locale
+        prefs.edit().putString(KEY_SPEECH_RECOGNITION_LOCALE, locale).apply()
     }
 
-    private fun wrapPcmInWav(pcm: ByteArray, sampleRate: Int, channels: Int, bitsPerSample: Int): ByteArray {
-        val byteRate = sampleRate * channels * bitsPerSample / 8
-        val blockAlign = channels * bitsPerSample / 8
-        val dataSize = pcm.size
-        val buffer = java.nio.ByteBuffer.allocate(44 + dataSize).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        buffer.put("RIFF".toByteArray(Charsets.US_ASCII))
-        buffer.putInt(36 + dataSize)
-        buffer.put("WAVE".toByteArray(Charsets.US_ASCII))
-        buffer.put("fmt ".toByteArray(Charsets.US_ASCII))
-        buffer.putInt(16)
-        buffer.putShort(1) // PCM
-        buffer.putShort(channels.toShort())
-        buffer.putInt(sampleRate)
-        buffer.putInt(byteRate)
-        buffer.putShort(blockAlign.toShort())
-        buffer.putShort(bitsPerSample.toShort())
-        buffer.put("data".toByteArray(Charsets.US_ASCII))
-        buffer.putInt(dataSize)
-        buffer.put(pcm)
-        return buffer.array()
-    }
-
-    private fun playBase64Audio(base64Str: String) {
-        viewModelScope.launch(Dispatchers.IO) {
-            var tempFile: File? = null
-            try {
-                val decodedBytes = Base64.decode(base64Str, Base64.DEFAULT)
-                val (playableBytes, extension) = preparePlayableAudio(decodedBytes)
-                tempFile = File.createTempFile("tts_temp", extension, context.cacheDir)
-                FileOutputStream(tempFile!!).use { fos ->
-                    fos.write(playableBytes)
-                }
-                withContext(Dispatchers.Main) {
-                    try {
-                        mediaPlayer?.stop()
-                        mediaPlayer?.release()
-                        playbackFile?.delete()
-                    } catch (ex: Exception) {
-                        Log.e(TAG, "Error cleaning old mediaPlayer", ex)
-                    }
-                    playbackFile = tempFile
-                    mediaPlayer = MediaPlayer().apply {
-                        setDataSource(tempFile!!.absolutePath)
-                        prepare()
-                        setOnCompletionListener {
-                            _isSpeaking.value = false
-                            tempFile?.delete()
-                            if (playbackFile == tempFile) playbackFile = null
-                        }
-                        start()
-                    }
-                    _isSpeaking.value = true
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Play audio error", e)
-                tempFile?.delete()
-                withContext(Dispatchers.Main) {
-                    _isSpeaking.value = false
-                }
-            }
-        }
+    fun clearSpeechRecognitionError() {
+        _speechRecognitionError.value = null
     }
 
     fun stopSpeaking() {
+        speechGeneration++
+        speechSession = null
         try {
             textToSpeech?.stop()
-            mediaPlayer?.stop()
-            mediaPlayer?.release()
-            mediaPlayer = null
-            playbackFile?.delete()
-            playbackFile = null
         } catch (ex: Exception) {
-            Log.e(TAG, "Error stopping media", ex)
-            mediaPlayer?.release()
-            mediaPlayer = null
-            playbackFile?.delete()
-            playbackFile = null
+            Log.e(TAG, "Error stopping text-to-speech", ex)
         }
         _isSpeaking.value = false
+        _activeSpeechId.value = null
     }
 
     /**
@@ -909,16 +1843,25 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 setRecognitionListener(object : RecognitionListener {
                     override fun onReadyForSpeech(params: Bundle?) {
                         _isListeningToSpeech.value = true
+                        _isProcessingSpeech.value = false
+                        _speechRecognitionError.value = null
                     }
                     override fun onBeginningOfSpeech() {}
-                    override fun onRmsChanged(rmsdB: Float) {}
+                    override fun onRmsChanged(rmsdB: Float) {
+                        _speechAmplitude.value = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
+                    }
                     override fun onBufferReceived(buffer: ByteArray?) {}
                     override fun onEndOfSpeech() {
                         _isListeningToSpeech.value = false
+                        _isProcessingSpeech.value = true
+                        _speechAmplitude.value = 0f
                     }
                     override fun onError(error: Int) {
                         Log.e(TAG, "Speech recognition error code: $error")
                         _isListeningToSpeech.value = false
+                        _isProcessingSpeech.value = false
+                        _speechAmplitude.value = 0f
+                        _speechRecognitionError.value = speechRecognitionErrorMessage(error)
                         // A recognizer that reported CLIENT/BUSY errors can get stuck;
                         // destroy it so the next tap recreates a fresh one.
                         if (error == SpeechRecognizer.ERROR_CLIENT || error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
@@ -935,6 +1878,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             _speechInputText.value = matches[0]
                         }
                         _isListeningToSpeech.value = false
+                        _isProcessingSpeech.value = false
+                        _speechAmplitude.value = 0f
                     }
                     override fun onPartialResults(partialResults: Bundle?) {
                         val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
@@ -962,6 +1907,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.Main) {
             if (!ensureSpeechRecognizer()) {
                 _isListeningToSpeech.value = false
+                _isProcessingSpeech.value = false
+                _speechRecognitionError.value =
+                    "خدمة تحويل الكلام إلى نص غير متاحة على هذا الجهاز."
                 return@launch
             }
             val locale = selectedSTTLocale.value
@@ -970,16 +1918,38 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, locale)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, locale)
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    val supportedSpeechLocales = arrayListOf("ar-EG", "ar-SA", "en-US")
+                    putExtra(RecognizerIntent.EXTRA_ENABLE_LANGUAGE_DETECTION, true)
+                    putExtra(
+                        RecognizerIntent.EXTRA_ENABLE_LANGUAGE_SWITCH,
+                        RecognizerIntent.LANGUAGE_SWITCH_BALANCED
+                    )
+                    putStringArrayListExtra(
+                        RecognizerIntent.EXTRA_LANGUAGE_DETECTION_ALLOWED_LANGUAGES,
+                        supportedSpeechLocales
+                    )
+                    putStringArrayListExtra(
+                        RecognizerIntent.EXTRA_LANGUAGE_SWITCH_ALLOWED_LANGUAGES,
+                        supportedSpeechLocales
+                    )
+                }
                 // Boost voice performance and accuracy
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
             }
             try {
+                _speechRecognitionError.value = null
+                _speechAmplitude.value = 0f
+                _isProcessingSpeech.value = false
+                _speechInputText.value = ""
                 speechRecognizer?.startListening(intent)
                 _isListeningToSpeech.value = true
-                _speechInputText.value = ""
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start listening", e)
                 _isListeningToSpeech.value = false
+                _isProcessingSpeech.value = false
+                _speechRecognitionError.value =
+                    "تعذر بدء التسجيل الصوتي. حاول مرة أخرى."
             }
         }
     }
@@ -992,6 +1962,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 Log.e(TAG, "Failed to stop listening", e)
             }
             _isListeningToSpeech.value = false
+            _isProcessingSpeech.value = false
+            _speechAmplitude.value = 0f
         }
     }
 
@@ -999,68 +1971,294 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _speechInputText.value = ""
     }
 
-    // 4. IMAGE & VIDEO GENERATION (with safety filters)
-    fun generateAiImage(prompt: String, aspectRatio: String = "1:1") {
-        if (prompt.trim().isEmpty()) return
-        _isGeneratingImageOrVideo.value = true
+    private fun speechRecognitionErrorMessage(error: Int): String = when (error) {
+        SpeechRecognizer.ERROR_AUDIO -> "تعذر استخدام الميكروفون. تحقق من إعدادات الصوت وحاول مرة أخرى."
+        SpeechRecognizer.ERROR_CLIENT -> "توقف التسجيل الصوتي. اضغط على الميكروفون وحاول مرة أخرى."
+        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ->
+            "يلزم السماح باستخدام الميكروفون للإدخال الصوتي."
+        SpeechRecognizer.ERROR_NETWORK,
+        SpeechRecognizer.ERROR_NETWORK_TIMEOUT ->
+            "خدمة التعرف على الكلام غير متاحة حالياً. تحقق من الإنترنت وحاول مرة أخرى."
+        SpeechRecognizer.ERROR_NO_MATCH,
+        SpeechRecognizer.ERROR_SPEECH_TIMEOUT ->
+            "لم أسمع كلاماً واضحاً. حاول التحدث بالقرب من الميكروفون."
+        SpeechRecognizer.ERROR_RECOGNIZER_BUSY ->
+            "خدمة التعرف على الكلام مشغولة. انتظر لحظة ثم حاول مرة أخرى."
+        SpeechRecognizer.ERROR_SERVER -> "حدث خطأ في خدمة التعرف على الكلام. حاول مرة أخرى."
+        SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED ->
+            "لغة التعرف المحددة غير مدعومة. اختر العربية أو الإنجليزية."
+        SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE ->
+            "حزمة اللغة غير متاحة على الجهاز. نزّلها من إعدادات التعرف على الكلام."
+        else -> "تعذر تحويل الكلام إلى نص. حاول مرة أخرى."
+    }
 
+    fun loadQuranSurahs() {
+        if (quranSurahsLoaded || _isLoadingQuran.value) return
+        _isLoadingQuran.value = true
+        _quranCoachError.value = null
         viewModelScope.launch {
-            // Content moderation check before sending
-            val isSafe = checkPromptSafety(prompt)
-            if (!isSafe) {
-                _generatedImageBase64.value = null
-                _isGeneratingImageOrVideo.value = false
-                return@launch
+            try {
+                val surahs = QuranCoachApiClient.getSurahs()
+                _quranSurahs.value = surahs
+                quranSurahsLoaded = true
+                selectQuranSurah(surahs.first().number)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load Quran surahs", e)
+                _quranCoachError.value = e.localizedMessage ?: "تعذر تحميل قائمة السور."
+            } finally {
+                _isLoadingQuran.value = false
             }
-
-            val imageBase64 = GeminiApiClient.generateImage(prompt, aspectRatio)
-            _generatedImageBase64.value = imageBase64
-            _isGeneratingImageOrVideo.value = false
         }
     }
 
-    fun animateImageToVideo(prompt: String, base64Image: String, aspectRatio: String = "16:9") {
-        if (prompt.trim().isEmpty()) return
-        _isGeneratingImageOrVideo.value = true
+    fun selectQuranSurah(surahNumber: Int) {
+        val surah = _quranSurahs.value.firstOrNull { it.number == surahNumber } ?: return
+        stopQuranReciterAudio()
+        _selectedQuranSurah.value = surah
+        _selectedQuranAyah.value = null
+        _quranAyahs.value = emptyList()
+        _quranRecitationResult.value = null
+        _quranCoachError.value = null
+        _isLoadingAyahs.value = true
 
         viewModelScope.launch {
-            val operationName = GeminiApiClient.generateVideo(prompt, imageBase64 = base64Image, aspectRatio = aspectRatio)
-            _generatedVideoUrl.value = operationName ?: "operations/simulated_video_${UUID.randomUUID()}"
-            _isGeneratingImageOrVideo.value = false
-        }
-    }
-
-    fun generateTextToVideo(prompt: String, aspectRatio: String = "16:9") {
-        if (prompt.trim().isEmpty()) return
-        _isGeneratingImageOrVideo.value = true
-
-        viewModelScope.launch {
-            val isSafe = checkPromptSafety(prompt)
-            if (!isSafe) {
-                _generatedVideoUrl.value = null
-                _isGeneratingImageOrVideo.value = false
-                return@launch
+            try {
+                val ayahs = QuranCoachApiClient.getAyahs(surah.number)
+                _quranAyahs.value = ayahs
+                _selectedQuranAyah.value = ayahs.firstOrNull()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load Quran ayahs for surah ${surah.number}", e)
+                _quranCoachError.value = e.localizedMessage ?: "تعذر تحميل آيات السورة."
+            } finally {
+                _isLoadingAyahs.value = false
             }
-
-            val operationName = GeminiApiClient.generateVideo(prompt, aspectRatio = aspectRatio)
-            _generatedVideoUrl.value = operationName ?: "operations/simulated_video_${UUID.randomUUID()}"
-            _isGeneratingImageOrVideo.value = false
         }
     }
 
-    private fun checkPromptSafety(prompt: String): Boolean {
-        // Local keyword moderation: previously this burned a full Gemini API request
-        // per generation, which is wasteful (and fatal on a 20-requests/day free key).
-        // The Railway server applies its own moderation layer as a second line of defense.
-        val lower = prompt.lowercase()
-        val bannedKeywords = listOf(
-            "naked", "nude", "nudity", "nsfw", "porn", "erotic", "sexual", "sexy", "xxx",
-            "عاري", "عارية", "جنس", "جنسي", "إباحي", "اباحي", "بورن", "خادش",
-            "قنبلة", "متفجرات", "سلاح غير قانوني", "مخدرات", "تهكير", "اختراق حساب",
-            "make a bomb", "explosive", "drugs", "hack account"
-        )
-        return bannedKeywords.none { lower.contains(it) }
+    fun selectQuranAyah(ayahNumber: Int) {
+        stopQuranReciterAudio()
+        _selectedQuranAyah.value = _quranAyahs.value.firstOrNull {
+            it.numberInSurah == ayahNumber
+        }
+        _quranRecitationResult.value = null
+        _quranCoachError.value = null
     }
+
+    fun clearQuranCoachError() {
+        _quranCoachError.value = null
+    }
+
+    fun playQuranReciterSurah(recitationId: Int, reciterName: String) {
+        if (recitationId != 6 && recitationId != 9) {
+            _quranCoachError.value = "القارئ المحدد غير مدعوم."
+            return
+        }
+        if (_quranReciterName.value?.startsWith(reciterName) == true) {
+            stopQuranReciterAudio()
+            return
+        }
+        val surahNumber = _selectedQuranSurah.value?.number ?: return
+        stopQuranReciterAudio()
+        _quranReciterName.value = "$reciterName..."
+        _quranCoachError.value = null
+
+        quranReciterPlaybackJob = viewModelScope.launch {
+            try {
+                val audioUrls = QuranCoachApiClient.getRecitationAudioUrls(
+                    surahNumber = surahNumber,
+                    recitationId = recitationId
+                )
+                val expectedAyahCount = _selectedQuranSurah.value
+                    ?.takeIf { it.number == surahNumber }
+                    ?.ayahCount
+                if (expectedAyahCount != null && audioUrls.size != expectedAyahCount) {
+                    throw IOException("مصدر التلاوة لم يُرجع السورة كاملة.")
+                }
+                val player = MediaPlayer()
+                quranReciterPlayer = player
+                var currentTrack = 0
+                player.setOnPreparedListener { preparedPlayer ->
+                    preparedPlayer.start()
+                    _quranReciterName.value = reciterName
+                }
+                player.setOnCompletionListener { completedPlayer ->
+                    currentTrack++
+                    if (currentTrack < audioUrls.size && quranReciterPlayer === completedPlayer) {
+                        try {
+                            completedPlayer.reset()
+                            completedPlayer.setDataSource(audioUrls[currentTrack])
+                            completedPlayer.prepareAsync()
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Failed to continue Quran surah playback", e)
+                            stopQuranReciterAudio()
+                            _quranCoachError.value = "انقطع تشغيل السورة. حاول مرة أخرى."
+                        }
+                    } else {
+                        completedPlayer.release()
+                        if (quranReciterPlayer === completedPlayer) quranReciterPlayer = null
+                        _quranReciterName.value = null
+                    }
+                }
+                player.setOnErrorListener { failedPlayer, _, _ ->
+                    failedPlayer.release()
+                    if (quranReciterPlayer === failedPlayer) quranReciterPlayer = null
+                    _quranReciterName.value = null
+                    _quranCoachError.value = "تعذر تشغيل تلاوة الشيخ. تحقق من اتصال الإنترنت."
+                    true
+                }
+                player.setDataSource(audioUrls.first())
+                player.prepareAsync()
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                Log.e(TAG, "Failed to play full Quran surah", e)
+                stopQuranReciterAudio()
+                _quranCoachError.value = e.localizedMessage ?: "تعذر تحميل تلاوة السورة كاملة. حاول مرة أخرى."
+            }
+        }
+    }
+
+    fun stopQuranReciterAudio() {
+        quranReciterPlaybackJob?.cancel()
+        quranReciterPlaybackJob = null
+        quranReciterPlayer?.let { player ->
+            runCatching { player.stop() }
+            player.release()
+        }
+        quranReciterPlayer = null
+        _quranReciterName.value = null
+    }
+
+    fun startQuranRecording() {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            _quranCoachError.value = "اسمح باستخدام الميكروفون من إعدادات الهاتف ثم حاول مرة أخرى."
+            return
+        }
+        if (_selectedQuranSurah.value == null || _selectedQuranAyah.value == null) {
+            _quranCoachError.value = "اختر السورة والآية أولاً."
+            return
+        }
+
+        stopSpeaking()
+        stopQuranReciterAudio()
+        val file = File(context.cacheDir, "quran_coach_${UUID.randomUUID()}.m4a")
+        val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            MediaRecorder(context)
+        } else {
+            @Suppress("DEPRECATION")
+            MediaRecorder()
+        }
+        try {
+            recorder.apply {
+                setAudioSource(MediaRecorder.AudioSource.MIC)
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setAudioSamplingRate(44_100)
+                setAudioEncodingBitRate(128_000)
+                setMaxFileSize(15L * 1024L * 1024L)
+                setOutputFile(file.absolutePath)
+                prepare()
+                start()
+            }
+            quranRecordingFile = file
+            quranMediaRecorder = recorder
+            _quranRecitationResult.value = null
+            _quranCoachError.value = null
+            _isRecordingQuran.value = true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start Quran recording", e)
+            runCatching { recorder.release() }
+            file.delete()
+            _quranCoachError.value = "تعذر بدء التسجيل. تحقق من إذن الميكروفون وحاول مرة أخرى."
+        }
+    }
+
+    fun stopQuranRecordingAndCheck() {
+        if (!_isRecordingQuran.value) return
+        _isRecordingQuran.value = false
+        val recorder = quranMediaRecorder
+        quranMediaRecorder = null
+        val recordingFile = quranRecordingFile
+        quranRecordingFile = null
+
+        var recordingSucceeded = false
+        try {
+            recorder?.stop()
+            recordingSucceeded = true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to finish Quran recording", e)
+        } finally {
+            runCatching { recorder?.release() }
+        }
+
+        val surahNumber = _selectedQuranSurah.value?.number
+        val ayahNumber = _selectedQuranAyah.value?.numberInSurah
+        if (!recordingSucceeded || recordingFile == null || surahNumber == null || ayahNumber == null) {
+            recordingFile?.delete()
+            _quranCoachError.value = "لم يُلتقط تسجيل صالح. حاول قراءة الآية بوضوح مرة أخرى."
+            return
+        }
+
+        _isCheckingQuran.value = true
+        _quranCoachError.value = null
+        viewModelScope.launch {
+            try {
+                val audioBytes = withContext(Dispatchers.IO) { recordingFile.readBytes() }
+                if (audioBytes.size < 2_000) {
+                    throw IOException("التسجيل قصير جداً. سجّل الآية كاملة بصوت واضح.")
+                }
+                if (audioBytes.size > 15 * 1024 * 1024) {
+                    throw IOException("حجم التسجيل أكبر من الحد المسموح. حاول تسجيلاً أقصر.")
+                }
+                val result = QuranCoachApiClient.checkRecitation(
+                    audioBytes = audioBytes,
+                    surahNumber = surahNumber,
+                    ayahNumber = ayahNumber
+                )
+                _quranRecitationResult.value = result
+                val selectedSurah = _quranSurahs.value.firstOrNull { it.number == surahNumber }
+                if (selectedSurah != null) {
+                    repository.insertQuranRecord(
+                        QuranRecord(
+                            id = UUID.randomUUID().toString(),
+                            surah = selectedSurah.name,
+                            userTranscription = result.transcript,
+                            aiFeedback = result.summary,
+                            score = when (result.performance) {
+                                "ممتاز" -> 100
+                                "جيد" -> 75
+                                else -> 50
+                            },
+                            surahNumber = surahNumber,
+                            ayahNumber = ayahNumber,
+                            assessmentJson = encodeQuranAssessment(result)
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Quran recitation check failed", e)
+                _quranCoachError.value = e.localizedMessage ?: "تعذر تحليل التلاوة. حاول مرة أخرى."
+            } finally {
+                withContext(Dispatchers.IO) { recordingFile.delete() }
+                _isCheckingQuran.value = false
+            }
+        }
+    }
+
+    private fun encodeQuranAssessment(result: QuranRecitationResult): String =
+        org.json.JSONObject()
+            .put("audioQuality", result.audioQuality)
+            .put("performance", result.performance)
+            .put("summary", result.summary)
+            .put(
+                "mistakes",
+                org.json.JSONArray().apply {
+                    result.mistakes.forEach { (heard, correct) ->
+                        put(org.json.JSONObject().put("heard", heard).put("correct", correct))
+                    }
+                }
+            )
+            .put("tajweedTips", org.json.JSONArray(result.tajweedTips))
+            .toString()
 
     // 5. ORGANIZER & SCHEDULER (Daily Routines)
     fun generateDailySchedule(
@@ -1113,149 +2311,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             repository.deleteUserSchedule()
         }
-    }
-
-    // 6. QURAN RECITATION ANALYSIS (real audio is recorded and sent to the AI)
-    fun startRecordingQuran() {
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            Log.e(TAG, "RECORD_AUDIO permission not granted")
-            return
-        }
-        stopSpeaking()
-        // AAC in an MP4 container: a format Gemini accepts for audio understanding
-        audioFile = File(context.cacheDir, "quran_recitation.m4a")
-        try {
-            val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                MediaRecorder(context)
-            } else {
-                @Suppress("DEPRECATION")
-                MediaRecorder()
-            }
-            mediaRecorder = recorder.apply {
-                setAudioSource(MediaRecorder.AudioSource.MIC)
-                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                setAudioSamplingRate(44100)
-                setAudioEncodingBitRate(128_000)
-                setOutputFile(audioFile?.absolutePath)
-                prepare()
-                start()
-            }
-            _isRecordingQuran.value = true
-        } catch (e: Exception) {
-            Log.e(TAG, "Audio recording start failed", e)
-            _isRecordingQuran.value = false
-            try {
-                mediaRecorder?.release()
-            } catch (ignored: Exception) {
-            }
-            mediaRecorder = null
-        }
-    }
-
-    fun stopAndAnalyzeQuran(surahName: String) {
-        _isRecordingQuran.value = false
-        _isAnalyzingQuran.value = true
-
-        var recordingSucceeded = false
-        try {
-            mediaRecorder?.stop()
-            recordingSucceeded = true
-        } catch (e: Exception) {
-            Log.e(TAG, "Audio recording stop failed", e)
-        } finally {
-            try {
-                mediaRecorder?.release()
-            } catch (ignored: Exception) {
-            }
-            mediaRecorder = null
-        }
-
-        viewModelScope.launch {
-            val file = audioFile
-            val audioBytes = withContext(Dispatchers.IO) {
-                if (recordingSucceeded && file != null && file.exists()) file.readBytes() else null
-            }
-
-            // A valid recording of even a very short surah is far bigger than a few KB
-            if (audioBytes == null || audioBytes.size < 4096) {
-                val failedRecord = QuranRecord(
-                    id = UUID.randomUUID().toString(),
-                    surah = surahName,
-                    userTranscription = "تلاوة سورة $surahName",
-                    aiFeedback = "لم يتم التقاط تسجيل صوتي صالح. تأكد من منح التطبيق إذن الميكروفون من إعدادات الهاتف، ثم سجل التلاوة مرة أخرى بصوت واضح لمدة كافية.",
-                    score = 0,
-                    timestamp = System.currentTimeMillis()
-                )
-                repository.insertQuranRecord(failedRecord)
-                _isAnalyzingQuran.value = false
-                return@launch
-            }
-
-            val base64Audio = withContext(Dispatchers.IO) {
-                Base64.encodeToString(audioBytes, Base64.NO_WRAP)
-            }
-
-            val promptText = """
-                هذا تسجيل صوتي حقيقي لتلاوتي لسورة "$surahName". استمع إلى التسجيل المرفق بعناية فائقة ثم:
-                1. تحقق أولاً أن التسجيل يحتوي فعلاً على تلاوة قرآنية مسموعة لسورة "$surahName". إذا كان التسجيل صامتاً أو غير واضح أو ليس تلاوة قرآنية، صرّح بذلك بوضوح تام ولا تخترع تقييماً.
-                2. قارن ما تلوته بالنص الصحيح للسورة وحدد أي آيات ناقصة أو كلمات خاطئة.
-                3. قيّم دقة النطق ومخارج الحروف بأمانة كاملة.
-                4. قيّم تطبيق أحكام التجويد (المدود، الغنة، الإظهار، الإدغام...).
-                5. اذكر نقاط القوة في الصوت والنغم، والأخطاء (اللحن الجلي والخفي) التي يجب تصحيحها.
-                6. اختم ردك إلزامياً بسطر منفصل بهذا الشكل بالضبط: "التقييم النهائي: X/100" حيث X هي الدرجة الحقيقية المستحقة.
-
-                كن صادقاً تماماً ودقيقاً دون أي مجاملة، فهدفي هو تحسين تلاوتي فعلياً.
-            """.trimIndent()
-
-            val aiResponse = GeminiApiClient.generateMultimodalResponse(
-                prompt = promptText,
-                systemInstruction = "أنت شيخ جليل ومقرئ متمكن وخبير في أحكام التجويد ومخارج الحروف وتصحيح التلاوة للقرآن الكريم. تستمع للتسجيلات الصوتية وتقيّمها بأمانة علمية مطلقة دون مجاملات.",
-                base64Data = base64Audio,
-                mimeType = "audio/aac"
-            )
-
-            val score = parseScoreFromFeedback(aiResponse)
-
-            val record = QuranRecord(
-                id = UUID.randomUUID().toString(),
-                surah = surahName,
-                userTranscription = "تلاوة سورة $surahName المسجلة",
-                aiFeedback = aiResponse,
-                score = score,
-                timestamp = System.currentTimeMillis()
-            )
-            repository.insertQuranRecord(record)
-            _isAnalyzingQuran.value = false
-        }
-    }
-
-    fun deleteQuranRecord(id: String) {
-        viewModelScope.launch {
-            repository.deleteQuranRecord(id)
-        }
-    }
-
-    private fun parseScoreFromFeedback(feedback: String): Int {
-        // API/network failure messages must never be shown with a fabricated score
-        if (feedback.startsWith("خطأ") || feedback.startsWith("حدث خطأ") ||
-            feedback.startsWith("تم تجاوز") || feedback.startsWith("لم نتمكن")
-        ) {
-            return 0
-        }
-        // Preferred format requested from the model: "التقييم النهائي: X/100"
-        val finalScoreRegex = "التقييم النهائي\\s*[:：]?\\s*(\\d{1,3})".toRegex()
-        finalScoreRegex.find(feedback)?.let { match ->
-            match.groupValues[1].toIntOrNull()?.let { if (it in 0..100) return it }
-        }
-        // Fallback: any percentage or "/100" figure inside the text
-        val regex = "(\\d{1,3})\\s*([/٪%])\\s*(100)?".toRegex()
-        val match = regex.find(feedback)
-        if (match != null) {
-            val parsed = match.groupValues[1].toIntOrNull()
-            if (parsed != null && parsed in 0..100) return parsed
-        }
-        return 70 // conservative deterministic default when no score is stated
     }
 
     fun generateLocalFallbackResponse(prompt: String, personaId: String): String {
@@ -1324,12 +2379,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         super.onCleared()
         textToSpeech?.shutdown()
-        mediaPlayer?.release()
-        playbackFile?.delete()
-        mediaRecorder?.release()
+        quranMediaRecorder?.release()
+        quranRecordingFile?.delete()
+        quranReciterPlayer?.release()
         try {
             speechRecognizer?.destroy()
         } catch (ignored: Exception) {
         }
     }
+
 }

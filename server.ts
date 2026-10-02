@@ -23,6 +23,7 @@ import {
   saveFeedback,
   toFeedbackCsv,
 } from "./src/server/feedback-store.js";
+import { extractDocumentBuffer } from "./src/server/documents.js";
 
 dotenv.config();
 
@@ -279,6 +280,41 @@ const visionImageUpload = multer({
     callback(null, true);
   },
 });
+
+const documentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024, files: 1, fields: 0 },
+  fileFilter: (_req, file, callback) => {
+    const extension = file.originalname.split(".").pop()?.toLowerCase();
+    if (!new Set(["pdf", "docx", "xlsx", "txt"]).has(extension ?? "")) {
+      callback(new Error("صيغة الملف غير مدعومة. استخدم PDF أو DOCX أو XLSX أو TXT."));
+      return;
+    }
+    callback(null, true);
+  },
+});
+
+const parseProductivityDocument = (
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) => {
+  documentUpload.single("file")(req, res, (error) => {
+    if (error instanceof multer.MulterError) {
+      res.status(error.code === "LIMIT_FILE_SIZE" ? 413 : 400).json({
+        error: error.code === "LIMIT_FILE_SIZE"
+          ? "حجم الملف أكبر من الحد المسموح (15 ميجابايت)."
+          : error.message,
+      });
+      return;
+    }
+    if (error) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    next();
+  });
+};
 
 const parseQuranAudio = (req: express.Request, res: express.Response, next: express.NextFunction) => {
   quranAudioUpload.single("audio")(req, res, (error) => {
@@ -1248,40 +1284,73 @@ Now, execute your role with distinction.`;
 });
 
 // 2. PRODUCTIVITY: BOOK/DOCUMENT SUMMARIZER API
+app.post("/api/productivity/extract", parseProductivityDocument, async (req, res) => {
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: "اختر ملفاً لاستخراج النص." });
+  try {
+    const pages = await extractDocumentBuffer(file.originalname, file.buffer);
+    const extractedText = pages
+      .map((page) => page.text.trim())
+      .filter(Boolean)
+      .join("\n\n")
+      .trim();
+    if (!extractedText) {
+      return res.status(422).json({ error: "لم يتم العثور على نص قابل للاستخراج في الملف." });
+    }
+    if (extractedText.length > 120_000) {
+      return res.status(413).json({ error: "النص المستخرج طويل جداً. استخدم ملفاً أقصر من 120 ألف حرف." });
+    }
+    return res.json({
+      fileName: file.originalname,
+      size: file.size,
+      text: extractedText,
+      pages: pages.length,
+    });
+  } catch (error) {
+    console.error("Productivity document extraction failed:", error);
+    return res.status(422).json({
+      error: error instanceof Error ? error.message : "تعذر استخراج النص من الملف.",
+    });
+  }
+});
+
 app.post("/api/summarize", async (req, res) => {
   try {
     const { documentText, fileName, format = "bullets" } = req.body;
 
-    if (!documentText) {
-      return res.status(400).json({ error: "Document text content is required" });
+    if (
+      typeof documentText !== "string" ||
+      documentText.trim().length === 0 ||
+      documentText.length > 120_000 ||
+      typeof format !== "string" ||
+      !new Set(["short", "detailed", "bullets"]).has(format)
+    ) {
+      return res.status(400).json({ error: "أدخل نصاً صالحاً واختر نوع تلخيص مدعوماً." });
     }
 
-    let summaryPrompt = `Please summarize the following document content:
-File Name: ${fileName || "Uploaded Document"}
-Format option: ${format}
-
-Provide:
-1. Executive Summary (إيجاز تنفيذي)
-2. Key Findings & Crucial Points (النقاط والمحاور الرئيسية)
-3. Action Items or Conclusions (التوصيات والخطوات التالية)
-
-Please write the summary in highly professional Arabic (or English if the document is strictly English).`;
+    const formatInstructions = {
+      short: "اكتب ملخصاً قصيراً من 5 إلى 7 نقاط فقط، تغطي أهم الأفكار دون تكرار.",
+      detailed: "قسّم الملخص إلى أقسام بحسب موضوعات المستند، واكتب فقرة واضحة لكل قسم مع عناوين فرعية.",
+      bullets: "اكتب ملخصاً منظماً في نقاط رئيسية وفرعية، مع الحفاظ على الحقائق المهمة.",
+    }[format];
+    const summaryPrompt = `لخّص محتوى الملف "${typeof fileName === "string" ? fileName.slice(0, 200) : "المستند"}".
+${formatInstructions}
+اكتب بلغة المستند (العربية إذا كان عربياً)، ولا تضف معلومات غير موجودة في المصدر.`;
 
     const response = await ai.models.generateContent({
       model: GEMINI_TEXT_MODEL,
-      contents: [
-        { text: summaryPrompt },
-        { text: documentText }
-      ],
+      contents: `${summaryPrompt}\n\nمحتوى المستند:\n${documentText}`,
       config: {
-        systemInstruction: "You are an elite research analyst and fast executive summarizer for 'H&J Smart Hub'.",
+        systemInstruction: "أنت مساعد أكاديمي يلخص المستندات بأمانة، دون اختلاق حقائق أو مراجع.",
       }
     });
 
-    res.json({ summary: response.text || "فشل التلخيص." });
-  } catch (error: any) {
+    const summary = response.text?.trim();
+    if (!summary) return res.status(502).json({ error: "لم يُنتج الذكاء الاصطناعي ملخصاً صالحاً." });
+    return res.json({ summary });
+  } catch (error) {
     console.error("Summarizer Error:", error);
-    res.status(500).json({ error: "خطأ أثناء تلخيص الملف: " + error.message });
+    return res.status(502).json({ error: "تعذر تلخيص المستند حالياً. حاول مرة أخرى." });
   }
 });
 
@@ -1327,19 +1396,23 @@ app.post("/api/presentation", async (req, res) => {
   try {
     const { topic, slidesCount = 5 } = req.body;
 
-    if (!topic) {
-      return res.status(400).json({ error: "Presentation topic is required" });
+    if (
+      typeof topic !== "string" || topic.trim().length === 0 ||
+      topic.length > 12_000 ||
+      !Number.isInteger(slidesCount) || slidesCount < 4 || slidesCount > 12
+    ) {
+      return res.status(400).json({ error: "أدخل ملخصاً صالحاً وعدداً للشرائح بين 4 و12." });
     }
 
     const presentationPrompt = `Generate a structural, highly structured slide deck presentation about:
 Topic: "${topic}"
 Desired slides count: ${slidesCount}
 
-Please structure the output strictly in a JSON array format so the application can render the slides interactively in a slideshow player!
+Please structure the output strictly in a JSON array format.
 For each slide, return:
 - slideNumber (integer)
 - title (string, in Arabic or English depending on topic)
-- bullets (array of 3 to 4 strings containing points)
+- bullets (array of 3 to 5 concise strings containing points)
 - designTip (string, suggesting CSS/styling accent for this specific slide, e.g. "Use custom blue glow", "Modern minimalist layout")
 
 JSON Format Requirement:
@@ -1370,11 +1443,27 @@ Provide ONLY the JSON list. No surrounding explanation, no markdown tags.`;
       }
     });
 
-    const slidesJson = JSON.parse(response.text || "[]");
-    res.json({ slides: slidesJson });
-  } catch (error: any) {
+    const slidesJson: unknown = JSON.parse(response.text || "[]");
+    if (
+      !Array.isArray(slidesJson) ||
+      slidesJson.length < 4 ||
+      slidesJson.length > 12 ||
+      slidesJson.some((slide: unknown) => {
+        if (!slide || typeof slide !== "object") return true;
+        const candidate = slide as { title?: unknown; bullets?: unknown };
+        return typeof candidate.title !== "string" ||
+          !Array.isArray(candidate.bullets) ||
+          candidate.bullets.length < 3 ||
+          candidate.bullets.length > 5 ||
+          candidate.bullets.some((bullet: unknown) => typeof bullet !== "string");
+      })
+    ) {
+      return res.status(502).json({ error: "تعذر إنشاء مخطط عرض منسق. حاول مرة أخرى." });
+    }
+    return res.json({ slides: slidesJson });
+  } catch (error) {
     console.error("Presentation API Error:", error);
-    res.status(500).json({ error: "خطأ أثناء إنشاء العرض التقديمي: " + error.message });
+    return res.status(502).json({ error: "تعذر إنشاء مخطط العرض حالياً. حاول مرة أخرى." });
   }
 });
 
