@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "229353310715",
+    "project_id": "h2-hub",
+    "storage_bucket": "h2-hub.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:229353310715:android:bc54fd0ce4dd27d936635e",
+        "android_client_info": {
+          "package_name": "com.aistudio.h2hub.nqpwbz"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC_WV0_vHdrYGEasG60_oszPz0QV3yyRNY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

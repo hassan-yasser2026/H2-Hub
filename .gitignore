@@ -13,4 +13,9 @@ local.properties
 my-upload-key.jks
 debug.keystore
 keystore.properties
+app/android.properties
 app/build/
+google-services.json
+*service-account*.json
+*firebase-adminsdk*.json
+h2-hub-firebase-adminsdk-fbsvc-bdc93c5d99.json

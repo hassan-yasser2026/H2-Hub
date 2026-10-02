@@ -28,6 +28,24 @@ npm run dev
 
 For production, `npm run build` bundles the API server and `npm start` runs it. The server listens on `PORT` (default `3000`).
 
+### Push notifications (Firebase Cloud Messaging)
+
+The Android app uses native Firebase Messaging. In Firebase Console, register an Android app with package name `com.aistudio.h2hub.nqpwbz`, download `google-services.json`, and place it at `app/google-services.json`. This client configuration can be committed; never commit the Firebase service-account key. The app asks for notification permission once after opening; on Android 13 and newer, users must grant `POST_NOTIFICATIONS`. Device registration is stored in the existing PostgreSQL database and requires `DATABASE_URL`. Tokens can be registered at `POST /api/device/register` (also available at `POST /api/push/token`).
+
+Create a Firebase service account with permission to send Firebase Cloud Messaging messages. Store the complete service-account JSON in Railway as `FIREBASE_SERVICE_ACCOUNT_JSON`, and set a separate random `ADMIN_PUSH_PASSWORD` of at least 24 characters. Never put the service-account key or the admin password in Android configuration or Git. The API fails closed when either setting is missing.
+
+After deploying the API and rebuilding the Android app, send a broadcast with an authenticated request to `POST /api/admin/send-notification` (also available at `POST /api/admin/push`):
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri "https://YOUR-API-HOST/api/admin/send-notification" `
+  -Headers @{ Authorization = "Bearer YOUR_ADMIN_PUSH_PASSWORD" } `
+  -ContentType "application/json" `
+  -Body '{"title":"إشعار تجريبي","body":"تم إعداد إشعارات H2 Hub."}'
+```
+
+The response reports attempted, sent, and failed device counts. Invalid/uninstalled device tokens are removed automatically. Test delivery on a physical Android device with notification permission enabled; compiling the app alone does not verify Firebase project credentials or Railway delivery.
+
 `GET /health` reports the Railway deployment commit (`deploymentCommit`), whether the feedback routes are present, whether AI provider keys are configured, and whether PostgreSQL persistence is configured. After a Railway deployment, verify that `deploymentCommit` matches the deployed GitHub SHA and `feedbackRoutesAvailable` is `true`. The PostgreSQL database is used for the course knowledge vector index; account/cloud-sync persistence is not implemented, so cloud-sync routes return `503` until authenticated accounts are added. The AI routes have per-IP rate limits, and the Gemini proxy accepts only the model actions used by the app.
 
 ### Smart Cat knowledge search (RAG)

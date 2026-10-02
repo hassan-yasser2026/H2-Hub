@@ -24,6 +24,12 @@ import {
   toFeedbackCsv,
 } from "./src/server/feedback-store.js";
 import { extractDocumentBuffer } from "./src/server/documents.js";
+import {
+  isValidPushToken,
+  parsePushMessage,
+  registerPushToken,
+  sendPushBroadcast,
+} from "./src/server/push-notifications.js";
 
 dotenv.config();
 
@@ -59,6 +65,61 @@ app.use("/v1beta/models", rateLimit({
 }));
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ limit: "1mb", extended: true, parameterLimit: 1000 }));
+
+const registerPushTokenRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "تم تجاوز عدد محاولات تسجيل الإشعارات. حاول لاحقاً." },
+});
+
+app.post(["/api/push/token", "/api/device/register"], registerPushTokenRateLimit, async (req, res) => {
+  const { token, platform } = req.body ?? {};
+  if (!isValidPushToken(token) || platform !== "android") {
+    return res.status(400).json({ error: "رمز الإشعارات أو نوع الجهاز غير صالح." });
+  }
+  try {
+    await registerPushToken(token);
+    return res.status(201).json({ registered: true });
+  } catch (error) {
+    console.error("Failed to register an Android push token:", error instanceof Error ? error.name : "UnknownError");
+    return res.status(503).json({ error: "تعذر تسجيل الإشعارات حالياً. تحقق من إعداد قاعدة البيانات." });
+  }
+});
+
+app.post(["/api/admin/push", "/api/admin/send-notification"], async (req, res) => {
+  const configuredPassword = process.env.ADMIN_PUSH_PASSWORD;
+  if (!configuredPassword || configuredPassword.length < 24) {
+    return res.status(503).json({
+      error: "إرسال الإشعارات غير مهيأ. اضبط ADMIN_PUSH_PASSWORD بكلمة مرور لا تقل عن 24 حرفاً.",
+    });
+  }
+  const authorization = req.get("authorization") ?? "";
+  const match = /^Bearer\s+(.+)$/iu.exec(authorization);
+  if (!isValidAdminPassword(match?.[1] ?? "", configuredPassword)) {
+    return res.status(401).json({ error: "بيانات اعتماد إدارة الإشعارات غير صحيحة." });
+  }
+
+  const message = parsePushMessage(req.body);
+  if (!message) {
+    return res.status(400).json({
+      error: "أرسل عنواناً من 1 إلى 120 حرفاً ونصاً من 1 إلى 1000 حرف.",
+    });
+  }
+  try {
+    const result = await sendPushBroadcast(message);
+    return res.json(result);
+  } catch (error) {
+    console.error(
+      "Failed to send an Android push broadcast:",
+      error instanceof Error ? error.name : "UnknownError"
+    );
+    return res.status(503).json({
+      error: "تعذر إرسال الإشعار. تحقق من إعداد Firebase وPostgreSQL على الخادم.",
+    });
+  }
+});
 
 app.get("/health", (_req, res) => {
   res.json({
