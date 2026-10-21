@@ -11,6 +11,7 @@ coverage/
 !.env.example
 local.properties
 my-upload-key.jks
+release-key.jks
 debug.keystore
 keystore.properties
 app/android.properties
@@ -19,3 +20,4 @@ google-services.json
 *service-account*.json
 *firebase-adminsdk*.json
 h2-hub-firebase-adminsdk-fbsvc-bdc93c5d99.json
+app/google-services.json.bak

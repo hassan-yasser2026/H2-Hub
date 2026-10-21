@@ -20,10 +20,23 @@ test("accepts push messages within documented limits and trims whitespace", () =
   });
 });
 
+test("accepts supported optional notification types", () => {
+  assert.deepEqual(parsePushMessage({
+    title: "تحديث جديد",
+    body: "يتوفر إصدار أحدث.",
+    type: "app_update",
+  }), {
+    title: "تحديث جديد",
+    body: "يتوفر إصدار أحدث.",
+    type: "app_update",
+  });
+});
+
 test("rejects empty, oversized, and non-object push messages", () => {
   assert.equal(parsePushMessage({ title: "", body: "message" }), null);
   assert.equal(parsePushMessage({ title: "title", body: " ".repeat(1_001) }), null);
   assert.equal(parsePushMessage({ title: "x".repeat(121), body: "message" }), null);
   assert.equal(parsePushMessage(null), null);
   assert.equal(parsePushMessage([]), null);
+  assert.equal(parsePushMessage({ title: "title", body: "body", type: "unknown" }), null);
 });

@@ -29,3 +29,12 @@ val PurpleH2Background = Color(0xFF0F0B1E) // Deep Purple Night
 val PurpleH2Surface = Color(0xFF1B1435) // Elegant Dark Purple Surface
 val PurpleH2OnBackground = Color(0xFFF5F3FF)
 val PurpleH2OnSurface = Color(0xFFEDE9FE)
+
+val HubSurfaceVariant = Color(0xFF28213F)
+val HubSurfaceContainerLowest = Color(0xFF171229)
+val HubSurfaceContainerLow = Color(0xFF211938)
+val HubSurfaceContainer = Color(0xFF261E40)
+val HubSurfaceContainerHigh = Color(0xFF2C2348)
+val HubSurfaceContainerHighest = Color(0xFF32294F)
+val HubOnSurfaceVariant = Color(0xFFC7BFE0)
+val HubOutlineVariant = Color(0xFF51466D)

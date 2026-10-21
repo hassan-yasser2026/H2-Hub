@@ -1,0 +1,29 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId)
+        && !request.resource.data.keys().hasAny(['subscriptionStatus']);
+      allow update: if isOwner(userId)
+        && request.resource.data.get('subscriptionStatus', null)
+          == resource.data.get('subscriptionStatus', null);
+      allow delete: if isOwner(userId);
+    }
+
+    match /users/{userId}/{document=**} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId)
+        && !request.resource.data.keys().hasAny(['subscriptionStatus']);
+      allow update: if isOwner(userId)
+        && request.resource.data.get('subscriptionStatus', null)
+          == resource.data.get('subscriptionStatus', null);
+      allow delete: if isOwner(userId);
+    }
+  }
+}

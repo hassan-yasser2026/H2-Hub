@@ -3,7 +3,10 @@ package com.example.data
 import android.content.Context
 
 class AppDatabase private constructor(context: Context) {
-    private val appDaoInstance = PersistentAppDao(context)
+    private val appDaoInstance = RoomBackedAppDao(
+        context.applicationContext,
+        PersistentAppDao(context.applicationContext)
+    )
 
     fun appDao(): AppDao = appDaoInstance
 

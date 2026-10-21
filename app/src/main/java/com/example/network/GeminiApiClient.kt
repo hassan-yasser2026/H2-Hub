@@ -15,17 +15,36 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.MultipartBody
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import com.google.firebase.auth.FirebaseAuth
 import java.io.IOException
+import java.net.ConnectException
+import java.net.NoRouteToHostException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
 
 object GeminiApiClient {
     data class SocraticChatResult(val reply: String, val progress: SocraticProgress)
     data class ProductivitySlide(val title: String, val bullets: List<String>)
+    data class AsyncChatStatus(val status: String, val reply: String?, val error: String?)
+    data class DailyQuranVerse(val text: String, val reference: String)
+    data class MemorySummary(
+        val subject: String,
+        val summary: String,
+        val date: String
+    )
+    data class ConversationMemory(
+        val recentSummaries: List<MemorySummary>,
+        val weakPoints: List<String>,
+        val longTermSummary: String,
+        val summaryCount: Int
+    )
 
     enum class FeedbackRating(val wireValue: String) {
         POSITIVE("positive"),
@@ -34,6 +53,7 @@ object GeminiApiClient {
     }
 
     private const val TAG = "GeminiApiClient"
+    private const val FEATURE_HEADER = "X-H2-Feature"
     private val baseUrl: String = BuildConfig.SERVER_URL.trimEnd('/')
     @Volatile
     private var thinkingModeEnabled = false
@@ -43,25 +63,173 @@ object GeminiApiClient {
     }
 
     private val client = OkHttpClient.Builder()
+        .addInterceptor(DeviceQuotaInterceptor())
         .connectTimeout(90, TimeUnit.SECONDS)
         .readTimeout(90, TimeUnit.SECONDS)
         .writeTimeout(90, TimeUnit.SECONDS)
         .build()
 
+    suspend fun generateConversationSummary(
+        conversationId: String,
+        messages: List<ChatMessage>
+    ): JSONObject = withContext(Dispatchers.IO) {
+        val user = FirebaseAuth.getInstance().currentUser
+            ?: throw IOException("سجّل الدخول لحفظ ذاكرة محادثاتك.")
+        val messageArray = JSONArray()
+        val latestMessages = messages.takeLast(40)
+        latestMessages.forEach { message ->
+            if (message.role != "user" && message.role != "model") return@forEach
+            val parsedVision = parseChatVisionMessage(message.content)
+            val content = (parsedVision?.question ?: message.content).trim().take(3_000)
+            if (content.isNotEmpty()) {
+                messageArray.put(
+                    JSONObject()
+                        .put("role", message.role)
+                        .put("content", content)
+                )
+            }
+        }
+        val body = JSONObject()
+            .put("conversationId", conversationId)
+            .put("lastMessageId", latestMessages.lastOrNull()?.id.orEmpty())
+            .put("messages", messageArray)
+        val (status, responseBody) = postJson("$baseUrl/api/memory/summarize", body)
+        val response = runCatching { JSONObject(responseBody) }.getOrElse {
+            throw IOException("خادم الذاكرة أعاد استجابة غير صالحة.", it)
+        }
+        if (status !in 200..299) {
+            val error = response.optString("error").ifBlank { "تعذر تلخيص المحادثة." }
+            throw IOException("HTTP $status: $error")
+        }
+        response
+    }
+
+    suspend fun fetchConversationMemory(): ConversationMemory = withContext(Dispatchers.IO) {
+        if (FirebaseAuth.getInstance().currentUser == null) {
+            return@withContext ConversationMemory(emptyList(), emptyList(), "", 0)
+        }
+        val request = Request.Builder()
+            .url("$baseUrl/api/memory/context")
+            .get()
+            .build()
+        val (status, responseBody) = client.newCall(request).execute().use { response ->
+            response.code to (response.body?.string().orEmpty())
+        }
+        val response = runCatching { JSONObject(responseBody) }.getOrElse {
+            throw IOException("خادم الذاكرة أعاد استجابة غير صالحة.", it)
+        }
+        if (status !in 200..299) {
+            throw IOException("HTTP $status: ${response.optString("error", "تعذر تحميل الذاكرة.")}")
+        }
+        val summaries = response.optJSONArray("recentSummaries")
+        val recentSummaries = buildList {
+            if (summaries != null) {
+                for (index in 0 until summaries.length()) {
+                    val summary = summaries.optJSONObject(index) ?: continue
+                    add(
+                        MemorySummary(
+                            subject = summary.optString("subject"),
+                            summary = summary.optString("summary"),
+                            date = summary.optString("date")
+                        )
+                    )
+                }
+            }
+        }
+        val weakPointsJson = response.optJSONArray("weakPoints")
+        val weakPoints = buildList {
+            if (weakPointsJson != null) {
+                for (index in 0 until weakPointsJson.length()) {
+                    weakPointsJson.optString(index).takeIf(String::isNotBlank)?.let(::add)
+                }
+            }
+        }
+        ConversationMemory(
+            recentSummaries = recentSummaries,
+            weakPoints = weakPoints,
+            longTermSummary = response.optString("longTermSummary"),
+            summaryCount = response.optInt("summaryCount")
+        )
+    }
+
     // --- 429 (quota) handling helpers ---
 
     private const val DAILY_QUOTA_MESSAGE =
-        "استُنفدت الحصة المجانية اليومية لمفتاح Gemini. راجع حدود الاستخدام في Google AI Studio، أو انتظر تجدد الحصة. تفعيل الفوترة قد يتيح استخداماً مدفوعاً، لكنه لا يلغي جميع الحدود وقد يترتب عليه رسوم."
+        "انتهت الحصة المجانية لهذا اليوم. حاول مرة أخرى غداً أو تحقق من اشتراكك."
     private const val RATE_LIMIT_MESSAGE =
-        "الخادم مشغول مؤقتاً (تم تجاوز حد الطلبات في الدقيقة). انتظر لحظات ثم أعد المحاولة."
+        "🕐 انتظر قليلاً ثم حاول مرة أخرى."
     private const val CONNECTION_ERROR_MESSAGE =
-        "تعذر الاتصال بخدمة الذكاء الاصطناعي. تحقق من اتصال الإنترنت وحاول مرة أخرى."
+        "📶 تحقق من اتصالك بالإنترنت وحاول مرة أخرى."
     private const val BUSY_MESSAGE =
-        "خدمة الذكاء الاصطناعي مشغولة مؤقتاً. حاول مرة أخرى بعد قليل."
+        "😅 حدثت مشكلة مؤقتة. حاول مرة أخرى بعد قليل."
     private const val MAX_NETWORK_ATTEMPTS = 3
+
+    fun friendlyErrorMessage(error: Throwable): String {
+        val chain = generateSequence(error) { it.cause }.toList()
+        if (chain.any { it is SocketTimeoutException || it is java.util.concurrent.TimeoutException }) {
+            return "⏱️ تأخرت الاستجابة. حاول مرة أخرى."
+        }
+        if (chain.any {
+                it is UnknownHostException ||
+                    it is ConnectException ||
+                    it is NoRouteToHostException
+            }) {
+            return CONNECTION_ERROR_MESSAGE
+        }
+
+        val message = chain.mapNotNull { it.message }.firstOrNull().orEmpty()
+        val status = Regex("""(?:HTTP\s*)?(\d{3})""", RegexOption.IGNORE_CASE)
+            .find(message)?.groupValues?.get(1)?.toIntOrNull()
+        return friendlyErrorMessage(status, message)
+    }
+
+    internal fun friendlyErrorMessage(statusCode: Int?, serverMessage: String?): String {
+        val message = serverMessage.orEmpty().trim()
+        if (statusCode == 429) return RATE_LIMIT_MESSAGE
+        if (statusCode == 404) return "😅 حدثت مشكلة بسيطة. حاول مرة أخرى."
+        if (statusCode == 503) {
+            if (message.contains("توليد الصور متوقفة")) return message
+            return "🔧 نجري صيانة سريعة. حاول مرة أخرى بعد قليل."
+        }
+        if (statusCode != null && statusCode >= 500) {
+            return "😅 هذه الميزة غير متاحة حالياً. حاول بعد قليل."
+        }
+        if (statusCode == 408 || message.contains("timeout", ignoreCase = true)) {
+            return "⏱️ تأخرت الاستجابة. حاول مرة أخرى."
+        }
+        if (
+            message.contains("failed to connect", ignoreCase = true) ||
+            message.contains("unable to resolve host", ignoreCase = true) ||
+            message.contains("network is unreachable", ignoreCase = true)
+        ) {
+            return CONNECTION_ERROR_MESSAGE
+        }
+        val technical = Regex(
+            """\b(?:api|server|route|http|timeout|exception|failed|not found|internal error)\b""",
+            RegexOption.IGNORE_CASE
+        )
+        return if (
+            message.any { Character.UnicodeBlock.of(it) == Character.UnicodeBlock.ARABIC } &&
+            !technical.containsMatchIn(message) &&
+            !Regex("""\b\d{3}\b""").containsMatchIn(message)
+        ) {
+            message
+        } else {
+            "😅 حدثت مشكلة. حاول مرة أخرى، أو تواصل معنا إذا استمرت."
+        }
+    }
+
+    internal fun parseServerErrorMessage(body: String): String? {
+        return try {
+            JSONObject(body).optString("error").takeIf(String::isNotBlank)
+        } catch (_: JSONException) {
+            null
+        }
+    }
 
     /** True when the 429 is the per-day free-tier quota — retrying is pointless. */
     private fun isDailyQuotaError(body: String): Boolean {
+        if (parseQuotaError(429, body) != null) return true
         val normalizedBody = body.lowercase()
         return normalizedBody.contains("perday") ||
             normalizedBody.contains("per_day") ||
@@ -77,10 +245,12 @@ object GeminiApiClient {
             .find(body)?.groupValues?.get(1)?.toDoubleOrNull()
 
     /** Executes one POST and returns HTTP code + body. */
-    private fun postJson(url: String, bodyJson: JSONObject): Pair<Int, String> {
+    private fun postJson(url: String, bodyJson: JSONObject, feature: String? = null): Pair<Int, String> {
         val mediaType = "application/json; charset=utf-8".toMediaType()
         val requestBody = bodyJson.toString().toRequestBody(mediaType)
-        val request = Request.Builder().url(url).post(requestBody).build()
+        val request = Request.Builder().url(url).post(requestBody)
+            .apply { if (feature != null) header(FEATURE_HEADER, feature) }
+            .build()
         client.newCall(request).execute().use { response ->
             return response.code to (response.body?.string() ?: "")
         }
@@ -131,10 +301,13 @@ object GeminiApiClient {
                     throw IOException(BUSY_MESSAGE)
                 }
                 if (!response.isSuccessful) {
-                    throw IOException(json.optString("error").takeIf(String::isNotBlank) ?: BUSY_MESSAGE)
+                    throw IOException(friendlyErrorMessage(
+                        response.code,
+                        json.optString("error").takeIf(String::isNotBlank)
+                    ))
                 }
                 json.optString("text").takeIf(String::isNotBlank)
-                    ?: throw IOException("لم يعثر الخادم على نص قابل للاستخدام.")
+                    ?: throw IOException("لم نعثر على نص قابل للاستخدام في الملف.")
             }
         }
 
@@ -163,7 +336,7 @@ object GeminiApiClient {
                 throw IOException(json.optString("error").takeIf(String::isNotBlank) ?: BUSY_MESSAGE)
             }
             json.optString("summary").takeIf(String::isNotBlank)
-                ?: throw IOException("لم يُنتج الخادم ملخصاً صالحاً.")
+                ?: throw IOException("تعذر إنشاء ملخص صالح. حاول مرة أخرى.")
         }
 
         suspend fun generateProductivityPresentation(summary: String): List<ProductivitySlide> =
@@ -311,17 +484,89 @@ object GeminiApiClient {
     private suspend fun postJsonWithNetworkRetries(
         url: String,
         bodyJson: JSONObject,
+        feature: String? = null,
     ): Pair<Int, String>? {
         for (attempt in 1..MAX_NETWORK_ATTEMPTS) {
             try {
-                return postJson(url, bodyJson)
+                return postJson(url, bodyJson, feature)
+            } catch (e: QuotaExceededException) {
+                throw e
             } catch (e: IOException) {
                 Log.w(TAG, "Temporary network failure on attempt $attempt/$MAX_NETWORK_ATTEMPTS", e)
-                if (attempt == MAX_NETWORK_ATTEMPTS) return null
+                if (attempt == MAX_NETWORK_ATTEMPTS) {
+                    throw IOException(friendlyErrorMessage(e), e)
+                }
                 delay(attempt * 1_000L)
             }
         }
         return null
+    }
+
+    suspend fun submitAsyncChatRequest(requestJson: String): Pair<Int, String> =
+        withContext(Dispatchers.IO) {
+            if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
+                throw IOException("عنوان خادم Smart Cat غير مضبوط.")
+            }
+            val payload = try {
+                JSONObject(requestJson)
+            } catch (error: org.json.JSONException) {
+                throw IOException("بيانات طلب المحادثة غير صالحة.", error)
+            }
+            postJsonWithNetworkRetries("$baseUrl/api/chat-async", payload)
+                ?: throw IOException(CONNECTION_ERROR_MESSAGE)
+        }
+
+    suspend fun getAsyncChatStatus(jobId: String, deviceToken: String): AsyncChatStatus =
+        withContext(Dispatchers.IO) {
+            val response = postJsonWithNetworkRetries(
+                "$baseUrl/api/chat-async/$jobId/result",
+                JSONObject().put("deviceToken", deviceToken)
+            ) ?: throw IOException(CONNECTION_ERROR_MESSAGE)
+            val (statusCode, body) = response
+            val json = try {
+                JSONObject(body)
+            } catch (error: org.json.JSONException) {
+                throw IOException("استجابة حالة المحادثة غير صالحة.", error)
+            }
+            if (statusCode !in 200..299) {
+                throw IOException(
+                    friendlyErrorMessage(
+                        statusCode,
+                        json.optString("error").takeIf(String::isNotBlank)
+                    )
+                )
+            }
+            AsyncChatStatus(
+                status = json.optString("status"),
+                reply = json.optString("reply").takeIf(String::isNotBlank),
+                error = json.optString("error").takeIf(String::isNotBlank)?.let {
+                    friendlyErrorMessage(IOException(it))
+                }
+            )
+        }
+
+    suspend fun getDailyQuranVerse(): DailyQuranVerse = withContext(Dispatchers.IO) {
+        if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
+            throw IOException("عنوان خادم Smart Cat غير مضبوط.")
+        }
+        val request = Request.Builder().url("$baseUrl/api/quran/daily-verse").get().build()
+        client.newCall(request).execute().use { response ->
+            val body = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                throw IOException("تعذر جلب آية اليوم (${response.code}).")
+            }
+            val json = try {
+                JSONObject(body)
+            } catch (error: org.json.JSONException) {
+                throw IOException("استجابة آية اليوم غير صالحة.", error)
+            }
+            val text = json.optString("text").trim()
+            val reference = json.optString("reference").trim()
+            if (text.isBlank() || reference.isBlank()) {
+                throw IOException("بيانات آية اليوم غير مكتملة.")
+            }
+            DailyQuranVerse(text, reference)
+        }
     }
 
     /**
@@ -364,7 +609,8 @@ object GeminiApiClient {
         history: List<ChatMessage>,
         systemInstruction: String,
         reason: String,
-        useThinking: Boolean = thinkingModeEnabled
+        useThinking: Boolean = thinkingModeEnabled,
+        feature: String = "chat"
     ): String {
         Log.w(TAG, "$reason endpoint is missing on the server; using the legacy server-side Gemini proxy")
         val fallbackInstruction = """
@@ -374,7 +620,7 @@ object GeminiApiClient {
             Do not claim that you searched H2 Hub course files or cite course sources.
             Help the student using general knowledge, clearly noting uncertainty when appropriate.
         """.trimIndent()
-        return generateChatResponse(history, fallbackInstruction, useThinking)
+        return generateChatResponse(history, fallbackInstruction, useThinking, feature)
     }
 
     /**
@@ -384,10 +630,11 @@ object GeminiApiClient {
     suspend fun generateChatResponse(
         history: List<ChatMessage>,
         systemInstruction: String,
-        useThinking: Boolean = thinkingModeEnabled
+        useThinking: Boolean = thinkingModeEnabled,
+        feature: String = "chat"
     ): String = withContext(Dispatchers.IO) {
         if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
-            return@withContext "خطأ: لم يتم ضبط رابط الخادم."
+            return@withContext "الخدمة غير مهيأة حالياً. حاول مرة أخرى لاحقاً."
         }
 
         val modelsToTry = if (useThinking) {
@@ -444,7 +691,7 @@ object GeminiApiClient {
                 var attempt = 0
                 attemptsLoop@ while (attempt < 3) {
                     attempt++
-                    val response = postJsonWithNetworkRetries(url, requestBodyJson)
+                    val response = postJsonWithNetworkRetries(url, requestBodyJson, feature)
                     if (response == null) {
                         lastError = CONNECTION_ERROR_MESSAGE
                         break@attemptsLoop
@@ -463,7 +710,7 @@ object GeminiApiClient {
                     Log.e(TAG, "Request failed for $model: Code $code, Body: $bodyStr")
                     if (code == 429) {
                         if (isDailyQuotaError(bodyStr)) {
-                            lastError = DAILY_QUOTA_MESSAGE
+                            lastError = parseQuotaError(429, bodyStr)?.message ?: DAILY_QUOTA_MESSAGE
                             break@attemptsLoop // try fallback model if any
                         }
                         val delaySec = parseRetryDelaySeconds(bodyStr)?.coerceAtMost(25.0) ?: 12.0
@@ -479,7 +726,7 @@ object GeminiApiClient {
                         }
                         lastError = BUSY_MESSAGE
                     } else {
-                        lastError = "خطأ في الاتصال بالخادم ($code). الرجاء المحاولة لاحقاً."
+                        lastError = friendlyErrorMessage(code, parseServerErrorMessage(bodyStr))
                     }
                     break@attemptsLoop
                 }
@@ -487,7 +734,7 @@ object GeminiApiClient {
                 throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Exception during chat generate ($model)", e)
-                lastError = CONNECTION_ERROR_MESSAGE
+                lastError = friendlyErrorMessage(e)
             }
         }
         return@withContext lastError
@@ -500,7 +747,7 @@ object GeminiApiClient {
         useThinking: Boolean = thinkingModeEnabled
     ): String = withContext(Dispatchers.IO) {
         if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
-            return@withContext "خطأ: لم يتم ضبط رابط الخادم."
+            return@withContext "الخدمة غير مهيأة حالياً. حاول مرة أخرى لاحقاً."
         }
         val latestQuestion = history.lastOrNull { it.role == "user" }?.content?.trim()
         if (latestQuestion.isNullOrEmpty()) {
@@ -535,9 +782,10 @@ object GeminiApiClient {
         }
         if (code !in 200..299) {
             Log.e(TAG, "RAG request failed: Code $code, Body: $responseBody")
-            return@withContext responseJson.optString("error")
-                .takeIf(String::isNotBlank)
-                ?: BUSY_MESSAGE
+            return@withContext friendlyErrorMessage(
+                code,
+                responseJson.optString("error").takeIf(String::isNotBlank)
+            )
         }
 
         val reply = responseJson.optString("reply").trim()
@@ -558,6 +806,288 @@ object GeminiApiClient {
         if (sourceLines.isEmpty()) reply else "$reply\n\nالمصادر:\n${sourceLines.joinToString("\n")}"
     }
 
+    private fun chatToolBody(history: List<ChatMessage>, systemInstruction: String): JSONObject? {
+        val latestQuestion = history.lastOrNull { it.role == "user" }?.content?.trim()
+        if (latestQuestion.isNullOrEmpty()) return null
+        return JSONObject()
+            .put("message", latestQuestion)
+            .put("systemInstruction", systemInstruction)
+            .put(
+                "history",
+                JSONArray().apply {
+                    history.takeLast(8).forEach { message ->
+                        put(JSONObject().put("role", message.role).put("text", message.content))
+                    }
+                }
+            )
+    }
+
+    private suspend fun postChatTool(path: String, body: JSONObject): JSONObject {
+        val (code, responseBody) = postJsonWithNetworkRetries("$baseUrl$path", body)
+            ?: return JSONObject().put("error", CONNECTION_ERROR_MESSAGE)
+        val json = try {
+            JSONObject(responseBody)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to parse $path response", e)
+            return JSONObject().put("error", BUSY_MESSAGE)
+        }
+        if (code !in 200..299) {
+            Log.e(TAG, "$path failed: Code $code, Body: $responseBody")
+            val message = friendlyErrorMessage(
+                code,
+                json.optString("error").takeIf(String::isNotBlank)
+            )
+            return JSONObject().put("error", message)
+        }
+        return json
+    }
+
+    data class ToolChatResult(
+        val reply: String,
+        val sources: List<com.example.data.ChatSource> = emptyList(),
+        val thinkingSeconds: Int? = null
+    )
+    data class GeneratedImageResult(
+        val imageUrl: String,
+        val model: String,
+        val safetyWarning: String?,
+        val used: Int,
+        val limit: Int,
+        val paid: Boolean
+    )
+    data class ImageDescriptionSpeech(
+        val description: String,
+        val audioUrl: String?
+    )
+    data class SynthesizedSpeech(
+        val audio: String,
+        val mimeType: String
+    )
+
+    suspend fun isImageGenerationEnabled(): Boolean = withContext(Dispatchers.IO) {
+        if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
+            return@withContext false
+        }
+        val request = Request.Builder()
+            .url("$baseUrl/api/feature-flags")
+            .get()
+            .build()
+        val flagsClient = client.newBuilder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(5, TimeUnit.SECONDS)
+            .callTimeout(8, TimeUnit.SECONDS)
+            .build()
+        try {
+            flagsClient.newCall(request).execute().use { response ->
+                val body = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    Log.w(TAG, "Feature-flag request failed: HTTP ${response.code}")
+                    return@withContext false
+                }
+                JSONObject(body).optBoolean("imageGenerationEnabled", false)
+            }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Log.w(TAG, "Could not read image-generation feature flag; keeping it disabled.", error)
+            false
+        }
+    }
+
+    suspend fun generateImage(prompt: String): GeneratedImageResult = withContext(Dispatchers.IO) {
+        if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
+            throw IOException("عنوان خادم Smart Cat غير مضبوط.")
+        }
+        val deviceId = ApiDeviceIdentity.deviceId
+            ?: throw IOException("تعذر تحديد جهازك. أعد فتح التطبيق وحاول مرة أخرى.")
+        val body = JSONObject()
+            .put("prompt", prompt.trim().take(1_000))
+            .put("deviceId", deviceId)
+            .toString()
+            .toRequestBody("application/json; charset=utf-8".toMediaType())
+        val request = Request.Builder()
+            .url("$baseUrl/api/generate-image")
+            .post(body)
+            .build()
+        val imageClient = client.newBuilder()
+            .readTimeout(180, TimeUnit.SECONDS)
+            .callTimeout(190, TimeUnit.SECONDS)
+            .build()
+        imageClient.newCall(request).execute().use { response ->
+            val responseBody = response.body?.string().orEmpty()
+            val json = try {
+                JSONObject(responseBody)
+            } catch (error: org.json.JSONException) {
+                Log.e(TAG, "Invalid image-generation response: HTTP ${response.code}", error)
+                throw IOException(BUSY_MESSAGE)
+            }
+            if (!response.isSuccessful) {
+                parseQuotaError(response.code, responseBody)?.let(QuotaEvents::publish)
+                throw IOException(friendlyErrorMessage(
+                    response.code,
+                    json.optString("error").takeIf(String::isNotBlank)
+                ))
+            }
+            val imageUrl = json.optString("imageUrl")
+            if (!imageUrl.startsWith("https://")) {
+                throw IOException("تعذر تجهيز الصورة بأمان. حاول مرة أخرى.")
+            }
+            val model = json.optString("model").ifBlank { "black-forest-labs/flux-schnell" }
+            if (model !in setOf("black-forest-labs/flux-schnell", "ideogram-ai/ideogram-v2")) {
+                throw IOException("تعذر تجهيز الصورة. حاول مرة أخرى.")
+            }
+            val usage = json.optJSONObject("usage")
+            GeneratedImageResult(
+                imageUrl = imageUrl,
+                model = model,
+                safetyWarning = json.optString("safetyWarning").takeIf(String::isNotBlank),
+                used = usage?.optInt("used") ?: 0,
+                limit = usage?.optInt("limit") ?: 0,
+                paid = usage?.optBoolean("paid") ?: false
+            )
+        }
+    }
+
+    suspend fun describeImage(imageUrl: String): ImageDescriptionSpeech = withContext(Dispatchers.IO) {
+        if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
+            throw IOException("الخدمة غير متاحة حالياً. حاول مرة أخرى بعد قليل.")
+        }
+        val body = JSONObject()
+            .put("imageUrl", imageUrl)
+            .toString()
+            .toRequestBody("application/json; charset=utf-8".toMediaType())
+        val request = Request.Builder()
+            .url("$baseUrl/api/describe-image")
+            .post(body)
+            .build()
+        val speechClient = client.newBuilder()
+            .readTimeout(90, TimeUnit.SECONDS)
+            .callTimeout(100, TimeUnit.SECONDS)
+            .build()
+        try {
+            speechClient.newCall(request).execute().use { response ->
+                val responseBody = response.body?.string().orEmpty()
+                val json = try {
+                    JSONObject(responseBody)
+                } catch (error: org.json.JSONException) {
+                    Log.e(TAG, "Invalid image-description response: HTTP ${response.code}", error)
+                    throw IOException(BUSY_MESSAGE, error)
+                }
+                if (!response.isSuccessful) {
+                    throw IOException(friendlyErrorMessage(
+                        response.code,
+                        json.optString("error").takeIf(String::isNotBlank)
+                    ))
+                }
+                val description = json.optString("description").trim()
+                if (description.isBlank()) throw IOException(BUSY_MESSAGE)
+                ImageDescriptionSpeech(
+                    description = description,
+                    audioUrl = json.optString("audioUrl").takeIf {
+                        it.startsWith("data:audio/wav;base64,") ||
+                            it.startsWith("data:audio/mpeg;base64,")
+                    }
+                )
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: IOException) {
+            throw IOException(friendlyErrorMessage(error), error)
+        }
+    }
+
+    suspend fun synthesizeSpeech(text: String, femaleVoice: Boolean): SynthesizedSpeech =
+        withContext(Dispatchers.IO) {
+            if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
+                throw IOException("خدمة الصوت غير متاحة حالياً.")
+            }
+            val body = JSONObject()
+                .put("text", text)
+                .put("voice", if (femaleVoice) "ar-XA-Wavenet-C" else "ar-XA-Wavenet-B")
+                .toString()
+                .toRequestBody("application/json; charset=utf-8".toMediaType())
+            val request = Request.Builder()
+                .url("$baseUrl/api/tts")
+                .post(body)
+                .build()
+            try {
+                client.newCall(request).execute().use { response ->
+                    val responseBody = response.body?.string().orEmpty()
+                    val json = try {
+                        JSONObject(responseBody)
+                    } catch (error: org.json.JSONException) {
+                        throw IOException(BUSY_MESSAGE, error)
+                    }
+                    if (!response.isSuccessful) {
+                        throw IOException(friendlyErrorMessage(
+                            response.code,
+                            json.optString("error").takeIf(String::isNotBlank)
+                        ))
+                    }
+                    val audio = json.optString("audio")
+                    val mimeType = json.optString("mimeType")
+                    if (audio.isBlank() || mimeType !in setOf("audio/wav", "audio/mpeg")) {
+                        throw IOException(BUSY_MESSAGE)
+                    }
+                    SynthesizedSpeech(audio, mimeType)
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: IOException) {
+                throw IOException(friendlyErrorMessage(error), error)
+            }
+        }
+
+    private suspend fun runChatTool(
+        path: String,
+        history: List<ChatMessage>,
+        systemInstruction: String
+    ): ToolChatResult = withContext(Dispatchers.IO) {
+        if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
+            return@withContext ToolChatResult("الخدمة غير مهيأة حالياً. حاول مرة أخرى لاحقاً.")
+        }
+        val body = chatToolBody(history, systemInstruction)
+            ?: return@withContext ToolChatResult("اكتب سؤالك أولاً.")
+        val json = postChatTool(path, body)
+        json.optString("error").takeIf(String::isNotBlank)?.let { return@withContext ToolChatResult(it) }
+        val reply = json.optString("reply").trim()
+        if (reply.isBlank()) return@withContext ToolChatResult(BUSY_MESSAGE)
+        val array = json.optJSONArray("sources")
+        val sources = buildList {
+            if (array != null) {
+                for (index in 0 until array.length()) {
+                    val source = array.optJSONObject(index) ?: continue
+                    val url = source.optString("url").takeIf(String::isNotBlank) ?: continue
+                    add(
+                        com.example.data.ChatSource(
+                            source.optString("title").ifBlank { url },
+                            url,
+                            source.optInt("reference").takeIf {
+                                source.has("reference") && it > 0
+                            }
+                        )
+                    )
+                }
+            }
+        }
+        ToolChatResult(
+            reply = reply,
+            sources = sources,
+            thinkingSeconds = json.optInt("thinkingSeconds").takeIf {
+                json.has("thinkingSeconds") && it > 0
+            }
+        )
+    }
+
+    suspend fun generateWebSearchResponse(history: List<ChatMessage>, systemInstruction: String) =
+        runChatTool("/api/chat-web-search", history, systemInstruction)
+
+    suspend fun generateSearchThinkingResponse(history: List<ChatMessage>, systemInstruction: String) =
+        runChatTool("/api/chat-search-thinking", history, systemInstruction)
+
+    suspend fun generateThinkingResponse(history: List<ChatMessage>, systemInstruction: String) =
+        runChatTool("/api/chat-thinking", history, systemInstruction)
+
     suspend fun generateSocraticChatResponse(
         history: List<ChatMessage>,
         systemInstruction: String,
@@ -565,7 +1095,7 @@ object GeminiApiClient {
         useThinking: Boolean = thinkingModeEnabled
     ): SocraticChatResult? = withContext(Dispatchers.IO) {
         if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
-            return@withContext SocraticChatResult("خطأ: لم يتم ضبط رابط الخادم.", progress)
+            return@withContext SocraticChatResult("الخدمة غير مهيأة حالياً. حاول مرة أخرى لاحقاً.", progress)
         }
         val latestQuestion = history.lastOrNull { it.role == "user" }?.content?.trim()
         if (latestQuestion.isNullOrEmpty()) {
@@ -626,7 +1156,10 @@ object GeminiApiClient {
         if (code !in 200..299) {
             Log.e(TAG, "Socratic request failed: Code $code, Body: $responseBody")
             return@withContext SocraticChatResult(
-                responseJson.optString("error").takeIf(String::isNotBlank) ?: BUSY_MESSAGE,
+                friendlyErrorMessage(
+                    code,
+                    responseJson.optString("error").takeIf(String::isNotBlank)
+                ),
                 progress
             )
         }
@@ -661,10 +1194,14 @@ object GeminiApiClient {
         SocraticChatResult(replyWithSources, updatedProgress)
     }
 
-    suspend fun generateVisionResponse(imagePath: String, question: String): String =
+    suspend fun generateVisionResponse(
+        imagePath: String,
+        question: String,
+        systemInstruction: String = ""
+    ): String =
         withContext(Dispatchers.IO) {
             if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
-                return@withContext "خطأ: لم يتم ضبط رابط الخادم."
+                return@withContext "الخدمة غير مهيأة حالياً. حاول مرة أخرى لاحقاً."
             }
             val imageFile = java.io.File(imagePath)
             if (!imageFile.isFile || imageFile.length() !in 1..1_048_576) {
@@ -674,7 +1211,12 @@ object GeminiApiClient {
             try {
                 val requestBody = MultipartBody.Builder()
                     .setType(MultipartBody.FORM)
-                    .addFormDataPart("question", question.take(4_000))
+                    .addFormDataPart("question", question.take(1_000))
+                    .apply {
+                        if (systemInstruction.isNotBlank()) {
+                            addFormDataPart("systemInstruction", systemInstruction.take(2_500))
+                        }
+                    }
                     .addFormDataPart(
                         "image",
                         imageFile.name,
@@ -695,15 +1237,16 @@ object GeminiApiClient {
                     }
                     if (!response.isSuccessful) {
                         Log.e(TAG, "Vision request failed: ${response.code} $body")
-                        return@withContext json.optString("error")
-                            .takeIf(String::isNotBlank)
-                            ?: BUSY_MESSAGE
+                        return@withContext friendlyErrorMessage(
+                            response.code,
+                            json.optString("error").takeIf(String::isNotBlank)
+                        )
                     }
                     json.optString("reply").takeIf(String::isNotBlank) ?: BUSY_MESSAGE
                 }
             } catch (e: IOException) {
                 Log.e(TAG, "Vision request failed", e)
-                CONNECTION_ERROR_MESSAGE
+                friendlyErrorMessage(e)
             }
         }
 
@@ -712,10 +1255,11 @@ object GeminiApiClient {
         systemInstruction: String,
         base64Data: String,
         mimeType: String,
-        useThinking: Boolean = false
+        useThinking: Boolean = false,
+        feature: String = "chat"
     ): String = withContext(Dispatchers.IO) {
         if (baseUrl.isEmpty() || baseUrl == "https://YOUR_RAILWAY_DOMAIN") {
-            return@withContext "خطأ: لم يتم ضبط رابط الخادم."
+            return@withContext "الخدمة غير مهيأة حالياً. حاول مرة أخرى لاحقاً."
         }
 
         // Determine Model
@@ -773,7 +1317,7 @@ object GeminiApiClient {
             var attempt = 0
             while (attempt < 2) {
                 attempt++
-                val response = postJsonWithNetworkRetries(url, requestBodyJson)
+                val response = postJsonWithNetworkRetries(url, requestBodyJson, feature)
                     ?: return@withContext CONNECTION_ERROR_MESSAGE
                 val (code, bodyStr) = response
 
@@ -785,7 +1329,7 @@ object GeminiApiClient {
                 Log.e(TAG, "Multimodal request failed: Code $code, Body: $bodyStr")
                 if (code == 429) {
                     if (isDailyQuotaError(bodyStr)) {
-                        return@withContext DAILY_QUOTA_MESSAGE
+                        return@withContext parseQuotaError(429, bodyStr)?.message ?: DAILY_QUOTA_MESSAGE
                     }
                     // Thinking model unavailable (quota/limit) -> retry once with flash
                     if (useThinking) {
@@ -794,7 +1338,8 @@ object GeminiApiClient {
                             systemInstruction = systemInstruction,
                             base64Data = base64Data,
                             mimeType = mimeType,
-                            useThinking = false
+                            useThinking = false,
+                            feature = feature
                         )
                     }
                     val delaySec = parseRetryDelaySeconds(bodyStr)?.coerceAtMost(25.0) ?: 12.0
@@ -807,14 +1352,17 @@ object GeminiApiClient {
                 if (code == 408 || code == 500 || code == 502 || code == 503 || code == 504) {
                     return@withContext BUSY_MESSAGE
                 }
-                return@withContext "خطأ في الاتصال بالخادم ($code). الرجاء المحاولة لاحقاً."
+                return@withContext friendlyErrorMessage(
+                    code,
+                    runCatching { JSONObject(bodyStr).optString("error") }.getOrNull()
+                )
             }
             return@withContext "لم نتمكن من الحصول على رد من الذكاء الاصطناعي."
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.e(TAG, "Exception during multimodal generate", e)
-            return@withContext CONNECTION_ERROR_MESSAGE
+            return@withContext friendlyErrorMessage(e)
         }
     }
 

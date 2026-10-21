@@ -6,8 +6,10 @@
    See https://developer.android.com/about/versions/12/backup-restore
 -->
 <full-backup-content>
-    <!--
-   <include domain="sharedpref" path="."/>
-   <exclude domain="sharedpref" path="device.xml"/>
--->
+    <exclude domain="database" path="h2_learning_profile.db" />
+    <exclude domain="database" path="h2_learning_profile.db-wal" />
+    <exclude domain="database" path="h2_learning_profile.db-shm" />
+    <exclude domain="sharedpref" path="h2hub_data.xml" />
+    <exclude domain="sharedpref" path="subscription_prefs.xml" />
+    <exclude domain="file" path="chat-vision/" />
 </full-backup-content>

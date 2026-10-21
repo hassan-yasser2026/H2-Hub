@@ -16,6 +16,14 @@ private val DarkColorScheme = darkColorScheme(
     tertiary = DarkTertiary,
     background = DarkBackground,
     surface = DarkSurface,
+    surfaceVariant = HubSurfaceVariant,
+    surfaceContainerLowest = HubSurfaceContainerLowest,
+    surfaceContainerLow = HubSurfaceContainerLow,
+    surfaceContainer = HubSurfaceContainer,
+    surfaceContainerHigh = HubSurfaceContainerHigh,
+    surfaceContainerHighest = HubSurfaceContainerHighest,
+    onSurfaceVariant = HubOnSurfaceVariant,
+    outlineVariant = HubOutlineVariant,
     onBackground = DarkOnBackground,
     onSurface = DarkOnSurface
 )
@@ -36,6 +44,14 @@ private val PurpleColorScheme = darkColorScheme(
     tertiary = PurpleH2Tertiary,
     background = PurpleH2Background,
     surface = PurpleH2Surface,
+    surfaceVariant = HubSurfaceVariant,
+    surfaceContainerLowest = HubSurfaceContainerLowest,
+    surfaceContainerLow = HubSurfaceContainerLow,
+    surfaceContainer = HubSurfaceContainer,
+    surfaceContainerHigh = HubSurfaceContainerHigh,
+    surfaceContainerHighest = HubSurfaceContainerHighest,
+    onSurfaceVariant = HubOnSurfaceVariant,
+    outlineVariant = HubOutlineVariant,
     onBackground = PurpleH2OnBackground,
     onSurface = PurpleH2OnSurface
 )
@@ -56,6 +72,7 @@ fun MyApplicationTheme(
     MaterialTheme(
         colorScheme = colorScheme,
         typography = Typography,
+        shapes = H2HubShapes,
         content = content
     )
 }

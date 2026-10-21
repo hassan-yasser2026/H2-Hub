@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>H2 Smart Hub | لوحة الإدارة</title>
+  <style>
+    :root{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#172033;background:#f4f6fb;font-synthesis:none}
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh}
+    button,input{font:inherit}
+    .shell{max-width:1180px;margin:auto;padding:28px}
+    .topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:26px}
+    .brand{display:flex;align-items:center;gap:14px}
+    .brand-mark{width:48px;height:48px;display:grid;place-items:center;border-radius:15px;background:#5636b2;color:#fff;font-weight:800;font-size:20px}
+    h1,h2,p{margin:0}
+    h1{font-size:clamp(22px,4vw,30px)}
+    .muted{color:#68738a}
+    .panel{background:#fff;border:1px solid #e6e9f1;border-radius:18px;padding:22px;box-shadow:0 10px 28px #1b28500a}
+    .login-wrap{max-width:440px;margin:8vh auto}
+    .login-wrap h2{margin-bottom:8px}
+    label{display:block;font-weight:650;margin:16px 0 7px}
+    input{width:100%;padding:12px 13px;border:1px solid #ccd2df;border-radius:10px;background:white;color:#172033}
+    input:focus{outline:3px solid #5636b222;border-color:#5636b2}
+    button{border:0;border-radius:10px;padding:11px 16px;background:#5636b2;color:#fff;font-weight:700;cursor:pointer}
+    button:disabled{opacity:.6;cursor:wait}
+    .secondary{background:#edf0f7;color:#27324a}
+    .full{width:100%;margin-top:20px}
+    .error{min-height:24px;margin-top:12px;color:#b42318}
+    .dashboard-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin:20px 0}
+    .cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+    .metric{min-height:126px}
+    .metric-name{color:#68738a;font-size:14px}
+    .metric-value{font-size:32px;font-weight:800;margin:12px 0 5px;letter-spacing:-.03em}
+    .metric-note{font-size:12px;color:#7b8496}
+    .section{margin-top:18px}
+    .section h2{font-size:18px;margin-bottom:14px}
+    .analytics-empty{padding:14px;color:#68738a}
+    .legacy-list{margin-top:18px}
+    .legacy-list table{white-space:normal}
+    .admin-tabs{display:flex;gap:10px;margin:20px 0}
+    .admin-tabs button[aria-selected="true"]{background:#342078}
+    .toolbar{display:flex;gap:10px;align-items:center;margin-bottom:16px}
+    .toolbar input,.toolbar select{max-width:300px}
+    .table-wrap{overflow-x:auto}
+    table{width:100%;border-collapse:collapse;white-space:nowrap}
+    th,td{padding:11px 10px;border-bottom:1px solid #e8ebf2;text-align:right}
+    th{font-size:13px;color:#68738a;background:#f8f9fc}
+    td{font-size:14px}
+    .table-wrap button{padding:7px 10px;margin:2px}
+    .approve{background:#16804a}
+    .reject{background:#b42318}
+    .badge{display:inline-block;padding:4px 8px;border-radius:999px;background:#edf0f7;color:#43506a;font-size:12px}
+    .badge.pending{background:#fff3d4;color:#805600}
+    .badge.approved{background:#e5f7ec;color:#166534}
+    .badge.rejected{background:#fee9e7;color:#9b1c13}
+    dialog{width:min(92vw,760px);max-height:90vh;border:0;border-radius:16px;padding:18px}
+    dialog::backdrop{background:#101828aa}
+    dialog img{display:block;max-width:100%;max-height:75vh;margin:12px auto}
+    .status{margin-top:14px;padding:12px;border-radius:10px;background:#f5f7fc;color:#43506a}
+    .hidden{display:none!important}
+    .notice{color:#76520a;background:#fff7df;border:1px solid #f3e3b0;border-radius:12px;padding:14px;margin-top:12px;line-height:1.7}
+    .success{color:#166534;background:#e5f7ec;border:1px solid #bbebca;border-radius:12px;padding:14px;margin-bottom:12px;line-height:1.7}
+    .foot{margin-top:20px;font-size:12px;color:#80899a;text-align:center}
+    @media(max-width:700px){.shell{padding:18px}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}.topbar{align-items:flex-start}.dashboard-head{align-items:flex-start;flex-direction:column}}
+    @media(max-width:430px){.cards{grid-template-columns:1fr}.panel{padding:18px}}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">H2</div>
+        <div><h1>لوحة إدارة H2 Smart Hub</h1><p class="muted">لوحة التشغيل وإدارة الاشتراكات</p></div>
+      </div>
+      <button id="logout" class="secondary hidden" type="button">تسجيل الخروج</button>
+    </header>
+
+    <section id="login-panel" class="panel login-wrap">
+      <h2>تسجيل دخول الأدمن</h2>
+      <p class="muted">استخدم بيانات الاعتماد المضبوطة على الخادم.</p>
+      <form id="login-form" autocomplete="on">
+        <label for="email">البريد الإلكتروني</label>
+        <input id="email" name="email" type="email" autocomplete="username" required maxlength="254">
+        <label for="password">كلمة المرور</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="256">
+        <button id="login-button" class="full" type="submit">دخول آمن</button>
+      </form>
+      <p id="login-error" class="error" role="alert" aria-live="polite"></p>
+    </section>
+
+    <section id="dashboard" class="hidden">
+      <nav class="admin-tabs" aria-label="أقسام الإدارة">
+        <button id="overview-tab" type="button" aria-selected="true">نظرة عامة</button>
+        <button id="subscriptions-tab" class="secondary" type="button" aria-selected="false">الاشتراكات</button>
+      </nav>
+      <section id="overview-panel">
+      <div class="dashboard-head">
+        <div><h2>نظرة عامة</h2><p id="updated-at" class="muted">جارٍ تحميل الإحصائيات...</p></div>
+        <button id="refresh" class="secondary" type="button">تحديث</button>
+      </div>
+      <div id="metrics" class="cards" aria-live="polite"></div>
+      <div id="unavailable" class="notice hidden"></div>
+      <section class="panel section">
+        <h2>المشتركون النشطون حسب الخطة</h2>
+        <div id="subscription-plan-counts" class="cards" aria-live="polite"></div>
+      </section>
+      <section class="panel section">
+        <h2>أكثر الخدمات استخداماً</h2>
+        <div id="service-usage" class="cards" aria-live="polite"></div>
+      </section>
+      <section class="panel section legacy-list">
+        <h2>المشتركون القدامى بلا حدود</h2>
+        <p id="legacy-count" class="muted"></p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>كود المستخدم</th><th>الاسم</th><th>الخطة القديمة</th><th>تاريخ الانتهاء</th></tr></thead>
+            <tbody id="legacy-subscribers"></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel section">
+        <h2>حالة نظام الاشتراكات</h2>
+        <p class="muted">الأرصدة والحصص تُعرض من سجلات الاشتراك والاستخدام المحفوظة على الخادم.</p>
+        <p id="dashboard-error" class="error" role="alert" aria-live="polite"></p>
+      </section>
+      </section>
+      <section id="subscriptions-panel" class="hidden">
+        <div class="dashboard-head">
+          <div><h2>طلبات الاشتراك</h2><p class="muted">اعرض إثبات التحويل ثم وافق على الطلب أو ارفضه مع توضيح السبب.</p></div>
+          <button id="subscriptions-refresh" class="secondary" type="button">تحديث الطلبات</button>
+        </div>
+        <div class="toolbar">
+          <input id="subscriptions-search" type="search" maxlength="100" placeholder="بحث بالرقم أو الكود">
+          <select id="subscriptions-status" aria-label="تصفية الحالة">
+            <option value="all">كل الحالات</option>
+            <option value="pending">قيد المراجعة</option>
+            <option value="approved">مقبول</option>
+            <option value="rejected">مرفوض</option>
+            <option value="draft">غير مكتمل</option>
+          </select>
+        </div>
+        <p id="subscriptions-error" class="error" role="alert" aria-live="polite"></p>
+        <p id="subscriptions-success" class="success hidden" role="status" aria-live="polite"></p>
+        <div class="panel table-wrap">
+          <table>
+            <thead><tr><th>المستخدم</th><th>رقم التحويل</th><th>الخطة</th><th>المبلغ</th><th>كود الدفع</th><th>الحالة</th><th>تاريخ الطلب</th><th>إثبات التحويل</th><th>إجراءات</th></tr></thead>
+            <tbody id="subscriptions-rows"></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+    <footer class="foot">جلسة الإدارة مؤقتة وتنتهي خلال 24 ساعة. استخدم تسجيل الخروج على الأجهزة المشتركة.</footer>
+  </main>
+  <dialog id="screenshot-dialog">
+    <button id="close-screenshot" class="secondary" type="button">إغلاق</button>
+    <img id="screenshot-image" alt="صورة إثبات التحويل">
+  </dialog>
+
+  <script>
+    (() => {
+      "use strict";
+      const tokenKey = "h2_admin_token";
+      const loginPanel = document.getElementById("login-panel");
+      const dashboard = document.getElementById("dashboard");
+      const logoutButton = document.getElementById("logout");
+      const metricsHost = document.getElementById("metrics");
+      const metricLabels = [
+        ["registeredDevices", "أجهزة مسجلة", "رموز FCM المسجلة"],
+        ["backgroundChats", "محادثات خلفية", "إجمالي الطلبات المحفوظة"],
+        ["backgroundChatsToday", "محادثات اليوم", "طلبات منذ بداية اليوم"],
+        ["feedbackReceived", "التقييمات", "إجمالي تقييمات Smart Cat"],
+        ["feedbackPositivePercent", "التقييم الإيجابي", "نسبة التقييمات الإيجابية", "%"],
+        ["users", "المستخدمون المسجلون", "معرّفات الأجهزة المسجلة"],
+        ["totalMessagesConsumed", "الرسائل المستهلكة", "إجمالي وحدات الرسائل المسجلة"]
+      ];
+      const planLabels = {
+        trial: "تجريبي",
+        basic: "أساسي",
+        premium: "مميز",
+        annual: "سنوي",
+        annual_premium: "سنوي مميز",
+        monthly: "شهري قديم",
+        quarterly: "ربع سنوي قديم",
+        yearly: "سنوي قديم"
+      };
+      const serviceLabels = {
+        chat: "المحادثة",
+        coder: "H2 Code",
+        rag: "المحتوى التعليمي",
+        vision: "تحليل الصور",
+        "web-search": "البحث",
+        thinking: "التفكير",
+        "search-thinking": "البحث مع التفكير",
+        "image-generation": "توليد الصور"
+      };
+
+      function showAuthenticated(isAuthenticated) {
+        loginPanel.classList.toggle("hidden", isAuthenticated);
+        dashboard.classList.toggle("hidden", !isAuthenticated);
+        logoutButton.classList.toggle("hidden", !isAuthenticated);
+      }
+
+      async function api(path, options = {}) {
+        const token = sessionStorage.getItem(tokenKey);
+        const headers = new Headers(options.headers || {});
+        if (token) headers.set("Authorization", `Bearer ${token}`);
+        if (options.body) headers.set("Content-Type", "application/json");
+        const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          if (response.status === 401) {
+            sessionStorage.removeItem(tokenKey);
+            showAuthenticated(false);
+          }
+          throw new Error(typeof data.error === "string" ? data.error : "تعذر إكمال الطلب.");
+        }
+        return data;
+      }
+
+      async function loadDashboard() {
+        const error = document.getElementById("dashboard-error");
+        error.textContent = "";
+        try {
+          const data = await api("/api/admin/dashboard");
+          metricsHost.replaceChildren();
+          for (const [key, label, note, suffix = ""] of metricLabels) {
+            const card = document.createElement("article");
+            card.className = "panel metric";
+            const name = document.createElement("p");
+            name.className = "metric-name";
+            name.textContent = label;
+            const value = document.createElement("p");
+            value.className = "metric-value";
+            value.textContent = data.metrics[key] === null || data.metrics[key] === undefined
+              ? "—"
+              : `${new Intl.NumberFormat("ar-EG").format(data.metrics[key])}${suffix}`;
+            const description = document.createElement("p");
+            description.className = "metric-note";
+            description.textContent = note;
+            card.append(name, value, description);
+            metricsHost.append(card);
+          }
+          const analytics = data.subscriptionAnalytics || {};
+          const planHost = document.getElementById("subscription-plan-counts");
+          planHost.replaceChildren();
+          const planCounts = analytics.activePlanCounts || [];
+          if (planCounts.length === 0) {
+            const empty = document.createElement("p");
+            empty.className = "analytics-empty";
+            empty.textContent = "لا توجد اشتراكات نشطة حالياً.";
+            planHost.append(empty);
+          } else {
+            for (const item of planCounts) {
+              const card = document.createElement("article");
+              card.className = "panel metric";
+              const label = document.createElement("p");
+              label.className = "metric-name";
+              label.textContent = planLabels[item.plan] || item.plan;
+              const count = document.createElement("p");
+              count.className = "metric-value";
+              count.textContent = new Intl.NumberFormat("ar-EG").format(item.count);
+              const note = document.createElement("p");
+              note.className = "metric-note";
+              note.textContent = "مشترك نشط";
+              card.append(label, count, note);
+              planHost.append(card);
+            }
+          }
+
+          const serviceHost = document.getElementById("service-usage");
+          serviceHost.replaceChildren();
+          const services = analytics.mostUsedServices || [];
+          if (services.length === 0) {
+            const empty = document.createElement("p");
+            empty.className = "analytics-empty";
+            empty.textContent = "سيظهر ترتيب الخدمات بعد تسجيل الاستخدام.";
+            serviceHost.append(empty);
+          } else {
+            for (const item of services) {
+              const card = document.createElement("article");
+              card.className = "panel metric";
+              const label = document.createElement("p");
+              label.className = "metric-name";
+              label.textContent = serviceLabels[item.service] || item.service;
+              const count = document.createElement("p");
+              count.className = "metric-value";
+              count.textContent = new Intl.NumberFormat("ar-EG").format(item.operations);
+              const note = document.createElement("p");
+              note.className = "metric-note";
+              note.textContent = "عملية مسجلة";
+              card.append(label, count, note);
+              serviceHost.append(card);
+            }
+          }
+
+          const legacyRows = document.getElementById("legacy-subscribers");
+          legacyRows.replaceChildren();
+          const legacy = analytics.legacySubscribers || [];
+          document.getElementById("legacy-count").textContent =
+            `${new Intl.NumberFormat("ar-EG").format(analytics.legacySubscriberCount || 0)} مشترك نشط` +
+            (analytics.legacySubscriberCount > legacy.length
+              ? ` — المعروض أول ${new Intl.NumberFormat("ar-EG").format(analytics.legacyListLimit || legacy.length)}`
+              : "");
+          if (legacy.length === 0) {
+            const row = document.createElement("tr");
+            const cell = document.createElement("td");
+            cell.colSpan = 4;
+            cell.className = "muted";
+            cell.textContent = "لا يوجد مشتركون قدامى نشطون.";
+            row.append(cell);
+            legacyRows.append(row);
+          } else {
+            for (const subscriber of legacy) {
+              const row = document.createElement("tr");
+              for (const value of [
+                subscriber.userCode,
+                subscriber.displayName || "—",
+                planLabels[subscriber.plan] || subscriber.plan,
+                new Date(subscriber.endsAt).toLocaleDateString("ar-EG")
+              ]) {
+                const cell = document.createElement("td");
+                cell.textContent = value;
+                row.append(cell);
+              }
+              legacyRows.append(row);
+            }
+          }
+          const unavailable = document.getElementById("unavailable");
+          const messages = Object.values(data.unavailableMetrics || {});
+          unavailable.textContent = messages.join(" ");
+          unavailable.classList.toggle("hidden", messages.length === 0);
+          document.getElementById("updated-at").textContent =
+            `آخر تحديث: ${new Date(data.generatedAt).toLocaleString("ar-EG")}`;
+        } catch (loadError) {
+          error.textContent = loadError.message;
+        }
+      }
+
+      const subscriptionStatusLabels = {
+        draft: "غير مكتمل",
+        pending: "قيد المراجعة",
+        approved: "مقبول",
+        rejected: "مرفوض"
+      };
+      const subscriptionPlanLabels = {
+        monthly: "شهري",
+        quarterly: "3 شهور",
+        yearly: "سنوي"
+      };
+
+      async function loadSubscriptions() {
+        const error = document.getElementById("subscriptions-error");
+        const rowsHost = document.getElementById("subscriptions-rows");
+        error.textContent = "";
+        rowsHost.replaceChildren();
+        const query = new URLSearchParams({
+          status: document.getElementById("subscriptions-status").value,
+          q: document.getElementById("subscriptions-search").value.trim()
+        });
+        try {
+          const data = await api(`/api/admin/subscriptions?${query}`);
+          if (data.requests.length === 0) {
+            const row = document.createElement("tr");
+            const cell = document.createElement("td");
+            cell.colSpan = 9;
+            cell.className = "muted";
+            cell.textContent = "لا توجد طلبات مطابقة.";
+            row.append(cell);
+            rowsHost.append(row);
+            return;
+          }
+          for (const request of data.requests) {
+            const row = document.createElement("tr");
+            const values = [
+              request.displayName || request.userCode,
+              request.vodafoneNumber || "—",
+              subscriptionPlanLabels[request.plan] || request.plan,
+              `${new Intl.NumberFormat("ar-EG").format(request.amount)} جنيه`,
+              request.uniqueCode
+            ];
+            for (const value of values) {
+              const cell = document.createElement("td");
+              cell.textContent = value;
+              row.append(cell);
+            }
+            const statusCell = document.createElement("td");
+            const badge = document.createElement("span");
+            badge.className = `badge ${request.status}`;
+            badge.textContent = subscriptionStatusLabels[request.status] || request.status;
+            statusCell.append(badge);
+            row.append(statusCell);
+
+            const dateCell = document.createElement("td");
+            dateCell.textContent = new Date(request.createdAt).toLocaleString("ar-EG");
+            row.append(dateCell);
+
+            const screenshotCell = document.createElement("td");
+            if (request.screenshotAvailable) {
+              const screenshotButton = document.createElement("button");
+              screenshotButton.type = "button";
+              screenshotButton.className = "secondary";
+              screenshotButton.textContent = "مشاهدة";
+              screenshotButton.addEventListener("click", () => showScreenshot(request.id));
+              screenshotCell.append(screenshotButton);
+            } else {
+              screenshotCell.textContent = "غير مرفقة";
+            }
+            row.append(screenshotCell);
+
+            const actionsCell = document.createElement("td");
+            if (request.status === "pending") {
+              const approveButton = document.createElement("button");
+              approveButton.type = "button";
+              approveButton.className = "approve";
+              approveButton.textContent = "موافقة";
+              approveButton.addEventListener("click", () => approveSubscription(request.id));
+              const rejectButton = document.createElement("button");
+              rejectButton.type = "button";
+              rejectButton.className = "reject";
+              rejectButton.textContent = "رفض";
+              rejectButton.addEventListener("click", () => rejectSubscription(request.id));
+              actionsCell.append(approveButton, rejectButton);
+            } else {
+              actionsCell.textContent = request.rejectionReason || "—";
+            }
+            row.append(actionsCell);
+            rowsHost.append(row);
+          }
+        } catch (loadError) {
+          error.textContent = loadError.message;
+        }
+      }
+
+      async function showScreenshot(requestId) {
+        const error = document.getElementById("subscriptions-error");
+        error.textContent = "";
+        try {
+          const token = sessionStorage.getItem(tokenKey);
+          const response = await fetch(`/api/admin/subscriptions/${encodeURIComponent(requestId)}/screenshot`, {
+            headers: token ? { Authorization: `Bearer ${token}` } : {},
+            credentials: "same-origin"
+          });
+          if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            throw new Error(data.error || "تعذر تحميل صورة التحويل.");
+          }
+          const imageUrl = URL.createObjectURL(await response.blob());
+          const image = document.getElementById("screenshot-image");
+          const oldUrl = image.dataset.objectUrl;
+          if (oldUrl) URL.revokeObjectURL(oldUrl);
+          image.dataset.objectUrl = imageUrl;
+          image.src = imageUrl;
+          document.getElementById("screenshot-dialog").showModal();
+        } catch (loadError) {
+          error.textContent = loadError.message;
+        }
+      }
+
+      async function approveSubscription(requestId) {
+        if (!window.confirm("هل تأكدت من التحويل وتريد تفعيل هذا الاشتراك؟")) return;
+        try {
+          const result = await api("/api/admin/subscription/approve", {
+            method: "POST",
+            body: JSON.stringify({ requestId })
+          });
+          const success = document.getElementById("subscriptions-success");
+          success.textContent = `تم تفعيل الاشتراك للمستخدم ${result.userCode} لمدة ${new Intl.NumberFormat("ar-EG").format(result.days)} يوم. تاريخ الانتهاء: ${new Date(result.subscriptionEndDate).toLocaleDateString("ar-EG")}.`;
+          success.classList.remove("hidden");
+          await loadSubscriptions();
+        } catch (actionError) {
+          document.getElementById("subscriptions-error").textContent = actionError.message;
+        }
+      }
+
+      async function rejectSubscription(requestId) {
+        const reason = window.prompt("اكتب سبب رفض الطلب:");
+        if (reason === null) return;
+        try {
+          await api("/api/admin/subscription/reject", {
+            method: "POST",
+            body: JSON.stringify({ requestId, reason })
+          });
+          await loadSubscriptions();
+        } catch (actionError) {
+          document.getElementById("subscriptions-error").textContent = actionError.message;
+        }
+      }
+
+      function selectAdminTab(selectedTab) {
+        const overviewSelected = selectedTab === "overview";
+        document.getElementById("overview-panel").classList.toggle("hidden", !overviewSelected);
+        document.getElementById("subscriptions-panel").classList.toggle("hidden", overviewSelected);
+        document.getElementById("overview-tab").setAttribute("aria-selected", String(overviewSelected));
+        document.getElementById("subscriptions-tab").setAttribute("aria-selected", String(!overviewSelected));
+        document.getElementById("overview-tab").classList.toggle("secondary", !overviewSelected);
+        document.getElementById("subscriptions-tab").classList.toggle("secondary", overviewSelected);
+        if (!overviewSelected) loadSubscriptions();
+      }
+
+      document.getElementById("login-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const button = document.getElementById("login-button");
+        const error = document.getElementById("login-error");
+        error.textContent = "";
+        button.disabled = true;
+        try {
+          const payload = {
+            email: document.getElementById("email").value,
+            password: document.getElementById("password").value
+          };
+          const result = await api("/api/admin/auth/login", {
+            method: "POST",
+            body: JSON.stringify(payload)
+          });
+          sessionStorage.setItem(tokenKey, result.token);
+          document.getElementById("password").value = "";
+          showAuthenticated(true);
+          await loadDashboard();
+        } catch (loginError) {
+          error.textContent = loginError.message;
+        } finally {
+          button.disabled = false;
+        }
+      });
+
+      document.getElementById("refresh").addEventListener("click", loadDashboard);
+      document.getElementById("overview-tab").addEventListener("click", () => selectAdminTab("overview"));
+      document.getElementById("subscriptions-tab").addEventListener("click", () => selectAdminTab("subscriptions"));
+      document.getElementById("subscriptions-refresh").addEventListener("click", loadSubscriptions);
+      document.getElementById("subscriptions-status").addEventListener("change", loadSubscriptions);
+      let searchTimer;
+      document.getElementById("subscriptions-search").addEventListener("input", () => {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(loadSubscriptions, 250);
+      });
+      document.getElementById("close-screenshot").addEventListener("click", () => {
+        document.getElementById("screenshot-dialog").close();
+      });
+      document.getElementById("screenshot-dialog").addEventListener("close", () => {
+        const image = document.getElementById("screenshot-image");
+        const imageUrl = image.dataset.objectUrl;
+        if (imageUrl) URL.revokeObjectURL(imageUrl);
+        delete image.dataset.objectUrl;
+        image.removeAttribute("src");
+      });
+      logoutButton.addEventListener("click", () => {
+        sessionStorage.removeItem(tokenKey);
+        metricsHost.replaceChildren();
+        showAuthenticated(false);
+      });
+
+      if (sessionStorage.getItem(tokenKey)) {
+        api("/api/admin/auth/me")
+          .then(() => {
+            showAuthenticated(true);
+            return loadDashboard();
+          })
+          .catch(() => showAuthenticated(false));
+      }
+    })();
+  </script>
+</body>
+</html>

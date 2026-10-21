@@ -2,18 +2,27 @@ package com.example.data
 
 import kotlinx.coroutines.flow.Flow
 
-class AppRepository(private val appDao: AppDao) {
+class AppRepository(
+    private val appDao: AppDao,
+    private val conversationSync: FirestoreConversationSync? = null
+) {
     // Sessions
     val allSessions: Flow<List<ChatSession>> = appDao.getAllSessionsFlow()
 
+    suspend fun getSession(sessionId: String): ChatSession? = appDao.getSession(sessionId)
+
     suspend fun insertSession(session: ChatSession) {
         appDao.insertSession(session)
+        conversationSync?.saveSession(session)
     }
 
     suspend fun deleteSession(sessionId: String) {
         appDao.deleteSession(sessionId)
         appDao.deleteMessagesForSession(sessionId)
+        conversationSync?.deleteSession(sessionId)
     }
+
+    suspend fun clearChatHistory() = appDao.clearChatHistory()
 
     // Messages
     fun getMessagesForSessionFlow(sessionId: String): Flow<List<ChatMessage>> {
@@ -26,10 +35,30 @@ class AppRepository(private val appDao: AppDao) {
 
     suspend fun insertMessage(message: ChatMessage) {
         appDao.insertMessage(message)
+        val session = appDao.getSession(message.sessionId)
+        if (session != null) {
+            val updatedSession = session.copy(updatedAt = maxOf(session.updatedAt, message.timestamp))
+            appDao.insertSession(updatedSession)
+            conversationSync?.saveMessage(updatedSession, message)
+        } else {
+            conversationSync?.saveOrphanMessage(message)
+        }
     }
 
     suspend fun deleteMessagesForSession(sessionId: String) {
         appDao.deleteMessagesForSession(sessionId)
+        conversationSync?.deleteMessages(sessionId)
+    }
+
+    suspend fun insertPendingChatRequest(request: PendingChatRequest) {
+        appDao.insertPendingChatRequest(request)
+    }
+
+    suspend fun getPendingChatRequest(notificationId: String): PendingChatRequest? =
+        appDao.getPendingChatRequest(notificationId)
+
+    suspend fun deletePendingChatRequest(notificationId: String) {
+        appDao.deletePendingChatRequest(notificationId)
     }
 
     // Productivity Documents

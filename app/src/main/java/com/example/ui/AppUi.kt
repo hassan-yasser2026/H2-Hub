@@ -6,17 +6,22 @@ import android.graphics.Typeface
 import android.graphics.pdf.PdfDocument
 import android.Manifest
 import android.app.TimePickerDialog
+import android.app.DatePickerDialog
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
-import android.util.Base64
+import android.os.Environment
+import android.provider.MediaStore
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
@@ -26,27 +31,44 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
+import android.os.Handler
+import android.os.Looper
 import androidx.compose.material3.*
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import com.example.auth.AuthManager
+import com.example.auth.AuthState
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.testTag
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
@@ -60,49 +82,134 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.example.data.*
+import com.example.ExamReminder
+import com.example.NotificationScheduler
+import com.example.PushNotifications
 import com.mikepenz.markdown.m3.Markdown
 import java.text.SimpleDateFormat
 import java.util.*
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import javax.net.ssl.HttpsURLConnection
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
-import java.io.File
 import java.io.IOException
 import com.example.network.parseChatVisionMessage
+import com.example.network.GeminiApiClient
+import com.example.network.GeminiApiClient.FeedbackRating
+import com.example.ui.theme.AccentColors
+import com.example.ui.theme.withAccent
+import coil.compose.AsyncImage
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.unit.LayoutDirection
 
 // Main app destinations
 enum class AppScreen(val titleAr: String, val icon: ImageVector) {
     CHAT("Smart Cat", Icons.Default.ChatBubble),
+    CODER("H2 Code", Icons.Default.Code),
+    VOICE_FRIENDS("تحدث مع صديقك", Icons.Default.Mic),
+    FRIEND_CHAT("محادثة صديقك", Icons.Default.ChatBubble),
+    PERSONA_CHAT("محادثة شخصية", Icons.Default.ChatBubble),
     QURAN("تجويد القرآن", Icons.Default.Mic),
     PRODUCTIVITY("الإنتاجية", Icons.Default.Analytics),
     PERSONAS("شخصيات AI", Icons.Default.People),
     ORGANIZER("المنظم اليومي", Icons.Default.CalendarMonth),
     LEARNING_PROFILE("ملفي التعليمي", Icons.Default.School),
     STUDY_SET("المراجعة", Icons.Default.Quiz),
-    MORE("المزيد", Icons.Default.Dashboard)
+    NOTIFICATIONS("الإشعارات", Icons.Default.Notifications),
+    SUBSCRIPTION("الاشتراك", Icons.Default.Star),
+    MORE("الأقسام", Icons.Default.Dashboard)
 }
+
+internal fun appScreenAccent(screen: AppScreen, personaId: String? = null): Color =
+    when (screen) {
+        AppScreen.CHAT -> AccentColors.SmartCat
+        AppScreen.QURAN -> AccentColors.Quran
+        AppScreen.VOICE_FRIENDS, AppScreen.FRIEND_CHAT -> AccentColors.VoiceFriend
+        AppScreen.PERSONAS -> AccentColors.Personas
+        AppScreen.PERSONA_CHAT -> personaId?.let { AccentColors.forPersona(it) } ?: AccentColors.SmartCat
+        AppScreen.CODER -> AccentColors.Coder
+        AppScreen.PRODUCTIVITY -> AccentColors.Productivity
+        AppScreen.ORGANIZER -> AccentColors.Organizer
+        AppScreen.SUBSCRIPTION -> AccentColors.Subscription
+        else -> AccentColors.SmartCat
+    }
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun AppUi(viewModel: AppViewModel) {
     var currentScreen by remember { mutableStateOf(AppScreen.CHAT) }
     var previousScreen by remember { mutableStateOf(AppScreen.CHAT) }
+    var selectedVoiceFriendId by rememberSaveable { mutableStateOf("hasan") }
+    var selectedPersonaChatId by rememberSaveable { mutableStateOf("teacher") }
     var showSettingsDialog by remember { mutableStateOf(false) }
+    var showQuickNavigationMenu by remember { mutableStateOf(false) }
     var settingsSection by remember { mutableStateOf(AppScreen.CHAT) }
     val isKeyboardVisible = WindowInsets.isImeVisible
+    val context = LocalContext.current
+    val navigationRequest by PushNotifications.navigationRequests.collectAsState()
+    val backgroundChatPendingSession by viewModel.backgroundChatPendingSession.collectAsState()
 
-    // Navigation back handling
-    if (currentScreen != AppScreen.CHAT) {
-        BackHandler {
-            currentScreen = if (currentScreen == AppScreen.MORE) {
-                AppScreen.CHAT
-            } else {
-                previousScreen
+    LaunchedEffect(navigationRequest?.eventId) {
+        val request = navigationRequest ?: return@LaunchedEffect
+        when (request.target) {
+            "chat" -> {
+                request.sessionId?.let(viewModel::selectSession) ?: viewModel.ensureActiveChatSession()
+                currentScreen = AppScreen.CHAT
             }
+            "quran" -> currentScreen = AppScreen.QURAN
+            "organizer" -> currentScreen = AppScreen.ORGANIZER
+            "learning_profile" -> currentScreen = AppScreen.LEARNING_PROFILE
+            else -> currentScreen = AppScreen.CHAT
+        }
+        request.speakText?.let(viewModel::speakTextLocally)
+        PushNotifications.clearNavigationRequest(request.eventId)
+    }
+
+    LaunchedEffect(currentScreen, backgroundChatPendingSession) {
+        if (currentScreen != AppScreen.CHAT &&
+            viewModel.consumeBackgroundChatNotice(backgroundChatPendingSession)
+        ) {
+            Toast.makeText(context, "هنبعتلك إشعار لما الرد يجي", Toast.LENGTH_SHORT).show()
         }
     }
 
-    Scaffold(
+    // Navigation back handling
+    fun navigateBack() {
+        currentScreen = when (currentScreen) {
+            AppScreen.MORE -> AppScreen.CHAT
+            AppScreen.VOICE_FRIENDS -> AppScreen.MORE
+            AppScreen.FRIEND_CHAT -> AppScreen.VOICE_FRIENDS
+            AppScreen.PERSONAS -> AppScreen.MORE
+            AppScreen.PERSONA_CHAT -> AppScreen.PERSONAS
+            else -> previousScreen
+        }
+    }
+
+    if (currentScreen != AppScreen.CHAT) {
+        BackHandler(onBack = ::navigateBack)
+    }
+
+    val sectionAccent = appScreenAccent(
+        currentScreen,
+        personaId = when (currentScreen) {
+            AppScreen.PERSONA_CHAT -> selectedPersonaChatId
+            AppScreen.FRIEND_CHAT -> selectedVoiceFriendId
+            else -> null
+        }
+    )
+    val sectionColorScheme = MaterialTheme.colorScheme.withAccent(sectionAccent)
+
+    MaterialTheme(
+        colorScheme = sectionColorScheme,
+        typography = MaterialTheme.typography,
+        shapes = MaterialTheme.shapes
+    ) {
+        Scaffold(
         modifier = Modifier.fillMaxSize().imePadding(),
         contentWindowInsets = WindowInsets.safeDrawing.only(
             WindowInsetsSides.Top + WindowInsetsSides.Horizontal
@@ -112,21 +219,68 @@ fun AppUi(viewModel: AppViewModel) {
         } else {
             {
                 TopAppBar(
-                    title = {},
+                    title = {
+                        Text(
+                            currentScreen.titleAr,
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold
+                        )
+                    },
+                    navigationIcon = {
+                        if (currentScreen != AppScreen.CHAT &&
+                            currentScreen != AppScreen.QURAN &&
+                            currentScreen != AppScreen.MORE
+                        ) {
+                            IconButton(onClick = ::navigateBack) {
+                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "رجوع")
+                            }
+                        }
+                    },
                     actions = {
-                        IconButton(onClick = {
-                            settingsSection = currentScreen
-                            showSettingsDialog = true
-                        }) {
+                        Box {
+                            IconButton(onClick = { showQuickNavigationMenu = true }) {
                             Icon(
                                 imageVector = Icons.Default.Settings,
                                 contentDescription = "Settings",
                                 tint = MaterialTheme.colorScheme.primary
                             )
+                            }
+                            DropdownMenu(
+                                expanded = showQuickNavigationMenu,
+                                onDismissRequest = { showQuickNavigationMenu = false }
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("الإعدادات") },
+                                    onClick = {
+                                        showQuickNavigationMenu = false
+                                        settingsSection = currentScreen
+                                        showSettingsDialog = true
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(AppScreen.LEARNING_PROFILE.titleAr) },
+                                    onClick = {
+                                        showQuickNavigationMenu = false
+                                        previousScreen = currentScreen
+                                        currentScreen = AppScreen.LEARNING_PROFILE
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(AppScreen.NOTIFICATIONS.titleAr) },
+                                    onClick = {
+                                        showQuickNavigationMenu = false
+                                        previousScreen = currentScreen
+                                        currentScreen = AppScreen.NOTIFICATIONS
+                                    }
+                                )
+                            }
                         }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = MaterialTheme.colorScheme.background
+                        containerColor = sectionAccent.copy(alpha = 0.12f),
+                        titleContentColor = MaterialTheme.colorScheme.onBackground,
+                        navigationIconContentColor = sectionAccent,
+                        actionIconContentColor = sectionAccent
                     )
                 )
             }
@@ -165,9 +319,14 @@ fun AppUi(viewModel: AppViewModel) {
                 },
                 label = "ScreenTransition"
             ) { screen ->
-                when (screen) {
+                val screenContent: @Composable () -> Unit = {
+                    when (screen) {
                     AppScreen.CHAT -> ChatScreen(
                         viewModel = viewModel,
+                        onOpenSubscription = {
+                            previousScreen = currentScreen
+                            currentScreen = AppScreen.SUBSCRIPTION
+                        },
                         onOpenSettings = {
                             settingsSection = AppScreen.CHAT
                             showSettingsDialog = true
@@ -178,119 +337,609 @@ fun AppUi(viewModel: AppViewModel) {
                             currentScreen = AppScreen.STUDY_SET
                         }
                     )
+                    AppScreen.CODER -> PersonasScreen(
+                        viewModel,
+                        coderOnly = true,
+                        onOpenSubscription = {
+                            previousScreen = currentScreen
+                            currentScreen = AppScreen.SUBSCRIPTION
+                        },
+                        onPersonaSelected = { personaId ->
+                            if (personaId == "hasan" || personaId == "jana") {
+                                selectedVoiceFriendId = personaId
+                                currentScreen = AppScreen.FRIEND_CHAT
+                            } else if (personaId != "coder") {
+                                selectedPersonaChatId = personaId
+                                currentScreen = AppScreen.PERSONA_CHAT
+                            }
+                            viewModel.setDefaultPersona(personaId)
+                        },
+                        onOpenSettings = {
+                            settingsSection = AppScreen.PERSONAS
+                            showSettingsDialog = true
+                        }
+                    )
+                    AppScreen.VOICE_FRIENDS -> VoiceFriendSelectionScreen(
+                        onBack = { currentScreen = AppScreen.MORE },
+                        onSelectFriend = { personaId ->
+                            selectedVoiceFriendId = personaId
+                            viewModel.setDefaultPersona(personaId)
+                            previousScreen = AppScreen.VOICE_FRIENDS
+                            currentScreen = AppScreen.FRIEND_CHAT
+                        }
+                    )
+                    AppScreen.FRIEND_CHAT -> PersonasScreen(
+                        viewModel,
+                        personaOnlyId = selectedVoiceFriendId,
+                        onBack = { currentScreen = AppScreen.VOICE_FRIENDS },
+                        onOpenSubscription = {
+                            previousScreen = currentScreen
+                            currentScreen = AppScreen.SUBSCRIPTION
+                        },
+                        onPersonaSelected = { personaId ->
+                            if (personaId == "hasan" || personaId == "jana") {
+                                selectedVoiceFriendId = personaId
+                                viewModel.setDefaultPersona(personaId)
+                            } else {
+                                selectedPersonaChatId = personaId
+                                currentScreen = AppScreen.PERSONA_CHAT
+                                viewModel.setDefaultPersona(personaId)
+                            }
+                        },
+                        onOpenSettings = {
+                            settingsSection = AppScreen.PERSONAS
+                            showSettingsDialog = true
+                        }
+                    )
+                    AppScreen.PERSONA_CHAT -> key(selectedPersonaChatId) {
+                        PersonasScreen(
+                            viewModel,
+                            personaOnlyId = selectedPersonaChatId,
+                            onBack = { currentScreen = AppScreen.PERSONAS },
+                            onOpenSubscription = {
+                                previousScreen = currentScreen
+                                currentScreen = AppScreen.SUBSCRIPTION
+                            },
+                            onPersonaSelected = { personaId ->
+                                if (personaId == "hasan" || personaId == "jana") {
+                                    selectedVoiceFriendId = personaId
+                                    currentScreen = AppScreen.FRIEND_CHAT
+                                } else {
+                                    selectedPersonaChatId = personaId
+                                }
+                                viewModel.setDefaultPersona(personaId)
+                            },
+                            onOpenSettings = {
+                                settingsSection = AppScreen.PERSONAS
+                                showSettingsDialog = true
+                            }
+                        )
+                    }
                     AppScreen.QURAN -> QuranCoachScreen(viewModel)
                     AppScreen.PRODUCTIVITY -> ProductivityScreen(viewModel)
-                    AppScreen.PERSONAS -> PersonasScreen(viewModel)
+                    AppScreen.PERSONAS -> PersonasGridScreen(
+                        onSelectPersona = { personaId ->
+                            selectedPersonaChatId = personaId
+                            viewModel.setDefaultPersona(personaId)
+                            previousScreen = AppScreen.PERSONAS
+                            currentScreen = AppScreen.PERSONA_CHAT
+                        }
+                    )
                     AppScreen.ORGANIZER -> OrganizerScreen(viewModel)
                     AppScreen.LEARNING_PROFILE -> LearningProfileScreen(viewModel)
                     AppScreen.STUDY_SET -> StudySetScreen(
                         viewModel = viewModel,
                         onBack = { currentScreen = previousScreen }
                     )
+                    AppScreen.NOTIFICATIONS -> NotificationsSettingsScreen(viewModel)
+                    AppScreen.SUBSCRIPTION -> SubscriptionScreen(AccentColors.Subscription)
                     AppScreen.MORE -> MoreScreen(
                         onNavigate = {
                             previousScreen = AppScreen.MORE
                             currentScreen = it
                         }
                     )
+                    }
+                }
+                val isChatDestination = screen in setOf(
+                    AppScreen.CHAT,
+                    AppScreen.CODER,
+                    AppScreen.PERSONA_CHAT,
+                    AppScreen.FRIEND_CHAT
+                )
+                Column(Modifier.fillMaxSize()) {
+                    if (isChatDestination) {
+                        BannerAdView(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(MaterialTheme.colorScheme.background)
+                        )
+                    }
+                    Box(Modifier.weight(1f)) {
+                        if (screen == AppScreen.CHAT) {
+                            screenContent()
+                        } else {
+                            SmartCatScreenStyle(content = screenContent)
+                        }
+                    }
                 }
             }
 
             if (showSettingsDialog) {
-                SettingsDialog(
-                    viewModel = viewModel,
-                    section = settingsSection,
-                    onDismiss = { showSettingsDialog = false }
-                )
+                SmartCatScreenStyle {
+                    SettingsDialog(
+                        viewModel = viewModel,
+                        section = settingsSection,
+                        onDismiss = { showSettingsDialog = false }
+                    )
+                }
             }
+        }
         }
     }
 }
 
 @Composable
 private fun MoreScreen(onNavigate: (AppScreen) -> Unit) {
+    val configuration = LocalConfiguration.current
+    val isWideScreen = configuration.screenWidthDp >= 600
+    val isShortScreen = configuration.screenHeightDp < 600
+    val cardHeight = when {
+        isShortScreen -> 96.dp
+        isWideScreen -> 128.dp
+        else -> 112.dp
+    }
+    val iconSize = if (isWideScreen) 52.dp else 44.dp
+    val iconGlyphSize = if (isWideScreen) 30.dp else 27.dp
+    val gridState = rememberLazyGridState()
+    LaunchedEffect(Unit) {
+        gridState.scrollToItem(0)
+    }
     val destinations = listOf(
-        AppScreen.CHAT,
         AppScreen.QURAN,
-        AppScreen.PRODUCTIVITY,
+        AppScreen.CHAT,
         AppScreen.PERSONAS,
+        AppScreen.VOICE_FRIENDS,
+        AppScreen.PRODUCTIVITY,
         AppScreen.ORGANIZER,
-        AppScreen.LEARNING_PROFILE
+        AppScreen.CODER,
+        AppScreen.SUBSCRIPTION
+    )
+
+    LazyVerticalGrid(
+        columns = GridCells.Adaptive(minSize = if (isWideScreen) 190.dp else 148.dp),
+        modifier = Modifier.fillMaxSize(),
+        state = gridState,
+        contentPadding = PaddingValues(start = 20.dp, top = 16.dp, end = 20.dp, bottom = 24.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        item(span = { GridItemSpan(maxLineSpan) }) {
+            HubSectionHeading(
+                title = "أقسام التطبيق",
+                description = "كل أداة في قسمها — افتح القسم المناسب لمهمتك."
+            )
+        }
+        gridItems(destinations, key = { it.name }) { destination ->
+            val accentColor = appScreenAccent(destination)
+            HubCard(
+                onClick = { onNavigate(destination) },
+                modifier = Modifier.fillMaxWidth().height(cardHeight),
+                accentColor = accentColor
+            ) {
+                Column(
+                    modifier = Modifier.fillMaxSize().padding(12.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Box(
+                        modifier = Modifier.size(iconSize)
+                            .background(accentColor.copy(alpha = 0.15f), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(destination.icon, contentDescription = null, tint = accentColor, modifier = Modifier.size(iconGlyphSize))
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = destination.titleAr,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        textAlign = TextAlign.Center,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PersonasGridScreen(onSelectPersona: (String) -> Unit) {
+    val configuration = LocalConfiguration.current
+    val isWideScreen = configuration.screenWidthDp >= 600
+    val isShortScreen = configuration.screenHeightDp < 600
+    val avatarSize = when {
+        isShortScreen -> 44.dp
+        isWideScreen -> 64.dp
+        else -> 54.dp
+    }
+    val cardMinHeight = when {
+        isShortScreen -> 104.dp
+        isWideScreen -> 148.dp
+        else -> 132.dp
+    }
+    val gridState = rememberLazyGridState()
+    LaunchedEffect(Unit) {
+        gridState.scrollToItem(0)
+    }
+    val personas = listOf(
+        Persona("business", "أ. سمير", "مساعد التثقيف في الأعمال", Icons.Default.BusinessCenter, AccentColors.forPersona("business")),
+        Persona("doctor", "د. خالد", "مساعدة التوعية الصحية", Icons.Default.LocalHospital, AccentColors.forPersona("doctor")),
+        Persona("teacher", "أ. أحمد", "معلم ومبسط العلوم", Icons.Default.School, AccentColors.forPersona("teacher")),
+        Persona("nanny", "المربية أسماء", "التوعية بالتربية الأسرية", Icons.Default.BabyChangingStation, AccentColors.forPersona("nanny")),
+        Persona("chef", "الشيف مراد", "وصفات الطهي والحلويات", Icons.Default.Restaurant, AccentColors.forPersona("chef")),
+        Persona("designer", "المصممة آية", "واجهات التصميم الجرافيكي", Icons.Default.Palette, AccentColors.forPersona("designer")),
+        Persona("coach", "الكابتن فهد", "مساعد اللياقة البدنية", Icons.Default.FitnessCenter, AccentColors.forPersona("coach")),
+        Persona("sheikh", "الشيخ عبد الرحمن", "مساعد المعرفة الإسلامية", Icons.Default.SelfImprovement, AccentColors.forPersona("sheikh")),
+        Persona("legal", "المستشار عادل", "مساعد التثقيف القانوني", Icons.Default.Gavel, AccentColors.forPersona("legal"))
+    )
+
+    LazyVerticalGrid(
+        columns = GridCells.Adaptive(minSize = if (isWideScreen) 190.dp else 145.dp),
+        modifier = Modifier.fillMaxSize(),
+        state = gridState,
+        contentPadding = PaddingValues(start = 16.dp, top = 12.dp, end = 16.dp, bottom = 24.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        item(span = { GridItemSpan(maxLineSpan) }) {
+            HubSectionHeading(
+                title = "شخصيات AI",
+                modifier = Modifier.padding(vertical = 8.dp)
+            )
+        }
+        gridItems(personas, key = { it.id }) { persona ->
+            HubCard(
+                onClick = { onSelectPersona(persona.id) },
+                modifier = Modifier.fillMaxWidth().heightIn(min = cardMinHeight),
+                accentColor = persona.color
+            ) {
+                Column(
+                    modifier = Modifier.fillMaxSize().padding(12.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Box(
+                        modifier = Modifier.size(avatarSize).clip(CircleShape)
+                            .background(persona.color.copy(alpha = 0.16f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            persona.icon,
+                            contentDescription = null,
+                            tint = persona.color,
+                            modifier = Modifier.size(if (isWideScreen) 32.dp else 28.dp)
+                        )
+                    }
+                    Spacer(Modifier.height(if (isShortScreen) 6.dp else 10.dp))
+                    Text(
+                        persona.name,
+                        textAlign = TextAlign.Center,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun VoiceFriendSelectionScreen(
+    onBack: () -> Unit,
+    onSelectFriend: (String) -> Unit
+) {
+    val configuration = LocalConfiguration.current
+    val isWideScreen = configuration.screenWidthDp >= 600
+    val isShortScreen = configuration.screenHeightDp < 600
+    val friendIconSize = when {
+        isShortScreen -> 60.dp
+        isWideScreen -> 96.dp
+        else -> 82.dp
+    }
+    val friends = listOf(
+        Persona(
+            id = "hasan",
+            name = "حسن صديق",
+            role = "صديقك الذكي",
+            icon = Icons.Default.RecordVoiceOver,
+            color = AccentColors.VoiceFriend
+        ),
+        Persona(
+            id = "jana",
+            name = "ريتاج صديقة",
+            role = "صديقتك الذكية",
+            icon = Icons.Default.Face,
+            color = AccentColors.VoiceFriend
+        )
     )
 
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(20.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "رجوع للأقسام")
+            }
+            HubSectionHeading(
+                title = "اختار صديقك",
+                description = "اختار الصديق اللي تحب تتكلم معاه.",
+                modifier = Modifier.weight(1f)
+            )
+        }
+        friends.forEach { friend ->
+            HubCard(
+                onClick = { onSelectFriend(friend.id) },
+                modifier = Modifier.fillMaxWidth().heightIn(min = if (isShortScreen) 120.dp else 152.dp),
+                accentColor = friend.color
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(if (isWideScreen) 28.dp else 22.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(20.dp)
+                ) {
+                    Box(
+                        modifier = Modifier.size(friendIconSize).clip(CircleShape)
+                            .background(friend.color.copy(alpha = 0.15f), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = friend.icon,
+                            contentDescription = null,
+                            tint = friend.color,
+                            modifier = Modifier.size(if (isWideScreen) 60.dp else 52.dp)
+                        )
+                    }
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            friend.name,
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = friend.color
+                        )
+                        Text(friend.role, style = MaterialTheme.typography.bodyLarge)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun NotificationsSettingsScreen(viewModel: AppViewModel) {
+    val context = LocalContext.current
+    val reminderEnabled by viewModel.quranReminderEnabled.collectAsState()
+    val reminderHour by viewModel.quranReminderHour.collectAsState()
+    val reminderMinute by viewModel.quranReminderMinute.collectAsState()
+    var chatEnabled by remember {
+        mutableStateOf(NotificationScheduler.isEnabled(context, NotificationScheduler.KEY_CHAT_ENABLED, true))
+    }
+    var studyEnabled by remember {
+        mutableStateOf(NotificationScheduler.isEnabled(context, NotificationScheduler.KEY_STUDY_ENABLED, false))
+    }
+    var quizEnabled by remember {
+        mutableStateOf(NotificationScheduler.isEnabled(context, NotificationScheduler.KEY_QUIZ_ENABLED, true))
+    }
+    var updatesEnabled by remember {
+        mutableStateOf(NotificationScheduler.isEnabled(context, NotificationScheduler.KEY_UPDATES_ENABLED, false))
+    }
+    val (initialStudyHour, initialStudyMinute) = remember { NotificationScheduler.studyReminderTime(context) }
+    var studyHour by remember { mutableIntStateOf(initialStudyHour) }
+    var studyMinute by remember { mutableIntStateOf(initialStudyMinute) }
+    var examTitle by remember { mutableStateOf("") }
+    val exams = remember {
+        androidx.compose.runtime.mutableStateListOf<ExamReminder>().apply {
+            addAll(NotificationScheduler.readExams(context))
+        }
+    }
+    val reminderPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) viewModel.setQuranReminder(reminderHour, reminderMinute, true)
+        else Toast.makeText(context, "اسمح بالإشعارات لتفعيل تذكير القرآن.", Toast.LENGTH_SHORT).show()
+    }
+
+    Column(
+        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Text(
-            text = "خصائص التطبيق",
+            "إعدادات الإشعارات",
             style = MaterialTheme.typography.headlineSmall,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.primary
         )
-        Text(
-            text = "اختر الخاصية التي تريد استخدامها",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-
-        destinations.chunked(2).forEach { rowDestinations ->
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+        NotificationSettingRow(
+            "إشعارات الشات",
+            "إشعار عند اكتمال رد Smart Cat في الخلفية.",
+            chatEnabled
+        ) {
+            chatEnabled = it
+            viewModel.setNotificationEnabled(NotificationScheduler.KEY_CHAT_ENABLED, it)
+        }
+        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+            Column(
+                Modifier.fillMaxWidth().padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                rowDestinations.forEach { destination ->
-                    Card(
-                        onClick = { onNavigate(destination) },
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(148.dp),
-                        shape = RoundedCornerShape(20.dp),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceVariant
-                        )
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .padding(16.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.Center
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(56.dp)
-                                    .background(
-                                        MaterialTheme.colorScheme.primaryContainer,
-                                        CircleShape
-                                    ),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(
-                                    imageVector = destination.icon,
-                                    contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.size(28.dp)
-                                )
-                            }
-                            Spacer(Modifier.height(12.dp))
-                            Text(
-                                text = destination.titleAr,
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.SemiBold,
-                                textAlign = TextAlign.Center,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                        }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("تذكيرات القرآن", fontWeight = FontWeight.Bold)
+                        Text("يومياً في %02d:%02d".format(Locale.getDefault(), reminderHour, reminderMinute))
                     }
+                    Switch(
+                        checked = reminderEnabled,
+                        onCheckedChange = { enabled ->
+                            if (
+                                enabled &&
+                                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                            ) {
+                                reminderPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            } else {
+                                viewModel.setQuranReminder(reminderHour, reminderMinute, enabled)
+                            }
+                        }
+                    )
                 }
-                if (rowDestinations.size == 1) {
-                    Spacer(Modifier.weight(1f))
+                OutlinedButton(
+                    onClick = {
+                        TimePickerDialog(
+                            context,
+                            { _, hour, minute -> viewModel.setQuranReminderTime(hour, minute) },
+                            reminderHour,
+                            reminderMinute,
+                            true
+                        ).show()
+                    },
+                    modifier = Modifier.fillMaxWidth().smartCatActionHeight()
+                ) { Text("تغيير موعد القرآن") }
+                TextButton(onClick = viewModel::scheduleQuranReminderTest) {
+                    Text("اختبار تذكير القرآن بعد دقيقتين")
                 }
             }
+        }
+        NotificationSettingRow(
+            "تذكيرات الدراسة",
+            "تنبيه قبل الاختبار بيوم وصباح يوم الاختبار.",
+            studyEnabled
+        ) {
+            studyEnabled = it
+            viewModel.setNotificationEnabled(NotificationScheduler.KEY_STUDY_ENABLED, it)
+        }
+        OutlinedButton(
+            enabled = studyEnabled,
+            onClick = {
+                TimePickerDialog(
+                    context,
+                    { _, hour, minute ->
+                        studyHour = hour
+                        studyMinute = minute
+                        viewModel.setStudyReminderTime(hour, minute)
+                    },
+                    studyHour,
+                    studyMinute,
+                    true
+                ).show()
+            },
+            modifier = Modifier.fillMaxWidth().smartCatActionHeight()
+        ) {
+            Text("وقت تذكير الاختبار: %02d:%02d".format(Locale.getDefault(), studyHour, studyMinute))
+        }
+        OutlinedTextField(
+            value = examTitle,
+            onValueChange = { examTitle = it.take(80) },
+            label = { Text("اسم الاختبار") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+        )
+        Button(
+            onClick = {
+                val now = Calendar.getInstance()
+                DatePickerDialog(
+                    context,
+                    { _, year, month, day ->
+                        val examCalendar = Calendar.getInstance().apply {
+                            set(year, month, day, 8, 0, 0)
+                            set(Calendar.MILLISECOND, 0)
+                        }
+                        TimePickerDialog(
+                            context,
+                            { _, hour, minute ->
+                                examCalendar.set(Calendar.HOUR_OF_DAY, hour)
+                                examCalendar.set(Calendar.MINUTE, minute)
+                                val exam = ExamReminder(
+                                    id = java.util.UUID.randomUUID().toString(),
+                                    title = examTitle.trim(),
+                                    examAt = examCalendar.timeInMillis
+                                )
+                                NotificationScheduler.saveExam(context, exam)
+                                exams.add(exam)
+                                examTitle = ""
+                            },
+                            8,
+                            0,
+                            true
+                        ).show()
+                    },
+                    now.get(Calendar.YEAR),
+                    now.get(Calendar.MONTH),
+                    now.get(Calendar.DAY_OF_MONTH)
+                ).apply { datePicker.minDate = System.currentTimeMillis() }.show()
+            },
+            enabled = studyEnabled && examTitle.isNotBlank(),
+            modifier = Modifier.fillMaxWidth().smartCatActionHeight()
+        ) { Text("إضافة موعد اختبار") }
+        exams.forEach { exam ->
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(exam.title, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault()).format(Date(exam.examAt)),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    IconButton(onClick = {
+                        NotificationScheduler.removeExam(context, exam.id)
+                        exams.remove(exam)
+                    }) {
+                        Icon(Icons.Default.Delete, contentDescription = "حذف الاختبار")
+                    }
+                }
+            }
+        }
+        NotificationSettingRow(
+            "نتيجة الاختبار جاهزة",
+            "إشعار عند اكتمال التحليل المتقدم.",
+            quizEnabled
+        ) {
+            quizEnabled = it
+            viewModel.setNotificationEnabled(NotificationScheduler.KEY_QUIZ_ENABLED, it)
+        }
+        NotificationSettingRow(
+            "تحديثات التطبيق",
+            "إشعار اختياري عند توفر تحديث جديد.",
+            updatesEnabled
+        ) {
+            updatesEnabled = it
+            viewModel.setNotificationEnabled(NotificationScheduler.KEY_UPDATES_ENABLED, it)
+        }
+    }
+}
+
+@Composable
+private fun NotificationSettingRow(
+    title: String,
+    description: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+        Row(
+            Modifier.fillMaxWidth().padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(title, fontWeight = FontWeight.Bold)
+                Text(description, style = MaterialTheme.typography.bodySmall)
+            }
+            Switch(checked = checked, onCheckedChange = onCheckedChange)
         }
     }
 }
@@ -304,6 +953,8 @@ private fun LearningProfileScreen(viewModel: AppViewModel) {
     val conversations by viewModel.learningConversations.collectAsState()
     val profile by viewModel.learningUserProfile.collectAsState()
     val quizResults by viewModel.learningQuizResults.collectAsState()
+    val cloudMemory by viewModel.conversationMemory.collectAsState()
+    val cloudMemoryError by viewModel.conversationMemoryError.collectAsState()
     val chartLineColor = MaterialTheme.colorScheme.primary
     val chartAxisColor = MaterialTheme.colorScheme.outlineVariant
     val weakTopics = topics.filter { it.isWeakness }
@@ -348,10 +999,19 @@ private fun LearningProfileScreen(viewModel: AppViewModel) {
         )
         Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
             Text(
-                "تُحفظ المحادثات والملخصات ونقاط الضعف على هذا الجهاز. تُرسل رسائل المحادثة الحالية " +
-                    "والمرفقات إلى خدمة الذكاء الاصطناعي للإجابة، بينما تبقى الملخصات ونقاط الضعف محلية. " +
+                "تُحفظ عناوين المحادثات ورسائلها في Firestore مرتبطة بحساب Google، وتُزامن بين أجهزتك. " +
+                    "تُمسح نسخة المحادثات المحلية عند تسجيل الخروج أو تبديل الحساب. تُرسل رسائل المحادثة " +
+                    "ومرفقات الصور إلى خدمة الذكاء الاصطناعي للإجابة؛ صورة التحليل نفسها لا تُزامن إلى أجهزتك الأخرى. " +
+                    "تُحفظ ملخصات المحادثات ونقاط التعلّم في Firestore لحسابك وتُستخدم لتخصيص الإجابات. " +
                     "التقييمات التي ترسلها تُحفظ على الخادم لتحسين الجودة.",
                 modifier = Modifier.padding(14.dp),
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+        if (cloudMemoryError != null) {
+            Text(
+                cloudMemoryError.orEmpty(),
+                color = MaterialTheme.colorScheme.error,
                 style = MaterialTheme.typography.bodySmall
             )
         }
@@ -374,6 +1034,17 @@ private fun LearningProfileScreen(viewModel: AppViewModel) {
                 Text(
                     questionCount.toString(),
                     style = MaterialTheme.typography.headlineLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+        }
+        Card {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("المحادثات المتذكّرة", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    cloudMemory.summaryCount.toString(),
+                    style = MaterialTheme.typography.headlineMedium,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary
                 )
@@ -454,12 +1125,12 @@ private fun LearningProfileScreen(viewModel: AppViewModel) {
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Text("نقاط الضعف المتكررة", style = MaterialTheme.typography.titleMedium)
-                if (weakTopics.isEmpty()) {
+                val allWeakTopics = (weakTopics.map { "${it.subject}: ${it.topic}" } +
+                    cloudMemory.weakPoints).distinct()
+                if (allWeakTopics.isEmpty()) {
                     Text("لا توجد نقاط ضعف متكررة بعد.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
-                    weakTopics.forEach { topic ->
-                        Text("• ${topic.subject}: ${topic.topic} (${topic.interactions} أسئلة)")
-                    }
+                    allWeakTopics.forEach { topic -> Text("• $topic") }
                 }
             }
         }
@@ -476,7 +1147,18 @@ private fun LearningProfileScreen(viewModel: AppViewModel) {
                 }
             }
         }
-        val recentSummaries = conversations.filter { !it.summary.isNullOrBlank() }.take(3)
+        if (cloudMemory.longTermSummary.isNotBlank()) {
+            Card {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text("ملخص تعلّمك طويل المدى", style = MaterialTheme.typography.titleMedium)
+                    Text(cloudMemory.longTermSummary, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
+        val recentSummaries = cloudMemory.recentSummaries
         if (recentSummaries.isNotEmpty()) {
             Card {
                 Column(
@@ -484,45 +1166,60 @@ private fun LearningProfileScreen(viewModel: AppViewModel) {
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Text("ملخصات المحادثات الأخيرة", style = MaterialTheme.typography.titleMedium)
-                    recentSummaries.forEach { conversation ->
+                    recentSummaries.forEach { summary ->
+                        Text(summary.subject, fontWeight = FontWeight.SemiBold)
+                        Text(summary.summary, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+        }
+        val recentLocalSummaries = conversations.filter { !it.summary.isNullOrBlank() }.take(3)
+        if (recentLocalSummaries.isNotEmpty()) {
+            Card {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text("ملخصات التعلّم على هذا الجهاز", style = MaterialTheme.typography.titleMedium)
+                    recentLocalSummaries.forEach { conversation ->
                         Text(conversation.title, fontWeight = FontWeight.SemiBold)
                         Text(conversation.summary.orEmpty(), style = MaterialTheme.typography.bodySmall)
                     }
                 }
-                Card {
-                    Column(
-                        modifier = Modifier.fillMaxWidth().padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Text("اختباراتي", style = MaterialTheme.typography.titleMedium)
-                        if (quizResults.isEmpty()) {
-                            Text(
-                                "نتائج الاختبارات التي تكملها ستظهر هنا.",
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        } else {
-                            quizResults.take(20).forEach { result ->
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Column(Modifier.weight(1f)) {
-                                        Text(result.title, fontWeight = FontWeight.SemiBold)
-                                        Text(
-                                            SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault())
-                                                .format(Date(result.completedAt)),
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                    Text(
-                                        "${result.score}/${result.totalQuestions}",
-                                        color = MaterialTheme.colorScheme.primary,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
+            }
+        }
+        Card {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("اختباراتي", style = MaterialTheme.typography.titleMedium)
+                if (quizResults.isEmpty()) {
+                    Text(
+                        "نتائج الاختبارات التي تكملها ستظهر هنا.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    quizResults.take(20).forEach { result ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(result.title, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault())
+                                        .format(Date(result.completedAt)),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             }
+                            Text(
+                                "${result.score}/${result.totalQuestions}",
+                                color = MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
                     }
                 }
@@ -538,13 +1235,17 @@ private fun LearningProfileScreen(viewModel: AppViewModel) {
 fun ChatScreen(
     viewModel: AppViewModel,
     onOpenSettings: () -> Unit = {},
-    onCreateStudySet: (String, StudySetMode) -> Unit = { _, _ -> }
+    onCreateStudySet: (String, StudySetMode) -> Unit = { _, _ -> },
+    onOpenSubscription: () -> Unit = {}
 ) {
     val messages by viewModel.currentMessages.collectAsState()
     val currentSessionId by viewModel.currentSessionId.collectAsState()
     val sessions by viewModel.chatSessions.collectAsState()
     val isGenerating by viewModel.isGeneratingChat.collectAsState()
+    val thinkingState by viewModel.thinkingState.collectAsState()
     val chatActionError by viewModel.chatActionError.collectAsState()
+    val usageState by viewModel.usageState.collectAsState()
+    val conversationSyncStatus by viewModel.conversationSyncStatus.collectAsState()
     val socraticModeEnabled by viewModel.socraticModeEnabled.collectAsState()
     val socraticProgress by viewModel.socraticProgress.collectAsState()
     val thinkingModeEnabled by viewModel.useThinkingMode.collectAsState()
@@ -555,11 +1256,30 @@ fun ChatScreen(
     val isSpeaking by viewModel.isSpeaking.collectAsState()
     val activeSpeechId by viewModel.activeSpeechId.collectAsState()
     val speechInputText by viewModel.speechInputText.collectAsState()
+    val webSearchEnabled by viewModel.webSearchEnabled.collectAsState()
+    val groqThinkingEnabled by viewModel.groqThinkingEnabled.collectAsState()
+    val imageGenerationEnabled by viewModel.imageGenerationEnabled.collectAsState()
+    val imageGenerationAvailable by viewModel.imageGenerationAvailable.collectAsState()
+    val chatRemaining = usageState.snapshot?.let { snapshot ->
+        if (snapshot.legacy) Int.MAX_VALUE
+        else snapshot.subscription?.remaining ?: snapshot.feature("chat")?.remaining
+    }
+    val chatExhausted = usageBanner(usageState, "chat")?.exhausted == true
+    val canGenerateImages = imageGenerationAvailable &&
+        (usageState.snapshot?.let { it.legacy || it.subscription?.features?.get("images") == true } == true) &&
+        (chatRemaining ?: 0) >= 20
 
     var inputText by rememberSaveable { mutableStateOf("") }
     var pendingVisionImagePath by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingCameraUri by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingCameraFilePath by rememberSaveable { mutableStateOf<String?>(null) }
+    val chatRequiredQuota = requiredMessageQuota(
+        webSearch = webSearchEnabled,
+        thinking = groqThinkingEnabled,
+        vision = pendingVisionImagePath != null,
+        imageGeneration = imageGenerationEnabled
+    )
+    val chatHasSufficientQuota = chatRemaining == null || chatRemaining >= chatRequiredQuota
     var showComposerSheet by remember { mutableStateOf(false) }
     var showComposerPlugins by remember { mutableStateOf(false) }
     var showChatHistory by remember { mutableStateOf(false) }
@@ -567,7 +1287,6 @@ fun ChatScreen(
 
     val listState = rememberLazyListState()
     val context = LocalContext.current
-    val contentResolver = context.contentResolver
     val chatScope = rememberCoroutineScope()
     val composerSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     DisposableEffect(Unit) {
@@ -577,11 +1296,16 @@ fun ChatScreen(
         }
     }
     fun prepareVisionImage(uri: Uri) {
+        if (chatRemaining != null && chatRemaining < 3) {
+            Toast.makeText(context, "الرصيد لا يكفي لتحليل الصورة؛ تحتاج إلى 3 رسائل على الأقل.", Toast.LENGTH_SHORT).show()
+            return
+        }
         chatScope.launch {
             try {
                 val imageFile = withContext(Dispatchers.IO) {
                     compressChatImage(context, uri)
                 }
+                pendingVisionImagePath?.let { deleteChatVisionImage(context, it) }
                 pendingVisionImagePath = imageFile.absolutePath
                 viewModel.clearChatActionError()
             } catch (e: Exception) {
@@ -601,7 +1325,7 @@ fun ChatScreen(
         }
     }
     val visionGalleryLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
         if (uri != null) prepareVisionImage(uri)
     }
@@ -624,20 +1348,50 @@ fun ChatScreen(
         else Toast.makeText(context, "يلزم السماح بالميكروفون للإدخال الصوتي.", Toast.LENGTH_SHORT).show()
     }
 
-    val pdfLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+    val documentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
-        if (uri != null) {
+        if (uri != null) chatScope.launch {
             try {
-                val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                    ?: error("Unable to read selected PDF")
-                check(bytes.isNotEmpty()) { "The selected PDF is empty." }
-                viewModel.sendChatAttachment(
-                    Base64.encodeToString(bytes, Base64.NO_WRAP),
-                    "application/pdf"
-                )
+                val mimeType = context.contentResolver.getType(uri).orEmpty()
+                if (mimeType == "application/pdf") {
+                    val encodedPdf = encodePdfAttachment(context, uri)
+                    viewModel.sendChatAttachment(encodedPdf, mimeType)
+                } else if (
+                    mimeType == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+                    mimeType == "application/msword"
+                ) {
+                    val fileName = context.contentResolver.query(
+                        uri,
+                        arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                        null,
+                        null,
+                        null
+                    )?.use { cursor ->
+                        if (cursor.moveToFirst()) {
+                            cursor.getString(0)?.takeIf(String::isNotBlank)
+                        } else null
+                    } ?: "document.docx"
+                    val documentText = GeminiApiClient.extractProductivityDocument(
+                        context,
+                        uri,
+                        fileName
+                    )
+                    viewModel.sendChatMessage(
+                        "حلل محتوى ملف $fileName وأجب عن أي سؤال متعلق به:\n\n${documentText.take(7_000)}"
+                    )
+                } else {
+                    Toast.makeText(context, "اختر ملف PDF أو Word بصيغة DOCX أو DOC.", Toast.LENGTH_LONG).show()
+                }
+            } catch (error: CancellationException) {
+                throw error
             } catch (e: Exception) {
-                android.util.Log.e("ChatScreen", "Failed to attach PDF", e)
+                android.util.Log.e("ChatScreen", "Failed to attach document", e)
+                Toast.makeText(
+                    context,
+                    e.localizedMessage ?: "تعذر إرفاق الملف.",
+                    Toast.LENGTH_LONG
+                ).show()
             }
         }
     }
@@ -673,6 +1427,7 @@ fun ChatScreen(
 
     LaunchedEffect(Unit) {
         viewModel.ensureActiveChatSession()
+        viewModel.refreshImageGenerationAvailability()
     }
 
     // Sync speech input text to user text field
@@ -689,46 +1444,186 @@ fun ChatScreen(
         }
     }
 
+    val haptics = LocalHapticFeedback.current
+    var wasGenerating by remember { mutableStateOf(isGenerating) }
+    LaunchedEffect(isGenerating) {
+        if (wasGenerating && !isGenerating && messages.lastOrNull()?.role == "model") {
+            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        }
+        wasGenerating = isGenerating
+    }
+
     val sendCurrentMessage = {
-        val message = inputText.trim()
-        val imagePath = pendingVisionImagePath
-        if (imagePath != null) {
-            viewModel.sendVisionQuestion(imagePath, message)
-            pendingVisionImagePath = null
-            inputText = ""
-            viewModel.clearChatActionError()
-        } else if (message.isNotEmpty()) {
-            viewModel.sendChatMessage(message)
-            inputText = ""
-            viewModel.clearSpeechInput()
+        if (chatExhausted) {
+            Toast.makeText(context, "استهلكت كل رسائلك. جدّد اشتراكك أو ارتقِ لخطة أعلى.", Toast.LENGTH_SHORT).show()
+        } else if (!chatHasSufficientQuota) {
+            Toast.makeText(context, "الرصيد لا يكفي لهذه العملية. اختر ميزة أقل تكلفة أو رقِّ اشتراكك.", Toast.LENGTH_SHORT).show()
+        } else {
+            val message = inputText.trim()
+            val imagePath = pendingVisionImagePath
+            if (imagePath != null || message.isNotEmpty()) playSendSound()
+            if (imagePath != null) {
+                viewModel.sendVisionQuestion(imagePath, message)
+                pendingVisionImagePath = null
+                inputText = ""
+                viewModel.clearChatActionError()
+            } else if (message.isNotEmpty()) {
+                viewModel.sendChatMessage(message)
+                inputText = ""
+                viewModel.clearSpeechInput()
+            }
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        // Keep the ad as the first content below the settings bar.
-        if (!WindowInsets.isImeVisible) {
-            BannerAdView(modifier = Modifier.fillMaxWidth())
-        }
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val parentDirection = LocalLayoutDirection.current
+    val chatSessionsOnly = remember(sessions) { sessions.filter { it.personaId == null } }
+    val currentSession = chatSessionsOnly.firstOrNull { it.id == currentSessionId }
+    var showTitleMenu by remember { mutableStateOf(false) }
+    var showRenameDialog by remember { mutableStateOf(false) }
+    var showDeleteDialog by remember { mutableStateOf(false) }
+    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+        ModalNavigationDrawer(
+            drawerState = drawerState,
+            drawerContent = {
+                ModalDrawerSheet {
+                    CompositionLocalProvider(LocalLayoutDirection provides parentDirection) {
+                        ChatSidebar(
+                            sessions = chatSessionsOnly,
+                            currentSessionId = currentSessionId,
+                            onNewChat = {
+                                viewModel.startNewSession("محادثة جديدة")
+                                chatScope.launch { drawerState.close() }
+                            },
+                            onSelect = {
+                                viewModel.selectSession(it)
+                                chatScope.launch { drawerState.close() }
+                            },
+                            onRename = viewModel::renameSession,
+                            onDelete = viewModel::deleteSession,
+                            onOpenSettings = {
+                                chatScope.launch { drawerState.close() }
+                                onOpenSettings()
+                            },
+                            syncIssue = conversationSyncStatus.error
+                        )
+                    }
+                }
+            }
         ) {
-            Text("Smart Cat", modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
-            IconButton(onClick = { viewModel.startNewSession("محادثة جديدة ${sessions.size + 1}") }) {
-                Icon(Icons.Default.Add, contentDescription = "محادثة جديدة")
-            }
-            IconButton(onClick = onOpenSettings) {
-                Icon(
-                    imageVector = Icons.Default.Settings,
-                    contentDescription = "Settings",
-                    tint = MaterialTheme.colorScheme.primary
+        CompositionLocalProvider(LocalLayoutDirection provides parentDirection) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = { chatScope.launch { drawerState.open() } }) {
+                    Icon(Icons.Default.Menu, contentDescription = "قائمة المحادثات")
+                }
+                CompositionLocalProvider(LocalLayoutDirection provides parentDirection) {
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            "Smart Cat",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+                UsageIndicatorCompact(
+                    state = usageState,
+                    onRefresh = viewModel::refreshUsage,
+                    onUpgrade = onOpenSubscription,
+                    modifier = Modifier.padding(horizontal = 2.dp)
                 )
-            }
-            IconButton(onClick = { showChatHistory = true }) {
-                Icon(Icons.Default.History, contentDescription = "المحادثات السابقة")
+                Box {
+                    IconButton(
+                        onClick = { showTitleMenu = true },
+                        enabled = currentSession != null
+                    ) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "خيارات المحادثة")
+                    }
+                    DropdownMenu(expanded = showTitleMenu, onDismissRequest = { showTitleMenu = false }) {
+                        CompositionLocalProvider(LocalLayoutDirection provides parentDirection) {
+                            DropdownMenuItem(
+                                text = { Text("تغيير الاسم") },
+                                leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null) },
+                                onClick = { showTitleMenu = false; showRenameDialog = true }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("مشاركة") },
+                                leadingIcon = { Icon(Icons.Default.Share, contentDescription = null) },
+                                onClick = {
+                                    showTitleMenu = false
+                                    val transcript = messages.joinToString("\n\n") { m ->
+                                        val who = if (m.role == "user") "أنا" else "Smart Cat"
+                                        val body = parseChatVisionMessage(m.content)?.question ?: m.content
+                                        "$who: $body"
+                                    }
+                                    val send = Intent(Intent.ACTION_SEND).apply {
+                                        type = "text/plain"
+                                        putExtra(Intent.EXTRA_TEXT, transcript)
+                                    }
+                                    context.startActivity(Intent.createChooser(send, "مشاركة المحادثة"))
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("حذف", color = MaterialTheme.colorScheme.error) },
+                                leadingIcon = {
+                                    Icon(Icons.Default.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.error)
+                                },
+                                onClick = { showTitleMenu = false; showDeleteDialog = true }
+                            )
+                        }
+                    }
+                }
             }
         }
-
+        if (usageBanner(usageState, "chat")?.level?.let { it != UsageLevel.NORMAL } == true) {
+            UsageBannerCard(
+                state = usageState,
+                onRefresh = viewModel::refreshUsage,
+                feature = "chat",
+                onUpgrade = onOpenSubscription,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)
+            )
+        }
+        if (showRenameDialog && currentSession != null) {
+            var newTitle by remember { mutableStateOf(currentSession.title) }
+            AlertDialog(
+                onDismissRequest = { showRenameDialog = false },
+                title = { Text("تغيير اسم المحادثة") },
+                text = {
+                    OutlinedTextField(value = newTitle, onValueChange = { newTitle = it }, singleLine = true)
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        viewModel.renameSession(currentSession.id, newTitle)
+                        showRenameDialog = false
+                    }) { Text("حفظ") }
+                },
+                dismissButton = { TextButton(onClick = { showRenameDialog = false }) { Text("إلغاء") } }
+            )
+        }
+        if (showDeleteDialog && currentSession != null) {
+            AlertDialog(
+                onDismissRequest = { showDeleteDialog = false },
+                title = { Text("حذف المحادثة؟") },
+                text = { Text("سيتم حذف هذه المحادثة نهائياً.") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        viewModel.deleteSession(currentSession.id)
+                        showDeleteDialog = false
+                    }) { Text("حذف", color = MaterialTheme.colorScheme.error) }
+                },
+                dismissButton = { TextButton(onClick = { showDeleteDialog = false }) { Text("إلغاء") } }
+            )
+        }
         // Messages List
         Box(modifier = Modifier.weight(1f)) {
             if (currentSessionId == null) {
@@ -754,7 +1649,7 @@ fun ChatScreen(
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        "اسأل أي سؤال، ابحث عن أفكار، أو تعلّم مهارات جديدة مع حفظ محادثاتك على الجهاز.",
+                        "اكتب ما تحتاجه: إجابة، كتابة، ترجمة، تلخيص، تخطيط، أفكار، برمجة، أو مساعدة دراسية عند طلبك.",
                         fontSize = 12.sp,
                         textAlign = TextAlign.Center,
                         color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
@@ -766,7 +1661,7 @@ fun ChatScreen(
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(horizontal = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
                     contentPadding = PaddingValues(vertical = 12.dp)
                 ) {
                     itemsIndexed(messages) { index, msg ->
@@ -781,6 +1676,9 @@ fun ChatScreen(
                         ChatBubble(
                             message = msg,
                             onSpeakClick = { viewModel.speakText(msg.content, msg.id) },
+                            onSpeakImageClick = {
+                                msg.generatedImageUrl?.let(viewModel::speakGeneratedImage)
+                            },
                             isSpeaking = isSpeaking,
                             isActiveSpeech = activeSpeechId == msg.id,
                             feedbackQuestion = precedingUserMessage?.let { userMessage ->
@@ -793,6 +1691,12 @@ fun ChatScreen(
                                 "سؤال الطالب:\n$question\n\nإجابة Smart Cat:\n${msg.content}"
                             },
                             onCreateStudySet = onCreateStudySet,
+                            onRegenerate = if (
+                                index == messages.lastIndex && msg.role == "model" &&
+                                precedingUserMessage != null && !canRetryVision && !isGenerating
+                            ) {
+                                { viewModel.sendChatMessage(precedingUserMessage.content) }
+                            } else null,
                             onRetryVision = if (canRetryVision) {
                                 { precedingUserMessage?.let { userMessage ->
                                     viewModel.retryVisionQuestion(userMessage.id)
@@ -812,7 +1716,7 @@ fun ChatScreen(
 
                     if (isGenerating) {
                         item {
-                            TypingIndicator()
+                            TypingIndicator(thinkingState)
                         }
                     }
                 }
@@ -894,135 +1798,201 @@ fun ChatScreen(
                 imageBitmap?.let {
                     Image(
                         bitmap = it,
-                        contentDescription = "الصورة المرفقة للمسألة",
+                        contentDescription = "الصورة المرفقة",
                         modifier = Modifier.size(64.dp).clip(RoundedCornerShape(8.dp)),
                         contentScale = ContentScale.Crop
                     )
                 }
                 Text(
-                    "أضف سؤالك أو اضغط إرسال لحل المسألة بالصورة",
+                    "اكتب ما تريد معرفته عن الصورة أو اضغط إرسال لتحليلها",
                     modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
                     style = MaterialTheme.typography.bodySmall
                 )
-                IconButton(onClick = { pendingVisionImagePath = null }) {
+                IconButton(onClick = {
+                    pendingVisionImagePath?.let { deleteChatVisionImage(context, it) }
+                    pendingVisionImagePath = null
+                }) {
                     Icon(Icons.Default.Close, contentDescription = "إزالة الصورة")
                 }
             }
         }
 
-        // Chat Input row
-        Row(
+        // Keep the message field above the compact action row, like the reference composer.
+        val hasInput = inputText.isNotBlank() || pendingVisionImagePath != null
+        val parentDirection = LocalLayoutDirection.current
+        CompositionLocalProvider(
+            LocalLayoutDirection provides LayoutDirection.Ltr,
+            LocalMinimumInteractiveComponentSize provides 0.dp
+        ) {
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(MaterialTheme.colorScheme.surface)
-                    .padding(8.dp),
-                verticalAlignment = Alignment.CenterVertically
+                    .padding(horizontal = 10.dp)
+                    .padding(bottom = 8.dp)
+                    .shadow(2.dp, RoundedCornerShape(28.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f), RoundedCornerShape(28.dp))
+                    .padding(horizontal = 8.dp, vertical = 6.dp)
+                    .heightIn(min = 92.dp, max = 190.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                // Microphone/Voice Chat button
-                IconButton(
-                    onClick = {
-                        if (isListeningToSpeech) {
-                            viewModel.stopSpeechRecognition()
-                        } else {
-                            showVoiceSetupDialog = true
-                        }
-                    },
-                    enabled = !isProcessingSpeech,
-                    modifier = Modifier
-                        .padding(end = 4.dp)
-                        .background(
-                            if (isListeningToSpeech) Color.Red.copy(alpha = 0.2f) else MaterialTheme.colorScheme.primaryContainer,
-                            CircleShape
-                        )
-                        .size(48.dp)
-                ) {
-                    if (isProcessingSpeech) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(22.dp),
-                            strokeWidth = 2.dp
-                        )
-                    } else {
-                        Icon(
-                            imageVector = if (isListeningToSpeech) Icons.Default.MicNone else Icons.Default.Mic,
-                            contentDescription = if (isListeningToSpeech) {
-                                "إيقاف التسجيل الصوتي"
-                            } else {
-                                "الإدخال الصوتي"
-                            },
-                            tint = if (isListeningToSpeech) Color.Red
-                            else MaterialTheme.colorScheme.onPrimaryContainer,
-                            modifier = Modifier.size(24.dp)
-                        )
-                    }
-                }
-                if (isListeningToSpeech) {
-                    SpeechWaveform(
-                        amplitude = speechAmplitude,
-                        modifier = Modifier.padding(end = 4.dp)
-                    )
-                }
-
-                IconButton(
-                    onClick = {
-                        showComposerPlugins = false
-                        showComposerSheet = true
-                    },
-                    modifier = Modifier
-                        .padding(end = 8.dp)
-                        .background(
-                            MaterialTheme.colorScheme.primaryContainer,
-                            CircleShape
-                        )
-                        .size(48.dp),
-                    enabled = !isGenerating
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Add,
-                        contentDescription = "فتح أدوات المحادثة",
-                        tint = MaterialTheme.colorScheme.onPrimaryContainer
-                    )
-                }
-
-                OutlinedTextField(
-                    value = inputText,
-                    onValueChange = { inputText = it },
-                    placeholder = { 
-                        Text(
-                            if (isListeningToSpeech) "جاري الاستماع لصوتك..." else "اكتب رسالتك لـ Smart Cat..."
-                        ) 
-                    },
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("chat_input"),
-                    shape = RoundedCornerShape(24.dp),
-                        textStyle = MaterialTheme.typography.bodyLarge.copy(
-                            color = MaterialTheme.colorScheme.onSurface
-                        ),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = MaterialTheme.colorScheme.onSurface,
-                            unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+                CompositionLocalProvider(LocalLayoutDirection provides parentDirection) {
+                    TextField(
+                        value = inputText,
+                        onValueChange = { inputText = it },
+                        placeholder = {
+                            Text(
+                                if (isListeningToSpeech) "جاري الاستماع لصوتك..." else "اكتب رسالة",
+                                style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 1
+                            )
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp, max = 120.dp)
+                            .testTag("chat_input"),
+                        textStyle = MaterialTheme.typography.bodyLarge.copy(fontSize = 14.sp),
+                        colors = TextFieldDefaults.colors(
+                            focusedContainerColor = Color.Transparent,
+                            unfocusedContainerColor = Color.Transparent,
+                            disabledContainerColor = Color.Transparent,
+                            focusedIndicatorColor = Color.Transparent,
+                            unfocusedIndicatorColor = Color.Transparent,
+                            disabledIndicatorColor = Color.Transparent,
                             cursorColor = MaterialTheme.colorScheme.primary
                         ),
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                         keyboardActions = KeyboardActions(onSend = { sendCurrentMessage() }),
-                        maxLines = 4,
-                        trailingIcon = {
-                            if (inputText.isNotEmpty() || pendingVisionImagePath != null) {
-                                IconButton(
-                                    onClick = sendCurrentMessage,
-                                    enabled = !isGenerating
-                                ) {
+                        maxLines = 4
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(modifier = Modifier.size(40.dp), contentAlignment = Alignment.Center) {
+                        if (hasInput) {
+                            IconButton(
+                                onClick = sendCurrentMessage,
+                                enabled = !isGenerating && chatHasSufficientQuota,
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .background(
+                                        if (!chatHasSufficientQuota) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.14f)
+                                        else MaterialTheme.colorScheme.primary,
+                                        CircleShape
+                                    )
+                            ) {
                                 Icon(
-                                    imageVector = Icons.AutoMirrored.Filled.Send,
-                                    contentDescription = "Send",
-                                    tint = MaterialTheme.colorScheme.primary
+                                    imageVector = Icons.Default.ArrowUpward,
+                                    contentDescription = "إرسال",
+                                    tint = if (!chatHasSufficientQuota) MaterialTheme.colorScheme.onSurfaceVariant
+                                    else MaterialTheme.colorScheme.onPrimary,
+                                    modifier = Modifier.size(20.dp)
                                 )
+                            }
+                        } else {
+                            IconButton(
+                                onClick = {
+                                    if (isListeningToSpeech) {
+                                        viewModel.stopSpeechRecognition()
+                                    } else {
+                                        showVoiceSetupDialog = true
+                                    }
+                                },
+                                enabled = !isProcessingSpeech,
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
+                            ) {
+                                if (isProcessingSpeech) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(20.dp),
+                                        strokeWidth = 2.dp
+                                    )
+                                } else {
+                                    Icon(
+                                        imageVector = if (isListeningToSpeech) Icons.Default.MicNone else Icons.Default.Mic,
+                                        contentDescription = if (isListeningToSpeech) {
+                                            "إيقاف التسجيل الصوتي"
+                                        } else {
+                                            "الإدخال الصوتي"
+                                        },
+                                        tint = if (isListeningToSpeech) Color.Red
+                                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
                             }
                         }
                     }
-                )
+                    Spacer(Modifier.width(4.dp))
+                    IconButton(
+                        onClick = {
+                            showComposerPlugins = false
+                            showComposerSheet = true
+                        },
+                        modifier = Modifier
+                            .size(40.dp)
+                            .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape),
+                        enabled = !isGenerating
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Add,
+                            contentDescription = "فتح أدوات المحادثة",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    if (isListeningToSpeech) {
+                        SpeechWaveform(
+                            amplitude = speechAmplitude,
+                            modifier = Modifier.padding(start = 6.dp)
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        ChatToolChip(
+                            label = "بحث",
+                            icon = Icons.Default.Language,
+                            selected = webSearchEnabled,
+                            enabled = !chatExhausted && (
+                                webSearchEnabled || (chatRemaining ?: 0) >= if (groqThinkingEnabled) 3 else 2
+                            ),
+                            onClick = { viewModel.setWebSearchEnabled(!webSearchEnabled) }
+                        )
+                        ChatToolChip(
+                            label = "تفكير",
+                            icon = Icons.Default.Psychology,
+                            selected = groqThinkingEnabled,
+                            enabled = !chatExhausted && (
+                                groqThinkingEnabled || (chatRemaining ?: 0) >= if (webSearchEnabled) 3 else 2
+                            ),
+                            onClick = { viewModel.setGroqThinkingEnabled(!groqThinkingEnabled) }
+                        )
+                        ChatToolChip(
+                            label = "ارسم",
+                            icon = Icons.Default.Brush,
+                            selected = imageGenerationAvailable && imageGenerationEnabled,
+                            available = canGenerateImages || imageGenerationEnabled,
+                            enabled = canGenerateImages || imageGenerationEnabled,
+                            onClick = {
+                                if (canGenerateImages || imageGenerationEnabled) {
+                                    viewModel.setImageGenerationEnabled(!imageGenerationEnabled)
+                                } else if ((chatRemaining ?: 0) < 20) {
+                                    Toast.makeText(context, "تحتاج إلى 20 رسالة متبقية لتوليد صورة.", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Toast.makeText(
+                                        context,
+                                        "🎨 نعمل على تحسين جودة الصور. هترجع أقوى من الأول!",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
+                            }
+                        )
+                    }
+                }
             }
-
+        }
         if (showComposerSheet) {
             ModalBottomSheet(
                 onDismissRequest = {
@@ -1120,7 +2090,7 @@ fun ChatScreen(
                         ChatComposerSheetAction(
                             icon = Icons.Default.CameraAlt,
                             title = "الكاميرا",
-                            subtitle = "صوّر مسألة أو صفحة",
+                            subtitle = "صوّر شيئاً تريد تحليله",
                             onClick = { closeComposerSheet(::openCameraCapture) }
                         )
                         ChatComposerSheetAction(
@@ -1128,16 +2098,34 @@ fun ChatScreen(
                             title = "الصور",
                             subtitle = "اختر صورة من المعرض",
                             onClick = {
-                                closeComposerSheet { visionGalleryLauncher.launch("image/*") }
+                                closeComposerSheet {                                 visionGalleryLauncher.launch(
+                                    androidx.activity.result.PickVisualMediaRequest(
+                                        ActivityResultContracts.PickVisualMedia.ImageOnly
+                                    )
+                                ) }
                             }
                         )
                         ChatComposerSheetAction(
                             icon = Icons.Default.AttachFile,
                             title = "الملفات",
-                            subtitle = "إرفاق ملف PDF",
+                            subtitle = "إرفاق ملف PDF أو Word",
                             onClick = {
-                                closeComposerSheet { pdfLauncher.launch("application/pdf") }
+                                closeComposerSheet {
+                                    documentLauncher.launch(
+                                        arrayOf(
+                                            "application/pdf",
+                                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                            "application/msword"
+                                        )
+                                    )
+                                }
                             }
+                        )
+                        ChatComposerSheetAction(
+                            icon = Icons.Default.Close,
+                            title = "إلغاء",
+                            subtitle = "إغلاق قائمة المرفقات",
+                            onClick = { closeComposerSheet {} }
                         )
                         ChatComposerSheetAction(
                             icon = Icons.Default.Extension,
@@ -1166,44 +2154,6 @@ fun ChatScreen(
             }
         }
 
-        if (showChatHistory) {
-            AlertDialog(
-                onDismissRequest = { showChatHistory = false },
-                title = { Text("المحادثات السابقة") },
-                text = {
-                    if (sessions.isEmpty()) {
-                        Text("لا توجد محادثات محفوظة حتى الآن.")
-                    } else {
-                        LazyColumn(modifier = Modifier.heightIn(max = 420.dp)) {
-                            items(sessions, key = { it.id }) { session ->
-                                TextButton(
-                                    onClick = {
-                                        viewModel.selectSession(session.id)
-                                        showChatHistory = false
-                                    },
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Text(
-                                        session.title,
-                                        modifier = Modifier.weight(1f),
-                                        textAlign = TextAlign.Start,
-                                        maxLines = 2
-                                    )
-                                    Text(
-                                        SimpleDateFormat("dd/MM", Locale.getDefault())
-                                            .format(Date(session.timestamp)),
-                                        style = MaterialTheme.typography.labelSmall
-                                    )
-                                }
-                            }
-                        }
-                    }
-                },
-                confirmButton = {
-                    TextButton(onClick = { showChatHistory = false }) { Text("إغلاق") }
-                }
-            )
-        }
         if (showVoiceSetupDialog) {
             VoiceSetupDialog(
                 viewModel = viewModel,
@@ -1222,6 +2172,331 @@ fun ChatScreen(
                     }
                 }
             )
+        }
+    }
+        }
+    }
+    }
+}
+
+@Composable
+private fun ChatToolChip(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    selected: Boolean,
+    available: Boolean = true,
+    enabled: Boolean = true,
+    accentColor: Color? = null,
+    onClick: () -> Unit
+) {
+    val primary = accentColor ?: MaterialTheme.colorScheme.primary
+    val container = when {
+        !available || !enabled -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.28f)
+        selected -> primary.copy(alpha = 0.2f)
+        else -> Color.Transparent
+    }
+    val content = when {
+        !available || !enabled -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
+        selected -> primary
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(24.dp),
+        color = container,
+        contentColor = content,
+        border = BorderStroke(
+            1.dp,
+            when {
+                !available || !enabled -> MaterialTheme.colorScheme.outline.copy(alpha = 0.35f)
+                selected -> primary
+                else -> MaterialTheme.colorScheme.outline
+            }
+        ),
+        enabled = enabled,
+        modifier = Modifier.height(28.dp).semantics { this.selected = selected }
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Icon(icon, contentDescription = null, modifier = Modifier.size(12.dp))
+            Text(label, fontSize = 10.sp, maxLines = 1)
+        }
+    }
+}
+private fun playSendSound() {
+    try {
+        val tone = android.media.ToneGenerator(android.media.AudioManager.STREAM_SYSTEM, 40)
+        tone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 60)
+        Handler(Looper.getMainLooper()).postDelayed({ tone.release() }, 200)
+    } catch (_: Exception) {
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ChatSidebar(
+    sessions: List<ChatSession>,
+    currentSessionId: String?,
+    onNewChat: () -> Unit,
+    onSelect: (String) -> Unit,
+    onRename: (String, String) -> Unit,
+    onDelete: (String) -> Unit,
+    onOpenSettings: () -> Unit,
+    personaItems: List<Persona>? = null,
+    selectedPersonaId: String? = null,
+    onSelectPersona: ((String) -> Unit)? = null,
+    syncIssue: String? = null
+) {
+    val authState by AuthManager.state.collectAsState()
+    val user = (authState as? AuthState.SignedIn)?.user
+    var query by remember { mutableStateOf("") }
+    var menuFor by remember { mutableStateOf<ChatSession?>(null) }
+    var renameFor by remember { mutableStateOf<ChatSession?>(null) }
+    var deleteFor by remember { mutableStateOf<ChatSession?>(null) }
+    val filtered = remember(sessions, query) {
+        sessions.filter { query.isBlank() || it.title.contains(query.trim(), ignoreCase = true) }
+            .sortedByDescending { it.updatedAt }
+    }
+    val groupedSessions = remember(filtered) { groupSessionsByTime(filtered) }
+    Column(modifier = Modifier.fillMaxHeight().widthIn(max = 320.dp).padding(12.dp)) {
+        if (personaItems == null) {
+            Button(onClick = onNewChat, modifier = Modifier.fillMaxWidth()) {
+                Icon(Icons.Default.Add, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("محادثة جديدة")
+            }
+        } else {
+            Text(
+                "الشخصيات",
+                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold
+            )
+            Button(onClick = onNewChat, modifier = Modifier.fillMaxWidth()) {
+                Icon(Icons.Default.Add, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("محادثة جديدة")
+            }
+        }
+        OutlinedTextField(
+            value = query,
+            onValueChange = { query = it },
+            placeholder = {
+                Text(if (personaItems == null) "بحث في المحادثات" else "بحث في الشخصيات والمحادثات")
+            },
+            leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+            singleLine = true,
+            shape = RoundedCornerShape(24.dp),
+            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+        )
+        if (syncIssue != null) {
+            Text(
+                syncIssue,
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+        LazyColumn(modifier = Modifier.weight(1f)) {
+            if (personaItems != null) {
+                val visiblePersonas = personaItems.filter {
+                    query.isBlank() || it.name.contains(query.trim(), ignoreCase = true)
+                }
+                if (visiblePersonas.isEmpty()) {
+                    item { Text("لا توجد شخصيات مطابقة.", modifier = Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall) }
+                }
+                items(visiblePersonas, key = { it.id }) { persona ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(
+                                if (persona.id == selectedPersonaId) persona.color.copy(alpha = 0.16f)
+                                else Color.Transparent
+                            )
+                            .clickable { onSelectPersona?.invoke(persona.id) }
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(persona.icon, contentDescription = null, tint = persona.color)
+                        Text(
+                            persona.name,
+                            modifier = Modifier.weight(1f).padding(horizontal = 10.dp),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        if (persona.id == selectedPersonaId) {
+                            Icon(Icons.Default.Check, contentDescription = "الشخصية الحالية", tint = persona.color)
+                        }
+                    }
+                }
+                item {
+                    Text(
+                        "المحادثات المحفوظة",
+                        modifier = Modifier.fillMaxWidth().padding(start = 12.dp, top = 14.dp, bottom = 6.dp),
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                if (groupedSessions.isEmpty()) {
+                    item {
+                        Text(
+                            "لا توجد محادثات محفوظة لهذا المساعد.",
+                            modifier = Modifier.padding(12.dp),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+                groupedSessions.forEach { (groupTitle, groupSessions) ->
+                    item(key = "persona-session-group-$groupTitle") {
+                        Text(
+                            text = groupTitle,
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(start = 12.dp, top = 12.dp, bottom = 4.dp)
+                        )
+                    }
+                    items(groupSessions, key = { it.id }) { session ->
+                        ChatSidebarSessionItem(
+                            session = session,
+                            isSelected = session.id == currentSessionId,
+                            onSelect = { onSelect(session.id) },
+                            onRename = { menuFor = null; renameFor = session },
+                            onDelete = { menuFor = null; deleteFor = session },
+                            menuExpanded = menuFor?.id == session.id,
+                            onOpenMenu = { menuFor = session },
+                            onDismissMenu = { menuFor = null }
+                        )
+                    }
+                }
+            } else {
+                if (groupedSessions.isEmpty()) {
+                    item { Text("لا توجد محادثات.", modifier = Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall) }
+                }
+                groupedSessions.forEach { (groupTitle, groupSessions) ->
+                    item(key = "chat-session-group-$groupTitle") {
+                        Text(
+                            text = groupTitle,
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 4.dp)
+                        )
+                    }
+                    items(groupSessions, key = { it.id }) { session ->
+                        ChatSidebarSessionItem(
+                            session = session,
+                            isSelected = session.id == currentSessionId,
+                            onSelect = { onSelect(session.id) },
+                            onRename = { menuFor = null; renameFor = session },
+                            onDelete = { menuFor = null; deleteFor = session },
+                            menuExpanded = menuFor?.id == session.id,
+                            onOpenMenu = { menuFor = session },
+                            onDismissMenu = { menuFor = null }
+                        )
+                    }
+                }
+            }
+        }
+        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (user?.photoUrl != null) {
+                AsyncImage(
+                    model = user.photoUrl,
+                    contentDescription = null,
+                    modifier = Modifier.size(36.dp).clip(CircleShape)
+                )
+            } else {
+                Icon(Icons.Default.AccountCircle, contentDescription = null, modifier = Modifier.size(36.dp))
+            }
+            Text(
+                user?.displayName ?: "مستخدم H2 Hub",
+                modifier = Modifier.weight(1f).padding(horizontal = 10.dp),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            IconButton(onClick = onOpenSettings) {
+                Icon(Icons.Default.Settings, contentDescription = "الإعدادات")
+            }
+        }
+    }
+    renameFor?.let { session ->
+        var title by remember(session.id) { mutableStateOf(session.title) }
+        AlertDialog(
+            onDismissRequest = { renameFor = null },
+            title = { Text("تغيير اسم المحادثة") },
+            text = { OutlinedTextField(value = title, onValueChange = { title = it }, singleLine = true) },
+            confirmButton = {
+                TextButton(onClick = { onRename(session.id, title); renameFor = null }) { Text("حفظ") }
+            },
+            dismissButton = { TextButton(onClick = { renameFor = null }) { Text("إلغاء") } }
+        )
+    }
+    deleteFor?.let { session ->
+        AlertDialog(
+            onDismissRequest = { deleteFor = null },
+            title = { Text("حذف المحادثة؟") },
+            text = { Text("سيتم حذف \"${session.title}\" نهائياً.") },
+            confirmButton = {
+                TextButton(onClick = { onDelete(session.id); deleteFor = null }) {
+                    Text("حذف", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = { TextButton(onClick = { deleteFor = null }) { Text("إلغاء") } }
+        )
+    }
+}
+
+@Composable
+private fun ChatSidebarSessionItem(
+    session: ChatSession,
+    isSelected: Boolean,
+    onSelect: () -> Unit,
+    onRename: () -> Unit,
+    onDelete: () -> Unit,
+    menuExpanded: Boolean,
+    onOpenMenu: () -> Unit,
+    onDismissMenu: () -> Unit
+) {
+    Box(modifier = Modifier.padding(bottom = 2.dp)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(
+                    if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
+                    else Color.Transparent
+                )
+                .combinedClickable(
+                    onClick = onSelect,
+                    onLongClick = onOpenMenu
+                )
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = session.title,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                fontSize = 14.sp,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.weight(1f)
+            )
+            IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
+                Icon(
+                    Icons.Default.Delete,
+                    contentDescription = "حذف المحادثة",
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+        DropdownMenu(expanded = menuExpanded, onDismissRequest = onDismissMenu) {
+            DropdownMenuItem(text = { Text("تغيير الاسم") }, onClick = onRename)
+            DropdownMenuItem(text = { Text("حذف") }, onClick = onDelete)
         }
     }
 }
@@ -1289,12 +2564,271 @@ private fun ChatComposerSheetAction(
 }
 
 @Composable
+private fun ChatAvatar(photoUrl: String?, isUser: Boolean) {
+    Box(
+        modifier = Modifier
+            .size(32.dp)
+            .clip(CircleShape)
+            .background(
+                if (isUser) MaterialTheme.colorScheme.primaryContainer else Color(0xFF3B1F7A)
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        when {
+            isUser && photoUrl != null -> AsyncImage(
+                model = photoUrl,
+                contentDescription = "صورة حسابك",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+            isUser -> Icon(
+                Icons.Default.Person,
+                contentDescription = "حسابك",
+                tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                modifier = Modifier.size(20.dp)
+            )
+            else -> Text("🐱", fontSize = 18.sp)
+        }
+    }
+}
+
+@Composable
+private fun BubbleActionIcon(
+    icon: ImageVector,
+    description: String,
+    tint: Color,
+    enabled: Boolean = true,
+    onClick: () -> Unit
+) {
+    IconButton(onClick = onClick, enabled = enabled, modifier = Modifier.size(32.dp)) {
+        Icon(icon, contentDescription = description, tint = tint, modifier = Modifier.size(18.dp))
+    }
+}
+
+private data class CachedGeneratedImage(val file: File, val mimeType: String)
+
+private fun isTrustedGeneratedImageUrl(url: URL): Boolean =
+    url.protocol == "https" &&
+        url.port in setOf(-1, 443) &&
+        url.userInfo == null &&
+        (url.host == "ik.imagekit.io" || Regex("^pub-[a-f0-9]{32}\\.r2\\.dev$").matches(url.host))
+
+private suspend fun cacheGeneratedImage(
+    context: Context,
+    imageUrl: String
+): CachedGeneratedImage = withContext(Dispatchers.IO) {
+    val url = URL(imageUrl)
+    require(isTrustedGeneratedImageUrl(url)) {
+        "رابط الصورة غير آمن."
+    }
+    val connection = (url.openConnection() as HttpsURLConnection).apply {
+        connectTimeout = 15_000
+        readTimeout = 30_000
+        instanceFollowRedirects = true
+    }
+    try {
+        check(connection.responseCode in HttpURLConnection.HTTP_OK..299) {
+            "تعذر تنزيل الصورة (HTTP ${connection.responseCode})."
+        }
+        check(isTrustedGeneratedImageUrl(connection.url)) {
+            "تم تحويل رابط الصورة إلى مضيف غير موثوق."
+        }
+        val contentLength = connection.contentLengthLong
+        check(contentLength <= 10L * 1024 * 1024) { "حجم الصورة أكبر من المسموح." }
+        val output = ByteArrayOutputStream()
+        connection.inputStream.use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            var totalBytes = 0
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                totalBytes += read
+                check(totalBytes <= 10 * 1024 * 1024) { "حجم الصورة أكبر من المسموح." }
+                output.write(buffer, 0, read)
+            }
+        }
+        val bytes = output.toByteArray()
+        val (extension, mimeType) = when {
+            bytes.size >= 3 &&
+                bytes[0] == 0xff.toByte() &&
+                bytes[1] == 0xd8.toByte() &&
+                bytes[2] == 0xff.toByte() -> "jpg" to "image/jpeg"
+            bytes.size >= 8 &&
+                bytes[0] == 0x89.toByte() &&
+                bytes[1] == 0x50.toByte() &&
+                bytes[2] == 0x4e.toByte() &&
+                bytes[3] == 0x47.toByte() -> "png" to "image/png"
+            bytes.size >= 12 &&
+                bytes.copyOfRange(0, 4).decodeToString() == "RIFF" &&
+                bytes.copyOfRange(8, 12).decodeToString() == "WEBP" -> "webp" to "image/webp"
+            else -> error("رابط الصورة لا يحتوي على صيغة صورة مدعومة.")
+        }
+        val directory = File(context.cacheDir, "generated-images")
+        check(directory.isDirectory || directory.mkdirs()) { "تعذر تجهيز مساحة مشاركة الصورة." }
+        val file = File(directory, "smart-cat-${System.currentTimeMillis()}.$extension")
+        file.writeBytes(bytes)
+        CachedGeneratedImage(file, mimeType)
+    } finally {
+        connection.disconnect()
+    }
+}
+
+private suspend fun saveGeneratedImageToGallery(
+    context: Context,
+    imageUrl: String
+) {
+    val cachedImage = cacheGeneratedImage(context, imageUrl)
+    withContext(Dispatchers.IO) {
+        val fileName = cachedImage.file.name
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
+                put(MediaStore.Images.Media.MIME_TYPE, cachedImage.mimeType)
+                put(
+                    MediaStore.Images.Media.RELATIVE_PATH,
+                    Environment.DIRECTORY_PICTURES + "/Smart Cat"
+                )
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+            val uri = context.contentResolver.insert(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                values
+            ) ?: error("تعذر إنشاء ملف الصورة في المعرض.")
+            try {
+                context.contentResolver.openOutputStream(uri)?.use { output ->
+                    cachedImage.file.inputStream().use { input -> input.copyTo(output) }
+                } ?: error("تعذر فتح ملف الصورة في المعرض.")
+                context.contentResolver.update(
+                    uri,
+                    ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) },
+                    null,
+                    null
+                )
+            } catch (error: Exception) {
+                context.contentResolver.delete(uri, null, null)
+                throw error
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            val picturesDirectory = Environment.getExternalStoragePublicDirectory(
+                Environment.DIRECTORY_PICTURES
+            )
+            val directory = File(picturesDirectory, "Smart Cat")
+            check(directory.isDirectory || directory.mkdirs()) { "تعذر إنشاء مجلد الصور." }
+            val destination = File(directory, fileName)
+            cachedImage.file.copyTo(destination, overwrite = false)
+            android.media.MediaScannerConnection.scanFile(
+                context,
+                arrayOf(destination.absolutePath),
+                arrayOf(cachedImage.mimeType),
+                null
+            )
+        }
+    }
+}
+
+@Composable
+private fun GeneratedImageActions(imageUrl: String, onSpeakImageClick: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    suspend fun saveImage() {
+        try {
+            saveGeneratedImageToGallery(context, imageUrl)
+            Toast.makeText(context, "تم حفظ الصورة في Pictures/Smart Cat.", Toast.LENGTH_LONG).show()
+        } catch (error: Exception) {
+            android.util.Log.e("ChatBubble", "Failed to save generated image", error)
+            Toast.makeText(
+                context,
+                com.example.network.GeminiApiClient.friendlyErrorMessage(error),
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+    val legacyStoragePermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) scope.launch { saveImage() }
+        else Toast.makeText(context, "يلزم السماح بحفظ الصور.", Toast.LENGTH_SHORT).show()
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Start,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        TextButton(
+            onClick = {
+                if (
+                    Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
+                    ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.WRITE_EXTERNAL_STORAGE
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    legacyStoragePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                } else {
+                    scope.launch { saveImage() }
+                }
+            },
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+        ) {
+            Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(4.dp))
+            Text("حفظ", fontSize = 12.sp)
+        }
+        TextButton(
+            onClick = {
+                scope.launch {
+                    try {
+                        val cachedImage = cacheGeneratedImage(context, imageUrl)
+                        val uri = FileProvider.getUriForFile(
+                            context,
+                            "${context.packageName}.fileprovider",
+                            cachedImage.file
+                        )
+                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                            type = cachedImage.mimeType
+                            putExtra(Intent.EXTRA_STREAM, uri)
+                            clipData = ClipData.newUri(context.contentResolver, "Smart Cat image", uri)
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        context.startActivity(Intent.createChooser(shareIntent, "مشاركة الصورة"))
+                    } catch (error: Exception) {
+                        android.util.Log.e("ChatBubble", "Failed to share generated image", error)
+                        Toast.makeText(
+                            context,
+                            com.example.network.GeminiApiClient.friendlyErrorMessage(error),
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            },
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+        ) {
+            Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(4.dp))
+            Text("مشاركة", fontSize = 12.sp)
+        }
+        TextButton(
+            onClick = onSpeakImageClick,
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+        ) {
+            Icon(Icons.Default.VolumeUp, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(4.dp))
+            Text("اسمع", fontSize = 12.sp)
+        }
+    }
+}
+
+@Composable
 fun ChatBubble(
     message: ChatMessage,
     onSpeakClick: (() -> Unit)? = null,
+    onSpeakImageClick: () -> Unit = {},
     isSpeaking: Boolean = false,
     isActiveSpeech: Boolean = false,
     onRetryVision: (() -> Unit)? = null,
+    renderCoderContent: Boolean = false,
+    onRegenerate: (() -> Unit)? = null,
     feedbackQuestion: String? = null,
     studySource: String? = null,
     onCreateStudySet: (String, StudySetMode) -> Unit = { _, _ -> },
@@ -1308,6 +2842,8 @@ fun ChatBubble(
 ) {
     val context = LocalContext.current
     val feedbackScope = rememberCoroutineScope()
+    val authState by com.example.auth.AuthManager.state.collectAsState()
+    val userPhoto = (authState as? com.example.auth.AuthState.SignedIn)?.user?.photoUrl
     var showFeedbackNote by rememberSaveable(message.id) { mutableStateOf(false) }
     var feedbackNote by rememberSaveable(message.id) { mutableStateOf("") }
     var feedbackSubmitted by rememberSaveable(message.id) { mutableStateOf(false) }
@@ -1316,8 +2852,8 @@ fun ChatBubble(
     var pendingFeedbackRating by remember(message.id) {
         mutableStateOf<com.example.network.GeminiApiClient.FeedbackRating?>(null)
     }
+    var showSources by rememberSaveable(message.id) { mutableStateOf(false) }
     val isUser = message.role == "user"
-    val align = if (isUser) Alignment.CenterEnd else Alignment.CenterStart
     val containerColor = if (isUser) {
         MaterialTheme.colorScheme.primary
     } else {
@@ -1334,229 +2870,360 @@ fun ChatBubble(
     val attachedImage = remember(visionAttachment?.imagePath) {
         visionAttachment?.imagePath?.let { BitmapFactory.decodeFile(it)?.asImageBitmap() }
     }
+    val contentDirection = LocalLayoutDirection.current
 
-    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = align) {
-        Card(
-            shape = RoundedCornerShape(
-                topStart = 16.dp,
-                topEnd = 16.dp,
-                bottomStart = if (isUser) 16.dp else 0.dp,
-                bottomEnd = if (isUser) 0.dp else 16.dp
-            ),
-            colors = CardDefaults.cardColors(containerColor = containerColor),
-            modifier = Modifier.widthIn(max = 300.dp)
-        ) {
-            Column(modifier = Modifier.padding(12.dp)) {
+    // Keep bubble sides physical so Arabic layout direction does not reverse them.
+    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+            val maxBubbleWidth = minOf(
+                maxWidth * if (isUser) 0.75f else 0.85f,
+                maxWidth - 40.dp
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = if (isUser) Arrangement.Start else Arrangement.End,
+                verticalAlignment = Alignment.Top
+            ) {
                 if (isUser) {
-                    if (visionAttachment != null) {
-                        attachedImage?.let { image ->
-                            Image(
-                                bitmap = image,
-                                contentDescription = "صورة المسألة المرسلة",
-                                modifier = Modifier.fillMaxWidth().heightIn(max = 220.dp)
-                                    .clip(RoundedCornerShape(8.dp)),
-                                contentScale = ContentScale.Fit
-                            )
-                        }
-                        if (visionAttachment.question.isNotBlank()) {
-                            Text(
-                                text = visionAttachment.question,
-                                modifier = Modifier.padding(top = 8.dp),
-                                color = contentColor,
-                                fontSize = 14.sp
-                            )
-                        }
-                    } else {
-                        Text(text = message.content, color = contentColor, fontSize = 14.sp)
-                    }
-                } else {
-                    RichChatContent(
-                        content = message.content,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    if (!feedbackQuestion.isNullOrBlank()) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.Start,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("قيّم الإجابة:", fontSize = 11.sp, color = contentColor.copy(alpha = 0.75f))
-                            TextButton(
-                                onClick = {
-                                    if (!feedbackSubmitted && !feedbackSending) {
-                                        pendingFeedbackRating =
-                                            com.example.network.GeminiApiClient.FeedbackRating.POSITIVE
-                                        feedbackSending = true
-                                        feedbackScope.launch {
-                                            val success = onFeedbackSubmit(
-                                                message.id,
-                                                feedbackQuestion,
-                                                message.content,
-                                                com.example.network.GeminiApiClient.FeedbackRating.POSITIVE,
-                                                ""
+                    ChatAvatar(photoUrl = userPhoto, isUser = true)
+                    Spacer(Modifier.width(8.dp))
+                }
+                Column(
+                    modifier = Modifier.widthIn(max = maxBubbleWidth),
+                    horizontalAlignment = if (isUser) Alignment.Start else Alignment.End
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(
+                            topStart = 18.dp,
+                            topEnd = 18.dp,
+                            bottomStart = if (isUser) 4.dp else 18.dp,
+                            bottomEnd = if (isUser) 18.dp else 4.dp
+                        ),
+                        color = containerColor
+                    ) {
+                        CompositionLocalProvider(LocalLayoutDirection provides contentDirection) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                if (isUser) {
+                                    if (visionAttachment != null) {
+                                        attachedImage?.let { image ->
+                                            Image(
+                                                bitmap = image,
+                                                contentDescription = "صورة المسألة المرسلة",
+                                                modifier = Modifier.fillMaxWidth().heightIn(max = 220.dp)
+                                                    .clip(RoundedCornerShape(8.dp)),
+                                                contentScale = ContentScale.Fit
                                             )
-                                            feedbackSending = false
-                                            feedbackSubmitted = success
-                                            feedbackStatus = if (success) "شكراً لتقييمك!" else "تعذر إرسال التقييم. حاول مرة أخرى."
-                                            if (!success) pendingFeedbackRating = null
+                                        }
+                                        if (visionAttachment.question.isNotBlank()) {
+                                            Text(
+                                                text = visionAttachment.question,
+                                                modifier = Modifier.padding(top = 8.dp),
+                                                color = contentColor,
+                                                fontSize = 15.sp
+                                            )
+                                        }
+                                    } else {
+                                        Text(text = message.content, color = contentColor, fontSize = 15.sp)
+                                    }
+                                } else {
+                                    if (renderCoderContent) {
+                                        CoderChatContent(
+                                            content = message.content,
+                                            modifier = Modifier.fillMaxWidth()
+                                        )
+                                    } else {
+                                        RichChatContent(
+                                            content = message.content,
+                                            modifier = Modifier.fillMaxWidth()
+                                        )
+                                    }
+                                    message.generatedImageUrl?.let { imageUrl ->
+                                        AsyncImage(
+                                            model = imageUrl,
+                                            contentDescription = "الصورة التي أنشأها Smart Cat",
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .heightIn(max = 360.dp)
+                                                .clip(RoundedCornerShape(12.dp))
+                                                .padding(top = 8.dp),
+                                            contentScale = ContentScale.Fit
+                                        )
+                                    }
+                                    if (onRetryVision != null) {
+                                        TextButton(onClick = onRetryVision) {
+                                            Icon(Icons.Default.Replay, contentDescription = null)
+                                            Spacer(Modifier.width(6.dp))
+                                            Text("حل تاني")
                                         }
                                     }
-                                },
-                                enabled = !feedbackSubmitted && !feedbackSending,
-                                contentPadding = PaddingValues(horizontal = 6.dp)
-                            ) { Text("👍", fontSize = 16.sp) }
-                            TextButton(
-                                onClick = {
-                                    pendingFeedbackRating =
-                                        com.example.network.GeminiApiClient.FeedbackRating.NEGATIVE
+                                    if (onRetryVision != null && !studySource.isNullOrBlank()) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                        ) {
+                                            TextButton(
+                                                onClick = { onCreateStudySet(studySource, StudySetMode.QUIZ) },
+                                                contentPadding = PaddingValues(horizontal = 6.dp)
+                                            ) {
+                                                Icon(Icons.Default.Quiz, contentDescription = null)
+                                                Spacer(Modifier.width(4.dp))
+                                                Text("اعمل اختبار", fontSize = 12.sp)
+                                            }
+                                            TextButton(
+                                                onClick = { onCreateStudySet(studySource, StudySetMode.FLASHCARDS) },
+                                                contentPadding = PaddingValues(horizontal = 6.dp)
+                                            ) {
+                                                Icon(Icons.Default.Style, contentDescription = null)
+                                                Spacer(Modifier.width(4.dp))
+                                                Text("اعمل كروت مراجعة", fontSize = 11.sp)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    message.thinkingSeconds?.takeIf { it > 0 }?.let { seconds ->
+                        Text(
+                            text = "🧠 فكر في $seconds ثانية",
+                            modifier = Modifier.padding(top = 6.dp),
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f)
+                        )
+                    }
+                    Text(
+                        text = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date(message.timestamp)),
+                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
+                        fontSize = 10.sp,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f)
+                    )
+                    if (!isUser) {
+                        message.generatedImageUrl?.let { imageUrl ->
+                            GeneratedImageActions(imageUrl, onSpeakImageClick)
+                        }
+                    }
+                    if (!isUser) {
+                        val iconTint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f)
+                        val activeTint = MaterialTheme.colorScheme.primary
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            BubbleActionIcon(Icons.Default.ContentCopy, "نسخ الرد", iconTint) {
+                                val clipboard = context.getSystemService(ClipboardManager::class.java)
+                                clipboard.setPrimaryClip(ClipData.newPlainText("رد Smart Cat", message.content))
+                                Toast.makeText(context, "تم نسخ الرد.", Toast.LENGTH_SHORT).show()
+                            }
+                            if (onSpeakClick != null && message.generatedImageUrl == null) {
+                                BubbleActionIcon(
+                                    icon = if (isActiveSpeech) {
+                                        if (isSpeaking) Icons.Default.Pause else Icons.Default.PlayArrow
+                                    } else Icons.Default.VolumeUp,
+                                    description = if (isActiveSpeech && isSpeaking) {
+                                        "إيقاف مؤقت للقراءة"
+                                    } else if (isActiveSpeech) {
+                                        "متابعة القراءة"
+                                    } else "قراءة النص بصوت عالٍ",
+                                    tint = iconTint,
+                                    onClick = onSpeakClick
+                                )
+                            }
+                            if (onRegenerate != null) {
+                                BubbleActionIcon(Icons.Default.Refresh, "إعادة توليد الرد", iconTint, onClick = onRegenerate)
+                            }
+                            if (message.sources.isNotEmpty()) {
+                                TextButton(
+                                    onClick = { showSources = true },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                                    modifier = Modifier.height(32.dp)
+                                ) {
+                                    Text("🌐 المصادر (${message.sources.size})", fontSize = 12.sp, color = iconTint)
+                                }
+                            }
+                            if (!feedbackQuestion.isNullOrBlank()) {
+                                val locked = feedbackSubmitted || feedbackSending
+                                BubbleActionIcon(
+                                    Icons.Default.ThumbUp,
+                                    "إعجاب",
+                                    if (feedbackSubmitted && pendingFeedbackRating == FeedbackRating.POSITIVE) activeTint else iconTint,
+                                    enabled = !locked
+                                ) {
+                                    pendingFeedbackRating = FeedbackRating.POSITIVE
+                                    feedbackSending = true
+                                    feedbackScope.launch {
+                                        val success = onFeedbackSubmit(
+                                            message.id,
+                                            feedbackQuestion,
+                                            message.content,
+                                            FeedbackRating.POSITIVE,
+                                            ""
+                                        )
+                                        feedbackSending = false
+                                        feedbackSubmitted = success
+                                        feedbackStatus = if (success) "شكراً لتقييمك!" else "تعذر إرسال التقييم. حاول مرة أخرى."
+                                        if (!success) pendingFeedbackRating = null
+                                    }
+                                }
+                                BubbleActionIcon(
+                                    Icons.Default.ThumbDown,
+                                    "عدم إعجاب",
+                                    if (feedbackSubmitted && pendingFeedbackRating == FeedbackRating.NEGATIVE) activeTint else iconTint,
+                                    enabled = !locked
+                                ) {
+                                    pendingFeedbackRating = FeedbackRating.NEGATIVE
                                     feedbackNote = ""
                                     showFeedbackNote = true
-                                },
-                                enabled = !feedbackSubmitted && !feedbackSending,
-                                contentPadding = PaddingValues(horizontal = 6.dp)
-                            ) { Text("👎", fontSize = 16.sp) }
-                            TextButton(
-                                onClick = {
-                                    pendingFeedbackRating =
-                                        com.example.network.GeminiApiClient.FeedbackRating.INCORRECT
+                                }
+                                BubbleActionIcon(
+                                    Icons.Default.Flag,
+                                    "إبلاغ عن إجابة خاطئة",
+                                    if (feedbackSubmitted && pendingFeedbackRating == FeedbackRating.INCORRECT) activeTint else iconTint,
+                                    enabled = !locked
+                                ) {
+                                    pendingFeedbackRating = FeedbackRating.INCORRECT
                                     feedbackNote = ""
                                     showFeedbackNote = true
-                                },
-                                enabled = !feedbackSubmitted && !feedbackSending,
-                                contentPadding = PaddingValues(horizontal = 6.dp)
-                            ) { Text("🚩", fontSize = 16.sp) }
+                                }
+                            }
                         }
                         if (feedbackStatus.isNotBlank()) {
                             Text(
                                 feedbackStatus,
+                                modifier = Modifier.padding(horizontal = 4.dp),
                                 fontSize = 11.sp,
                                 color = if (feedbackSubmitted) MaterialTheme.colorScheme.primary
                                 else MaterialTheme.colorScheme.error
                             )
                         }
                     }
-                    if (onRetryVision != null) {
-                        TextButton(onClick = onRetryVision) {
-                            Icon(Icons.Default.Replay, contentDescription = null)
-                            Spacer(Modifier.width(6.dp))
-                            Text("حل تاني")
-                        }
-                        if (!studySource.isNullOrBlank()) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(4.dp)
-                            ) {
-                                TextButton(
-                                    onClick = { onCreateStudySet(studySource, StudySetMode.QUIZ) },
-                                    contentPadding = PaddingValues(horizontal = 6.dp)
-                                ) {
-                                    Icon(Icons.Default.Quiz, contentDescription = null)
-                                    Spacer(Modifier.width(4.dp))
-                                    Text("اعمل اختبار", fontSize = 12.sp)
-                                }
-                                TextButton(
-                                    onClick = { onCreateStudySet(studySource, StudySetMode.FLASHCARDS) },
-                                    contentPadding = PaddingValues(horizontal = 6.dp)
-                                ) {
-                                    Icon(Icons.Default.Style, contentDescription = null)
-                                    Spacer(Modifier.width(4.dp))
-                                    Text("اعمل كروت مراجعة", fontSize = 11.sp)
-                                }
-                            }
-                        }
-                    }
-
-                    if (showFeedbackNote) {
-                        AlertDialog(
-                            onDismissRequest = { showFeedbackNote = false },
-                            title = {
-                                Text(
-                                    if (pendingFeedbackRating == com.example.network.GeminiApiClient.FeedbackRating.INCORRECT) {
-                                        "الإبلاغ عن إجابة خاطئة"
-                                    } else {
-                                        "ملاحظتك على الإجابة"
-                                    }
-                                )
-                            },
-                            text = {
-                                OutlinedTextField(
-                                    value = feedbackNote,
-                                    onValueChange = { feedbackNote = it.take(1_000) },
-                                    label = { Text("اكتب ملاحظة (اختياري)") },
-                                    maxLines = 4
-                                )
-                            },
-                            confirmButton = {
-                                TextButton(
-                                    enabled = !feedbackSending,
-                                    onClick = {
-                                        val rating = pendingFeedbackRating ?: return@TextButton
-                                        feedbackSending = true
-                                        feedbackScope.launch {
-                                            val success = onFeedbackSubmit(
-                                                message.id,
-                                                feedbackQuestion.orEmpty(),
-                                                message.content,
-                                                rating,
-                                                feedbackNote.trim()
-                                            )
-                                            feedbackSending = false
-                                            feedbackSubmitted = success
-                                            feedbackStatus = if (success) "شكراً لتقييمك!" else "تعذر إرسال التقييم. حاول مرة أخرى."
-                                            if (success) showFeedbackNote = false
-                                        }
-                                    }
-                                ) { Text(if (feedbackSending) "جارٍ الإرسال..." else "إرسال") }
-                            },
-                            dismissButton = {
-                                TextButton(onClick = { showFeedbackNote = false }) { Text("إلغاء") }
-                            }
-                        )
-                    }
                 }
-                Spacer(modifier = Modifier.height(4.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (!isUser) {
-                            IconButton(
-                                onClick = {
-                                    val clipboard = context.getSystemService(ClipboardManager::class.java)
-                                    clipboard.setPrimaryClip(ClipData.newPlainText("رد Smart Cat", message.content))
-                                    Toast.makeText(context, "تم نسخ الرد.", Toast.LENGTH_SHORT).show()
-                                },
-                                modifier = Modifier.size(28.dp)
-                            ) {
-                                Icon(Icons.Default.ContentCopy, "نسخ الرد", tint = contentColor, modifier = Modifier.size(16.dp))
-                            }
-                            if (onSpeakClick != null) {
-                                IconButton(onClick = onSpeakClick, modifier = Modifier.size(28.dp)) {
-                                    Icon(
-                                        imageVector = if (isActiveSpeech) {
-                                            if (isSpeaking) Icons.Default.Pause else Icons.Default.PlayArrow
-                                        } else Icons.Default.VolumeUp,
-                                        contentDescription = if (isActiveSpeech && isSpeaking) {
-                                            "إيقاف مؤقت للقراءة"
-                                        } else if (isActiveSpeech) {
-                                            "متابعة القراءة"
-                                        } else "قراءة النص بصوت عالٍ",
-                                        tint = contentColor.copy(alpha = 0.8f),
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                }
-                            }
-                        } else {
-                            Spacer(modifier = Modifier.width(1.dp))
+                if (!isUser) {
+                    Spacer(Modifier.width(8.dp))
+                    ChatAvatar(photoUrl = null, isUser = false)
+                }
+            }
+        }
+    }
+
+    if (showSources) {
+        SourcesSheet(message.sources, onDismiss = { showSources = false })
+    }
+
+    if (showFeedbackNote) {
+        AlertDialog(
+            onDismissRequest = { showFeedbackNote = false },
+            title = {
+                Text(
+                    if (pendingFeedbackRating == FeedbackRating.INCORRECT) {
+                        "الإبلاغ عن إجابة خاطئة"
+                    } else {
+                        "ملاحظتك على الإجابة"
+                    }
+                )
+            },
+            text = {
+                OutlinedTextField(
+                    value = feedbackNote,
+                    onValueChange = { feedbackNote = it.take(1_000) },
+                    label = { Text("اكتب ملاحظة (اختياري)") },
+                    maxLines = 4
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = !feedbackSending,
+                    onClick = {
+                        val rating = pendingFeedbackRating ?: return@TextButton
+                        feedbackSending = true
+                        feedbackScope.launch {
+                            val success = onFeedbackSubmit(
+                                message.id,
+                                feedbackQuestion.orEmpty(),
+                                message.content,
+                                rating,
+                                feedbackNote.trim()
+                            )
+                            feedbackSending = false
+                            feedbackSubmitted = success
+                            feedbackStatus = if (success) "شكراً لتقييمك!" else "تعذر إرسال التقييم. حاول مرة أخرى."
+                            if (success) showFeedbackNote = false
                         }
                     }
-                    Text(
-                        text = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date(message.timestamp)),
-                        fontSize = 9.sp,
-                        color = contentColor.copy(alpha = 0.7f)
+                ) { Text(if (feedbackSending) "جارٍ الإرسال..." else "إرسال") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showFeedbackNote = false }) { Text("إلغاء") }
+            }
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SourcesSheet(sources: List<ChatSource>, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("🌐 المصادر (${sources.size})", style = MaterialTheme.typography.titleMedium)
+                TextButton(onClick = {
+                    val clipboard = context.getSystemService(ClipboardManager::class.java)
+                    clipboard.setPrimaryClip(
+                        ClipData.newPlainText(
+                            "المصادر",
+                            sources.mapIndexed { index, source ->
+                                "${source.reference ?: index + 1}. ${source.title}\n${source.url}"
+                            }.joinToString("\n\n")
+                        )
                     )
+                    Toast.makeText(context, "تم نسخ المصادر.", Toast.LENGTH_SHORT).show()
+                }) {
+                    Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("نسخ الكل")
+                }
+            }
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                itemsIndexed(sources) { index, source ->
+                    Surface(
+                        onClick = {
+                            try {
+                                context.startActivity(
+                                    Intent(Intent.ACTION_VIEW, Uri.parse(source.url))
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                )
+                            } catch (_: Exception) {
+                                Toast.makeText(context, "تعذر فتح الرابط.", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text(
+                                "${source.reference ?: index + 1}. ${source.title}",
+                                fontSize = 14.sp,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                source.url,
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.primary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -1564,7 +3231,7 @@ fun ChatBubble(
 }
 
 @Composable
-fun TypingIndicator() {
+fun TypingIndicator(state: String? = null) {
     val infiniteTransition = rememberInfiniteTransition(label = "dots")
     val animatedY by infiniteTransition.animateFloat(
         initialValue = 0f,
@@ -1588,17 +3255,37 @@ fun TypingIndicator() {
                 .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(12.dp))
                 .padding(horizontal = 16.dp, vertical = 12.dp)
         ) {
-            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("جاري التفكير والكتابة", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                (0..2).forEach { index ->
-                    Box(
-                        modifier = Modifier
-                            .size(6.dp)
-                            .graphicsLayer {
-                                this.translationY = if (index == 0) animatedY else animatedY * 0.5f
-                            }
-                            .clip(CircleShape)
-                            .background(MaterialTheme.colorScheme.primary)
+            Column {
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Crossfade(targetState = state, label = "typingLabel") { current ->
+                        Text(
+                            when (current) {
+                                "searching" -> "🌐 يترجم السؤال ويبحث بالإنجليزية..."
+                                "thinking" -> "🧠 يراجع السؤال بعمق..."
+                                "searching+thinking" -> "🌐 يبحث بالإنجليزية ثم 🧠 يراجع النتائج..."
+                                "drawing" -> "🎨 جاري الرسم..."
+                                else -> "جاري التفكير والكتابة"
+                            },
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    (0..2).forEach { index ->
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .graphicsLayer {
+                                    this.translationY = if (index == 0) animatedY else animatedY * 0.5f
+                                }
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.primary)
+                        )
+                    }
+                }
+                if (state == "searching" || state == "searching+thinking") {
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                        color = MaterialTheme.colorScheme.primary
                     )
                 }
             }
@@ -1734,7 +3421,7 @@ fun ProductivityScreen(viewModel: AppViewModel) {
                                 activeTab = "saved"
                                 promptInput = ""
                             },
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier.fillMaxWidth().smartCatActionHeight(),
                             enabled = !isGenerating && promptInput.isNotEmpty()
                         ) {
                             if (isGenerating) {
@@ -1761,7 +3448,7 @@ fun ProductivityScreen(viewModel: AppViewModel) {
                                 )
                             },
                             enabled = !isExtracting && !isGenerating,
-                            modifier = Modifier.fillMaxWidth()
+                            modifier = Modifier.fillMaxWidth().smartCatActionHeight()
                         ) {
                             Icon(Icons.Default.UploadFile, contentDescription = null)
                             Spacer(Modifier.width(8.dp))
@@ -1835,7 +3522,7 @@ fun ProductivityScreen(viewModel: AppViewModel) {
                                     selectedFileName ?: "مستند"
                                 )
                             },
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier.fillMaxWidth().smartCatActionHeight(),
                             enabled = !isGenerating && !isExtracting && sourceText.isNotBlank()
                         ) {
                             if (isGenerating) {
@@ -1855,7 +3542,7 @@ fun ProductivityScreen(viewModel: AppViewModel) {
                                     }
                                 },
                                 enabled = !isGenerating && latestSummary != null,
-                                modifier = Modifier.fillMaxWidth()
+                                modifier = Modifier.fillMaxWidth().smartCatActionHeight()
                             ) {
                                 Text("إنشاء مخطط عرض من الملخص")
                             }
@@ -1882,7 +3569,10 @@ fun ProductivityScreen(viewModel: AppViewModel) {
                                     modifier = Modifier.weight(1f),
                                     textAlign = TextAlign.End
                                 )
-                                Button(onClick = { doc?.let { viewModel.speakText(it.content, it.id) } }, modifier = Modifier.padding(start = 8.dp)) {
+                                Button(
+                                    onClick = { doc?.let { viewModel.speakText(it.content, it.id) } },
+                                    modifier = Modifier.padding(start = 8.dp).smartCatActionHeight()
+                                ) {
                                     Icon(Icons.Default.VolumeUp, contentDescription = "Listen")
                                     Spacer(modifier = Modifier.width(4.dp))
                                     Text("استمع")
@@ -1911,7 +3601,10 @@ fun ProductivityScreen(viewModel: AppViewModel) {
                                 Text(doc?.content.orEmpty(), fontSize = 13.sp)
                             }
                             Spacer(modifier = Modifier.height(12.dp))
-                            Button(onClick = { viewModel.clearSelectedDoc() }, modifier = Modifier.fillMaxWidth()) {
+                            Button(
+                                onClick = { viewModel.clearSelectedDoc() },
+                                modifier = Modifier.fillMaxWidth().smartCatActionHeight()
+                            ) {
                                 Text("العودة للقائمة")
                             }
                         }
@@ -2048,18 +3741,34 @@ data class Persona(
 
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
-fun PersonasScreen(viewModel: AppViewModel) {
+fun PersonasScreen(
+    viewModel: AppViewModel,
+    coderOnly: Boolean = false,
+    personaOnlyId: String? = null,
+    onBack: (() -> Unit)? = null,
+    onPersonaSelected: ((String) -> Unit)? = null,
+    onOpenSettings: (() -> Unit)? = null,
+    onOpenSubscription: () -> Unit = {}
+) {
     val selectedPersonaId by viewModel.selectedPersonaId.collectAsState()
-    val personaVoiceEnabled by viewModel.personaVoiceEnabled.collectAsState()
+    val personaSessions by viewModel.chatSessions.collectAsState()
+    val conversationSyncStatus by viewModel.conversationSyncStatus.collectAsState()
+    val activePersonaSessionIds by viewModel.activePersonaSessionIds.collectAsState()
     val isGenerating by viewModel.isGeneratingPersona.collectAsState()
-    val messagesMap by viewModel.personaMessages.collectAsState()
     val isListeningToSpeech by viewModel.isListeningToSpeech.collectAsState()
+    val isProcessingSpeech by viewModel.isProcessingSpeech.collectAsState()
     val speechInputText by viewModel.speechInputText.collectAsState()
+    val speechAmplitude by viewModel.speechAmplitude.collectAsState()
     val isSpeaking by viewModel.isSpeaking.collectAsState()
     val activeSpeechId by viewModel.activeSpeechId.collectAsState()
     val thinkingModeEnabled by viewModel.useThinkingMode.collectAsState()
+    val thinkingState by viewModel.thinkingState.collectAsState()
+    val usageState by viewModel.usageState.collectAsState()
     val socraticModeEnabled by viewModel.socraticModeEnabled.collectAsState()
     val educationalContentEnabled by viewModel.educationalContentEnabled.collectAsState()
+    if (personaOnlyId != null && onBack != null) {
+        BackHandler(onBack = onBack)
+    }
     DisposableEffect(Unit) {
         onDispose {
             activeSpeechId?.let(viewModel::stopSpeakingIfActive)
@@ -2074,19 +3783,48 @@ fun PersonasScreen(viewModel: AppViewModel) {
     val explanationText by viewModel.explanationText.collectAsState()
 
     val personasList = listOf(
-        Persona("hasan", "حسن (صوت ولد)", "صاحبك الجدع - صوت ولد تفاعلي", Icons.Default.RecordVoiceOver, Color(0xFF2563EB)),
-        Persona("jana", "ريتاج (صوت بنت)", "صديقتك الذكية - صوت بنت رقيق", Icons.Default.Face, Color(0xFFEC4899)),
-        Persona("teacher", "أ. أحمد", "معلم ومبسط العلوم", Icons.Default.School, Color(0xFF10B981)),
-        Persona("coder", "Coder AI", "خبير البرمجة والأكواد", Icons.Default.Code, Color(0xFF14B8A6)),
-        Persona("doctor", "د. خالد", "طبيب العائلة التوعوي", Icons.Default.LocalHospital, Color(0xFFEF4444)),
-        Persona("business", "أ. سمير", "مستشار دراسات الجدوى", Icons.Default.BusinessCenter, Color(0xFFF59E0B)),
-        Persona("legal", "المستشار عادل", "استشاري الشؤون القانونية", Icons.Default.Gavel, Color(0xFF8B5CF6)),
-        Persona("sheikh", "الشيخ عبد الرحمن", "فقيه الشريعة المعتدل", Icons.Default.SelfImprovement, Color(0xFF06B6D4)),
-        Persona("coach", "الكابتن فهد", "مدرب اللياقة والصحة", Icons.Default.FitnessCenter, Color(0xFFF97316)),
-        Persona("designer", "المصممة آيه", "واجهات التصميم الجرافيكي", Icons.Default.Palette, Color(0xFFEC4899)),
-        Persona("chef", "الشيف مراد", "وصفات الطهي والحلويات", Icons.Default.Restaurant, Color(0xFF06B6D4)),
-        Persona("nanny", "المربية فاطمة", "تربية الأطفال والأسرة", Icons.Default.BabyChangingStation, Color(0xFF6366F1))
+        Persona("teacher", "أ. أحمد", "معلم ومبسط العلوم", Icons.Default.School, AccentColors.forPersona("teacher")),
+        Persona("doctor", "د. خالد", "مساعدة التوعية الصحية", Icons.Default.LocalHospital, AccentColors.forPersona("doctor")),
+        Persona("business", "أ. سمير", "مساعد التثقيف في الأعمال", Icons.Default.BusinessCenter, AccentColors.forPersona("business")),
+        Persona("legal", "المستشار عادل", "مساعد التثقيف القانوني", Icons.Default.Gavel, AccentColors.forPersona("legal")),
+        Persona("sheikh", "الشيخ عبد الرحمن", "مساعد المعرفة الإسلامية", Icons.Default.SelfImprovement, AccentColors.forPersona("sheikh")),
+        Persona("coach", "الكابتن فهد", "مساعد اللياقة البدنية", Icons.Default.FitnessCenter, AccentColors.forPersona("coach")),
+        Persona("designer", "المصممة آية", "واجهات التصميم الجرافيكي", Icons.Default.Palette, AccentColors.forPersona("designer")),
+        Persona("chef", "الشيف مراد", "وصفات الطهي والحلويات", Icons.Default.Restaurant, AccentColors.forPersona("chef")),
+        Persona("nanny", "المربية أسماء", "التوعية بالتربية الأسرية", Icons.Default.BabyChangingStation, AccentColors.forPersona("nanny"))
     )
+
+    val activePersonaId = resolvePersonaScreenId(personaOnlyId, coderOnly, selectedPersonaId)
+    val quotaFeature = if (coderOnly) "coder" else "chat"
+    val personaRemaining = usageState.snapshot?.let { snapshot ->
+        if (snapshot.legacy) Int.MAX_VALUE
+        else snapshot.subscription?.remaining ?: snapshot.feature(quotaFeature)?.remaining
+    }
+    val personaQuotaExhausted = usageBanner(usageState, quotaFeature)?.exhausted == true
+    val activeSessionId = activePersonaSessionIds[activePersonaId] ?: "persona_$activePersonaId"
+    var personaSearchEnabled by remember(activePersonaId) {
+        mutableStateOf(viewModel.personaWebSearchEnabled(activePersonaId))
+    }
+    var personaThinkingEnabled by remember(activePersonaId) {
+        mutableStateOf(viewModel.personaThinkingEnabled(activePersonaId))
+    }
+    val personaRequiredQuota = requiredMessageQuota(
+        webSearch = personaSearchEnabled,
+        thinking = personaThinkingEnabled
+    )
+    val personaHasSufficientQuota = personaRemaining == null || personaRemaining >= personaRequiredQuota
+    var personaAutoReadEnabled by remember(activePersonaId) {
+        mutableStateOf(viewModel.personaAutoReadEnabled(activePersonaId))
+    }
+    var showAssistantSettings by remember { mutableStateOf(false) }
+    var showClearChatConfirmation by remember { mutableStateOf(false) }
+    LaunchedEffect(coderOnly, selectedPersonaId) {
+        if (!coderOnly && personaOnlyId == null &&
+            (selectedPersonaId == "coder" || selectedPersonaId == "hasan" || selectedPersonaId == "jana")
+        ) {
+            viewModel.setDefaultPersona("teacher")
+        }
+    }
 
     val context = LocalContext.current
     val contentResolver = context.contentResolver
@@ -2099,10 +3837,14 @@ fun PersonasScreen(viewModel: AppViewModel) {
     var pendingCameraFilePath by rememberSaveable { mutableStateOf<String?>(null) }
 
     fun preparePersonaVisionImage(uri: Uri) {
+        if (personaRemaining != null && personaRemaining < 3) {
+            Toast.makeText(context, "الرصيد لا يكفي لتحليل الصورة؛ تحتاج إلى 3 رسائل على الأقل.", Toast.LENGTH_SHORT).show()
+            return
+        }
         personaScope.launch {
             try {
                 val imageFile = withContext(Dispatchers.IO) { compressChatImage(context, uri) }
-                viewModel.sendPersonaVision(imageFile.absolutePath, textInput.trim())
+                viewModel.sendPersonaVision(imageFile.absolutePath, textInput.trim(), activePersonaId)
                 textInput = ""
             } catch (e: Exception) {
                 android.util.Log.e("PersonasScreen", "Failed to prepare vision image", e)
@@ -2118,7 +3860,7 @@ fun PersonasScreen(viewModel: AppViewModel) {
     }
 
     val imageLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        contract = ActivityResultContracts.PickVisualMedia()
     ) { uri -> if (uri != null) preparePersonaVisionImage(uri) }
 
     val cameraLauncher = rememberLauncherForActivityResult(
@@ -2160,16 +3902,17 @@ fun PersonasScreen(viewModel: AppViewModel) {
     val pdfLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri ->
-        if (uri != null) {
+        if (uri != null) personaScope.launch {
             try {
-                val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                    ?: error("تعذر قراءة ملف PDF.")
-                check(bytes.isNotEmpty()) { "ملف PDF فارغ." }
+                val encodedPdf = encodePdfAttachment(context, uri)
                 viewModel.sendMultimodalMessage(
-                    Base64.encodeToString(bytes, Base64.NO_WRAP),
+                    encodedPdf,
                     "application/pdf",
-                    selectedPersonaId
+                    activePersonaId,
+                    persistSelection = !coderOnly && personaOnlyId == null
                 )
+            } catch (error: CancellationException) {
+                throw error
             } catch (e: Exception) {
                 android.util.Log.e("PersonasScreen", "Failed to attach PDF", e)
                 Toast.makeText(context, e.localizedMessage ?: "تعذر إرفاق الملف.", Toast.LENGTH_LONG).show()
@@ -2186,10 +3929,80 @@ fun PersonasScreen(viewModel: AppViewModel) {
             action()
         }
     }
-    val currentMessages = messagesMap[selectedPersonaId] ?: emptyList()
-    val activePersona = personasList.first { it.id == selectedPersonaId }
+    LaunchedEffect(activePersonaId) {
+        viewModel.ensurePersonaChatSession(activePersonaId)
+    }
+    LaunchedEffect(activeSessionId) {
+        viewModel.watchConversationMessages(activeSessionId)
+    }
+    val currentMessages by remember(activeSessionId) {
+        viewModel.personaMessagesFor(activeSessionId)
+    }.collectAsState(initial = emptyList())
+    val friends = listOf(
+        Persona("hasan", "حسن صديق", "صاحبك الجدع - صوت ولد تفاعلي", Icons.Default.RecordVoiceOver, AccentColors.VoiceFriend),
+        Persona("jana", "ريتاج صديقة", "صديقتك الذكية - صوت بنت رقيق", Icons.Default.Face, AccentColors.VoiceFriend)
+    )
+    val fallbackPersona = Persona(
+        "teacher",
+        "أ. أحمد",
+        "معلم ومبسط العلوم",
+        Icons.Default.School,
+        AccentColors.PersonaAhmed
+    )
+    val activePersona = if (coderOnly) {
+        Persona("coder", "H2 Code", "خبير البرمجة والأكواد", Icons.Default.Code, AccentColors.Coder)
+    } else {
+        resolvePersonaDisplay(activePersonaId, personasList + friends, fallbackPersona)
+    }
+    val saveChatLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri ->
+        if (uri != null) {
+            personaScope.launch {
+                try {
+                    val chatText = buildString {
+                        appendLine("${activePersona.name} - ${personaSessions.firstOrNull { it.id == activeSessionId }?.title.orEmpty()}")
+                        currentMessages.forEach { message ->
+                            appendLine()
+                            appendLine(if (message.role == "user") "أنت:" else "${activePersona.name}:")
+                            val attachment = parseChatVisionMessage(message.content)
+                            appendLine(
+                                if (attachment != null) {
+                                    "[صورة مرفقة] ${attachment.question}".trim()
+                                } else {
+                                    message.content
+                                }
+                            )
+                        }
+                    }
+                    withContext(Dispatchers.IO) {
+                        context.contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use {
+                            it.write(chatText)
+                        } ?: error("تعذر فتح الملف لحفظ المحادثة.")
+                    }
+                    Toast.makeText(context, "تم حفظ نسخة المحادثة.", Toast.LENGTH_SHORT).show()
+                } catch (error: Exception) {
+                    android.util.Log.e("PersonasScreen", "Failed to export persona chat", error)
+                    Toast.makeText(context, "تعذر حفظ المحادثة.", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
 
     val listState = rememberLazyListState()
+    val personaDrawerState = rememberDrawerState(DrawerValue.Closed)
+    val personaSidebarItems = remember(personasList, friends) { personasList + friends }
+    val personaAccentScheme = MaterialTheme.colorScheme.copy(
+        primary = activePersona.color,
+        onPrimary = if (activePersona.color.luminance() > 0.22f) Color(0xFF111827) else Color.White,
+        primaryContainer = activePersona.color.copy(alpha = 0.22f),
+        onPrimaryContainer = MaterialTheme.colorScheme.onSurface,
+        secondary = activePersona.color,
+        secondaryContainer = activePersona.color.copy(alpha = 0.22f),
+        onSecondaryContainer = MaterialTheme.colorScheme.onSurface,
+        tertiary = activePersona.color
+    )
+    val sharedChatAccent = activePersona.color
 
     // Sync speech input text to user text field
     LaunchedEffect(speechInputText) {
@@ -2204,53 +4017,93 @@ fun PersonasScreen(viewModel: AppViewModel) {
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        // Personas Horizontal List Selector
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState())
-                .background(MaterialTheme.colorScheme.surface)
-                .padding(12.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            personasList.forEach { p ->
-                val isSelected = p.id == selectedPersonaId
-                Column(
-                    modifier = Modifier
-                        .clickable { viewModel.setDefaultPersona(p.id) }
-                        .padding(horizontal = 4.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(54.dp)
-                            .clip(CircleShape)
-                            .background(if (isSelected) p.color else p.color.copy(alpha = 0.15f)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = p.icon,
-                            contentDescription = p.name,
-                            tint = if (isSelected) Color.White else p.color,
-                            modifier = Modifier.size(24.dp)
+    MaterialTheme(colorScheme = personaAccentScheme) {
+        ModalNavigationDrawer(
+            drawerState = personaDrawerState,
+            gesturesEnabled = onPersonaSelected != null,
+            drawerContent = {
+                if (onPersonaSelected != null) {
+                    ModalDrawerSheet {
+                        ChatSidebar(
+                            sessions = personaSessions.filter { it.personaId == activePersonaId },
+                            currentSessionId = activeSessionId,
+                            onNewChat = {
+                                viewModel.startNewPersonaChat(activePersonaId)
+                                personaScope.launch { personaDrawerState.close() }
+                            },
+                            onSelect = {
+                                viewModel.selectPersonaChatSession(activePersonaId, it)
+                                personaScope.launch { personaDrawerState.close() }
+                            },
+                            onRename = viewModel::renameSession,
+                            onDelete = { viewModel.deletePersonaChatSession(activePersonaId, it) },
+                            onOpenSettings = {
+                                personaScope.launch {
+                                    personaDrawerState.close()
+                                    onOpenSettings?.invoke()
+                                }
+                            },
+                            personaItems = personaSidebarItems,
+                            selectedPersonaId = activePersonaId,
+                            syncIssue = conversationSyncStatus.error,
+                            onSelectPersona = { personaId ->
+                                personaScope.launch {
+                                    personaDrawerState.close()
+                                    onPersonaSelected(personaId)
+                                }
+                            }
                         )
                     }
-                    Spacer(modifier = Modifier.height(4.dp))
+                }
+            }
+        ) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(horizontal = 8.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (onPersonaSelected != null) {
+                IconButton(onClick = { personaScope.launch { personaDrawerState.open() } }) {
+                    Icon(Icons.Default.Menu, contentDescription = "قائمة الشخصيات")
+                }
+            }
+            Icon(activePersona.icon, contentDescription = null, tint = activePersona.color)
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(activePersona.name, fontWeight = FontWeight.Bold, color = activePersona.color)
+            }
+            if (onBack != null) {
+                TextButton(onClick = onBack) {
                     Text(
-                        p.name,
-                        fontSize = 11.sp,
-                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                        color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                        if (personaOnlyId == "hasan" || personaOnlyId == "jana") "اختيار صديق آخر"
+                        else "العودة للشخصيات",
+                        color = activePersona.color
                     )
                 }
             }
+            UsageIndicatorCompact(
+                state = usageState,
+                onRefresh = viewModel::refreshUsage,
+                feature = quotaFeature,
+                onUpgrade = onOpenSubscription,
+                modifier = Modifier.padding(horizontal = 4.dp)
+            )
+            IconButton(onClick = { showAssistantSettings = true }) {
+                Icon(Icons.Default.Settings, contentDescription = "إعدادات ${activePersona.name}")
+            }
+        }
+
+        if (usageBanner(usageState, quotaFeature)?.level?.let { it != UsageLevel.NORMAL } == true) {
+            UsageBannerCard(
+                state = usageState,
+                onRefresh = viewModel::refreshUsage,
+                feature = quotaFeature,
+                onUpgrade = onOpenSubscription,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)
+            )
         }
 
         Divider()
-
-        // Banner Ad (took the place of the old large voice card)
-        BannerAdView(modifier = Modifier.fillMaxWidth())
 
         // Study Mode Active Banner
         val isStudyModeActive by viewModel.isStudyModeActive.collectAsState()
@@ -2295,15 +4148,15 @@ fun PersonasScreen(viewModel: AppViewModel) {
                         onClick = { viewModel.finishStudyAndGetReport() },
                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                        modifier = Modifier.height(32.dp)
+                        modifier = Modifier.heightIn(min = 40.dp)
                     ) {
-                        Text("إنهاء والتقرير 🎓", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        Text("إنهاء والتقرير 🎓", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                     }
                 }
             }
         }
 
-        Spacer(modifier = Modifier.height(48.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
         // Persona Chat History
         Box(
@@ -2322,15 +4175,15 @@ fun PersonasScreen(viewModel: AppViewModel) {
                         modifier = Modifier
                             .size(100.dp)
                             .clip(CircleShape)
-                            .background(activePersona.color.copy(alpha = 0.15f))
-                            .border(2.dp, activePersona.color.copy(alpha = 0.4f), CircleShape),
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.15f))
+                            .border(2.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f), CircleShape),
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
                             text = "H",
                             fontSize = 64.sp,
                             fontWeight = FontWeight.Black,
-                            color = activePersona.color
+                            color = MaterialTheme.colorScheme.primary
                         )
                     }
                 }
@@ -2349,9 +4202,8 @@ fun PersonasScreen(viewModel: AppViewModel) {
                         } else null
                         val visionAttachment = precedingUserMessage
                             ?.let { parseChatVisionMessage(it.content) }
-                        PersonaBubble(
-                            msg = msg,
-                            p = activePersona,
+                        ChatBubble(
+                            message = msg,
                             onSpeakClick = {
                                 viewModel.speakText(msg.content, msg.id, activePersona.id)
                             },
@@ -2360,6 +4212,7 @@ fun PersonasScreen(viewModel: AppViewModel) {
                             onRetryVision = if (visionAttachment != null) {
                                 { precedingUserMessage?.let { viewModel.retryPersonaVision(activePersona.id, it.id) } }
                             } else null,
+                            renderCoderContent = coderOnly,
                             feedbackQuestion = visionAttachment?.question
                                 ?: precedingUserMessage?.content,
                             onFeedbackSubmit = { responseId, question, reply, rating, note ->
@@ -2375,7 +4228,7 @@ fun PersonasScreen(viewModel: AppViewModel) {
                     }
                     if (isGenerating) {
                         item {
-                            TypingIndicator()
+                            TypingIndicator(thinkingState)
                         }
                     }
                 }
@@ -2392,7 +4245,7 @@ fun PersonasScreen(viewModel: AppViewModel) {
             ) {
                 Button(
                     onClick = { viewModel.explainAgainSimply() },
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(16.dp),
                     contentPadding = PaddingValues(vertical = 8.dp)
@@ -2403,7 +4256,7 @@ fun PersonasScreen(viewModel: AppViewModel) {
                 }
                 Button(
                     onClick = { viewModel.makeExamForMe() },
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary),
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(16.dp),
                     contentPadding = PaddingValues(vertical = 8.dp)
@@ -2416,97 +4269,183 @@ fun PersonasScreen(viewModel: AppViewModel) {
         }
 
         // Input Box
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(MaterialTheme.colorScheme.surface)
-                .padding(10.dp),
-            verticalAlignment = Alignment.CenterVertically
+        val hasPersonaInput = textInput.isNotBlank()
+        CompositionLocalProvider(
+            LocalLayoutDirection provides LayoutDirection.Ltr,
+            LocalMinimumInteractiveComponentSize provides 0.dp
         ) {
-            IconButton(
-                onClick = { showComposerSheet = true },
+            Column(
                 modifier = Modifier
-                    .padding(end = 4.dp)
-                    .background(activePersona.color.copy(alpha = 0.12f), CircleShape)
-                    .size(44.dp)
+                    .fillMaxWidth()
+                    .padding(horizontal = 10.dp)
+                    .padding(bottom = 8.dp)
+                    .shadow(2.dp, RoundedCornerShape(28.dp))
+                    .background(
+                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                        RoundedCornerShape(28.dp)
+                    )
+                    .padding(horizontal = 8.dp, vertical = 6.dp)
+                    .heightIn(min = 92.dp, max = 190.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Default.Add,
-                    contentDescription = "المرفقات والأدوات",
-                    tint = activePersona.color,
-                    modifier = Modifier.size(20.dp)
-                )
-            }
-
-            // Microphone/Voice Chat button
-            IconButton(
-                onClick = {
-                    if (isListeningToSpeech) {
-                        viewModel.stopSpeechRecognition()
-                    } else {
-                        if (ContextCompat.checkSelfPermission(
-                                context,
-                                Manifest.permission.RECORD_AUDIO
-                            ) == PackageManager.PERMISSION_GRANTED
-                        ) {
-                            showVoiceSetupDialog = true
+                CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+                    TextField(
+                        value = textInput,
+                        onValueChange = { textInput = it },
+                        placeholder = {
+                            Text(
+                                if (isListeningToSpeech) "جاري الاستماع لصوتك..."
+                                else "اكتب رسالة",
+                                style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 2
+                            )
+                        },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp, max = 120.dp),
+                        textStyle = MaterialTheme.typography.bodyLarge.copy(fontSize = 14.sp),
+                        colors = TextFieldDefaults.colors(
+                            focusedContainerColor = Color.Transparent,
+                            unfocusedContainerColor = Color.Transparent,
+                            disabledContainerColor = Color.Transparent,
+                            focusedIndicatorColor = Color.Transparent,
+                            unfocusedIndicatorColor = Color.Transparent,
+                            disabledIndicatorColor = Color.Transparent,
+                            cursorColor = MaterialTheme.colorScheme.primary
+                        ),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                        keyboardActions = KeyboardActions(onSend = {
+                            if (personaQuotaExhausted) {
+                                Toast.makeText(context, "استهلكت كل رسائلك. جدّد اشتراكك أو ارتقِ لخطة أعلى.", Toast.LENGTH_SHORT).show()
+                            } else if (!personaHasSufficientQuota) {
+                                Toast.makeText(context, "الرصيد لا يكفي لهذه العملية. اختر ميزة أقل تكلفة أو رقِّ اشتراكك.", Toast.LENGTH_SHORT).show()
+                            } else if (hasPersonaInput && !isGenerating) {
+                                viewModel.sendPersonaMessage(textInput, activePersonaId)
+                                textInput = ""
+                                viewModel.clearSpeechInput()
+                            }
+                        }),
+                        maxLines = 4
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(modifier = Modifier.size(40.dp), contentAlignment = Alignment.Center) {
+                        if (hasPersonaInput) {
+                            IconButton(
+                                onClick = {
+                                    if (personaQuotaExhausted) {
+                                        Toast.makeText(context, "استهلكت كل رسائلك. جدّد اشتراكك أو ارتقِ لخطة أعلى.", Toast.LENGTH_SHORT).show()
+                                    } else if (!personaHasSufficientQuota) {
+                                        Toast.makeText(context, "الرصيد لا يكفي لهذه العملية. اختر ميزة أقل تكلفة أو رقِّ اشتراكك.", Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        viewModel.sendPersonaMessage(textInput, activePersonaId)
+                                        textInput = ""
+                                        viewModel.clearSpeechInput()
+                                    }
+                                },
+                                enabled = !isGenerating && personaHasSufficientQuota,
+                                modifier = Modifier.size(40.dp)
+                                    .background(
+                                        if (!personaHasSufficientQuota) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.14f)
+                                        else MaterialTheme.colorScheme.primary,
+                                        CircleShape
+                                    )
+                            ) {
+                                Icon(
+                                    Icons.Default.ArrowUpward,
+                                    contentDescription = "إرسال",
+                                    tint = if (!personaHasSufficientQuota) MaterialTheme.colorScheme.onSurfaceVariant
+                                    else MaterialTheme.colorScheme.onPrimary,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
                         } else {
-                            speechPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                            IconButton(
+                                onClick = {
+                                    if (isListeningToSpeech) {
+                                        viewModel.stopSpeechRecognition()
+                                    } else if (ContextCompat.checkSelfPermission(
+                                            context,
+                                            Manifest.permission.RECORD_AUDIO
+                                        ) == PackageManager.PERMISSION_GRANTED
+                                    ) {
+                                        showVoiceSetupDialog = true
+                                    } else {
+                                        speechPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                    }
+                                },
+                                enabled = !isProcessingSpeech,
+                                modifier = Modifier.size(40.dp)
+                            ) {
+                                if (isProcessingSpeech) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(20.dp),
+                                        strokeWidth = 2.dp
+                                    )
+                                } else {
+                                    Icon(
+                                        if (isListeningToSpeech) Icons.Default.MicNone else Icons.Default.Mic,
+                                        contentDescription = if (isListeningToSpeech) "إيقاف التسجيل الصوتي" else "الإدخال الصوتي",
+                                        tint = if (isListeningToSpeech) Color.Red else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                            }
                         }
                     }
-                },
-                modifier = Modifier
-                    .padding(end = 4.dp)
-                    .background(
-                        if (isListeningToSpeech) Color.Red.copy(alpha = 0.2f) else activePersona.color.copy(alpha = 0.15f),
-                        CircleShape
-                    )
-                    .size(44.dp)
-            ) {
-                Icon(
-                    imageVector = if (isListeningToSpeech) Icons.Default.MicNone else Icons.Default.Mic,
-                    contentDescription = "التحدث بالصوت",
-                    tint = if (isListeningToSpeech) Color.Red else activePersona.color,
-                    modifier = Modifier.size(20.dp)
-                )
-            }
-
-            OutlinedTextField(
-                value = textInput,
-                onValueChange = { textInput = it },
-                placeholder = { 
-                    Text(
-                        if (isListeningToSpeech) "جاري الاستماع لصوتك..." else "اطرح سؤالاً على ${activePersona.name}..."
-                    ) 
-                },
-                modifier = Modifier.weight(1f),
-                shape = RoundedCornerShape(24.dp),
-                maxLines = 3,
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedTextColor = MaterialTheme.colorScheme.onSurface,
-                    unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
-                    cursorColor = activePersona.color,
-                    focusedPlaceholderColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
-                    unfocusedPlaceholderColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
-                    focusedBorderColor = activePersona.color,
-                    unfocusedBorderColor = activePersona.color.copy(alpha = 0.7f)
-                ),
-                trailingIcon = {
-                    if (textInput.isNotEmpty()) {
-                        IconButton(onClick = {
-                            viewModel.sendPersonaMessage(textInput)
-                            textInput = ""
-                            viewModel.clearSpeechInput()
-                        }) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.Send,
-                                contentDescription = "Send",
-                                tint = activePersona.color
-                            )
-                        }
+                    Spacer(Modifier.width(4.dp))
+                    IconButton(
+                        onClick = {
+                            showComposerPlugins = false
+                            showComposerSheet = true
+                        },
+                        modifier = Modifier.size(40.dp),
+                        enabled = !isGenerating
+                    ) {
+                        Icon(
+                            Icons.Default.Add,
+                            contentDescription = "فتح أدوات المحادثة",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    if (isListeningToSpeech) {
+                        SpeechWaveform(speechAmplitude, Modifier.padding(start = 6.dp))
+                    }
+                    Spacer(Modifier.weight(1f))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        ChatToolChip(
+                            label = "بحث",
+                            icon = Icons.Default.Language,
+                            selected = personaSearchEnabled,
+                            accentColor = sharedChatAccent,
+                            enabled = !personaQuotaExhausted && (
+                                personaSearchEnabled || (personaRemaining ?: 0) >= if (personaThinkingEnabled) 3 else 2
+                            ),
+                            onClick = {
+                                personaSearchEnabled = !personaSearchEnabled
+                                viewModel.setPersonaWebSearchEnabled(activePersonaId, personaSearchEnabled)
+                            }
+                        )
+                        ChatToolChip(
+                            label = "تفكير",
+                            icon = Icons.Default.Psychology,
+                            selected = personaThinkingEnabled,
+                            accentColor = sharedChatAccent,
+                            enabled = !personaQuotaExhausted && (
+                                personaThinkingEnabled || (personaRemaining ?: 0) >= if (personaSearchEnabled) 3 else 2
+                            ),
+                            onClick = {
+                                personaThinkingEnabled = !personaThinkingEnabled
+                                viewModel.setPersonaThinkingEnabled(activePersonaId, personaThinkingEnabled)
+                            }
+                        )
                     }
                 }
-            )
+            }
+        }
+    }
         }
     }
 
@@ -2579,11 +4518,12 @@ fun PersonasScreen(viewModel: AppViewModel) {
                     )
                     ChatComposerSheetAction(
                         icon = Icons.Default.VolumeUp,
-                        title = if (personaVoiceEnabled) "إيقاف القراءة التلقائية" else "قراءة الردود تلقائياً",
+                        title = if (personaAutoReadEnabled) "إيقاف القراءة التلقائية" else "قراءة الردود تلقائياً",
                         subtitle = "تشغيل صوت الردود الجديدة للشخصية الحالية",
-                        selected = personaVoiceEnabled,
+                        selected = personaAutoReadEnabled,
                         onClick = {
-                            viewModel.setPersonaAutoVoiceEnabled(!personaVoiceEnabled)
+                            personaAutoReadEnabled = !personaAutoReadEnabled
+                            viewModel.setPersonaAutoReadEnabled(activePersonaId, personaAutoReadEnabled)
                             closePersonaComposer {}
                         }
                     )
@@ -2598,7 +4538,11 @@ fun PersonasScreen(viewModel: AppViewModel) {
                         icon = Icons.Default.Image,
                         title = "الصور",
                         subtitle = "اختر صورة وسيتم ضغطها قبل الإرسال",
-                        onClick = { closePersonaComposer { imageLauncher.launch("image/*") } }
+                        onClick = { closePersonaComposer {                                                 imageLauncher.launch(
+                            androidx.activity.result.PickVisualMediaRequest(
+                                ActivityResultContracts.PickVisualMedia.ImageOnly
+                            )
+                        ) } }
                     )
                     ChatComposerSheetAction(
                         icon = Icons.Default.AttachFile,
@@ -2614,18 +4558,125 @@ fun PersonasScreen(viewModel: AppViewModel) {
                     )
                     ChatComposerSheetAction(
                         icon = Icons.Default.Psychology,
-                        title = if (thinkingModeEnabled) "إيقاف التفكير الأعمق" else "فكّر بعمق أكبر",
-                        subtitle = "فعّل نموذج التفكير قبل إرسال السؤال",
-                        selected = thinkingModeEnabled,
+                        title = if (personaThinkingEnabled) "إيقاف التفكير" else "تفعيل التفكير",
+                        subtitle = "استخدم البحث والتفكير المخصصين لهذا المساعد",
+                        selected = personaThinkingEnabled,
                         onClick = {
-                            val enabled = !thinkingModeEnabled
-                            viewModel.setThinkingModeEnabled(enabled)
+                            personaThinkingEnabled = !personaThinkingEnabled
+                            viewModel.setPersonaThinkingEnabled(activePersonaId, personaThinkingEnabled)
                             closePersonaComposer {}
                         }
                     )
                 }
             }
         }
+    }
+
+    if (showAssistantSettings) {
+        AlertDialog(
+            onDismissRequest = { showAssistantSettings = false },
+            title = {
+                Text("إعدادات ${activePersona.name}", color = activePersona.color)
+            },
+            text = {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("البحث على الإنترنت", fontWeight = FontWeight.SemiBold)
+                            Text("ابحث عن معلومات ومراجع حديثة.", style = MaterialTheme.typography.bodySmall)
+                        }
+                        Switch(
+                            checked = personaSearchEnabled,
+                            onCheckedChange = {
+                                personaSearchEnabled = it
+                                viewModel.setPersonaWebSearchEnabled(activePersonaId, it)
+                            }
+                        )
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("التفكير الأعمق", fontWeight = FontWeight.SemiBold)
+                            Text("فعّله للأسئلة التي تحتاج تحليلاً متأنياً.", style = MaterialTheme.typography.bodySmall)
+                        }
+                        Switch(
+                            checked = personaThinkingEnabled,
+                            onCheckedChange = {
+                                personaThinkingEnabled = it
+                                viewModel.setPersonaThinkingEnabled(activePersonaId, it)
+                            }
+                        )
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("قراءة الردود تلقائياً", fontWeight = FontWeight.SemiBold)
+                            Text("استخدم الصوت الطبيعي عند توفره.", style = MaterialTheme.typography.bodySmall)
+                        }
+                        Switch(
+                            checked = personaAutoReadEnabled,
+                            onCheckedChange = {
+                                personaAutoReadEnabled = it
+                                viewModel.setPersonaAutoReadEnabled(activePersonaId, it)
+                            }
+                        )
+                    }
+                    Text(
+                        "يحاول التطبيق استخدام Google WaveNet للصوت العربي، ثم ينتقل تلقائياً إلى صوت Gemini إذا لم تتوفر الخدمة.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(
+                            onClick = {
+                                viewModel.startNewPersonaChat(activePersonaId)
+                                showAssistantSettings = false
+                            }
+                        ) { Text("محادثة جديدة") }
+                        TextButton(
+                            onClick = {
+                                val fileName = "${activePersona.name}-محادثة.txt"
+                                    .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                                saveChatLauncher.launch(fileName)
+                            },
+                            enabled = currentMessages.isNotEmpty()
+                        ) { Text("حفظ نسخة") }
+                    }
+                    TextButton(
+                        onClick = { showClearChatConfirmation = true },
+                        enabled = currentMessages.isNotEmpty(),
+                        colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                    ) {
+                        Text("مسح رسائل هذه المحادثة")
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showAssistantSettings = false }) { Text("تم") }
+            }
+        )
+    }
+
+    if (showClearChatConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showClearChatConfirmation = false },
+            title = { Text("مسح المحادثة؟") },
+            text = { Text("سيتم حذف رسائل هذه المحادثة فقط. ستبقى المحادثات الأخرى محفوظة.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        viewModel.clearPersonaChat(activeSessionId)
+                        showClearChatConfirmation = false
+                        showAssistantSettings = false
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) { Text("مسح") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearChatConfirmation = false }) { Text("إلغاء") }
+            }
+        )
     }
 
     if (showVoiceSetupDialog) {
@@ -2674,9 +4725,15 @@ fun PersonaBubble(
         mutableStateOf<com.example.network.GeminiApiClient.FeedbackRating?>(null)
     }
     val isUser = msg.role == "user"
-    val align = if (isUser) Alignment.CenterEnd else Alignment.CenterStart
-    val containerColor = if (isUser) p.color else MaterialTheme.colorScheme.surfaceVariant
+    val containerColor = if (isUser) {
+        MaterialTheme.colorScheme.primary
+    } else {
+        MaterialTheme.colorScheme.surfaceVariant
+    }
     val contentColor = if (isUser) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
+    val contentDirection = LocalLayoutDirection.current
+    val authState by AuthManager.state.collectAsState()
+    val userPhoto = (authState as? AuthState.SignedIn)?.user?.photoUrl
     val visionAttachment = remember(msg.content) {
         if (isUser) parseChatVisionMessage(msg.content) else null
     }
@@ -2699,13 +4756,28 @@ fun PersonaBubble(
         }
     }
 
-    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = align) {
-        Card(
-            shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(containerColor = containerColor),
-            modifier = Modifier.widthIn(max = 280.dp)
+    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = if (isUser) Arrangement.Start else Arrangement.End,
+            verticalAlignment = Alignment.Top
         ) {
-            Column(modifier = Modifier.padding(12.dp)) {
+            if (isUser) {
+                ChatAvatar(photoUrl = userPhoto, isUser = true)
+                Spacer(Modifier.width(8.dp))
+            }
+            Card(
+                shape = RoundedCornerShape(
+                    topStart = 18.dp,
+                    topEnd = 18.dp,
+                    bottomStart = if (isUser) 4.dp else 18.dp,
+                    bottomEnd = if (isUser) 18.dp else 4.dp
+                ),
+                colors = CardDefaults.cardColors(containerColor = containerColor),
+                modifier = Modifier.widthIn(max = 280.dp)
+            ) {
+                CompositionLocalProvider(LocalLayoutDirection provides contentDirection) {
+                Column(modifier = Modifier.padding(12.dp)) {
                 if (isUser) {
                     if (visionAttachment != null) {
                         attachedImage?.let { image ->
@@ -2729,7 +4801,11 @@ fun PersonaBubble(
                         Text(msg.content, color = contentColor, fontSize = 13.sp)
                     }
                 } else {
-                    RichChatContent(content = msg.content, modifier = Modifier.fillMaxWidth())
+                    if (p.id == "coder") {
+                        CoderChatContent(content = msg.content, modifier = Modifier.fillMaxWidth())
+                    } else {
+                        RichChatContent(content = msg.content, modifier = Modifier.fillMaxWidth())
+                    }
                     if (!feedbackQuestion.isNullOrBlank()) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
@@ -2833,7 +4909,7 @@ fun PersonaBubble(
                             ) {
                                 Icon(Icons.Default.ContentCopy, "نسخ الرد", tint = contentColor, modifier = Modifier.size(16.dp))
                             }
-                            if (onSpeakClick != null) {
+                            if (onSpeakClick != null && msg.generatedImageUrl == null) {
                                 IconButton(onClick = onSpeakClick, modifier = Modifier.size(28.dp)) {
                                     Icon(
                                         imageVector = if (isActiveSpeech) {
@@ -2860,6 +4936,12 @@ fun PersonaBubble(
                     )
                 }
             }
+            }
+            }
+            if (!isUser) {
+                Spacer(Modifier.width(8.dp))
+                ChatAvatar(photoUrl = null, isUser = false)
+            }
         }
     }
 }
@@ -2867,150 +4949,7 @@ fun PersonaBubble(
 // ==================== ORGANIZER & SCHEDULER SCREEN ====================
 
 @Composable
-fun OrganizerScreen(viewModel: AppViewModel) {
-    val schedule by viewModel.userSchedule.collectAsState()
-    val isGenerating by viewModel.isGeneratingSchedule.collectAsState()
-    val confirmDelete by viewModel.organizerConfirmDelete.collectAsState()
-    var showDeleteConfirmation by remember { mutableStateOf(false) }
-
-    var ageInput by remember { mutableStateOf("") }
-    var occupation by remember { mutableStateOf("student") } // "student", "employee", "both"
-    var workSchoolTimings by remember { mutableStateOf("") }
-    var lessonTimings by remember { mutableStateOf("") }
-
-    var glassesOfWater by remember { mutableStateOf(0) }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        if (schedule == null) {
-            // Schedule builder form
-            Text("ابنِ جدولك اليومي المتكامل والصحي بالذكاء الاصطناعي:", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-
-            OutlinedTextField(
-                value = ageInput,
-                onValueChange = { ageInput = it },
-                label = { Text("كم عمرك؟") },
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            Text("ما هي طبيعة عملك أو دراستك؟", fontWeight = FontWeight.Bold, fontSize = 12.sp)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                listOf("student" to "طالب", "employee" to "موظف", "both" to "طالب وموظف").forEach { (occ, label) ->
-                    FilterChip(
-                        selected = occupation == occ,
-                        onClick = { occupation = occ },
-                        label = { Text(label) },
-                        modifier = Modifier.weight(1f)
-                    )
-                }
-            }
-
-            OutlinedTextField(
-                value = workSchoolTimings,
-                onValueChange = { workSchoolTimings = it },
-                label = { Text("مواعيد العمل أو المدرسة والمحاضرات اليومية") },
-                placeholder = { Text("مثال: من 8 صباحاً إلى 2 ظهراً") },
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            OutlinedTextField(
-                value = lessonTimings,
-                onValueChange = { lessonTimings = it },
-                label = { Text("مواعيد الدروس والمواد الإضافية بالملّي") },
-                placeholder = { Text("مثال: فيزياء السبت والثلاثاء 4 عصراً") },
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            Button(
-                onClick = {
-                    val age = ageInput.toIntOrNull() ?: 20
-                    viewModel.generateDailySchedule(age, occupation, workSchoolTimings, lessonTimings)
-                },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = !isGenerating && ageInput.isNotEmpty()
-            ) {
-                if (isGenerating) {
-                    CircularProgressIndicator(color = Color.White, modifier = Modifier.size(24.dp))
-                } else {
-                    Text("بناء جدول اليوم المتكامل ذكياً")
-                }
-            }
-        } else {
-            // Schedule View + health trackers
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                IconButton(onClick = {
-                    if (confirmDelete) showDeleteConfirmation = true
-                    else viewModel.clearSchedule()
-                }) {
-                    Icon(Icons.Default.Delete, contentDescription = "Clear Schedule", tint = Color.Red)
-                }
-                Text("جدولك اليومي المولد بالكامل:", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-            }
-
-            // Health & Water Trackers
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.1f))
-            ) {
-                Row(
-                    modifier = Modifier.padding(16.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column {
-                        Text("متابع شرب المياه اليومي 💧", fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                        Text("أكواب اليوم: $glassesOfWater / 8 أكواب", fontSize = 12.sp)
-                    }
-                    Button(
-                        onClick = { if (glassesOfWater < 12) glassesOfWater++ },
-                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-                    ) {
-                        Text("+ كوب ماء")
-                    }
-                }
-                if (showDeleteConfirmation) {
-                    AlertDialog(
-                        onDismissRequest = { showDeleteConfirmation = false },
-                        title = { Text("حذف الجدول؟") },
-                        text = { Text("سيتم حذف جدولك اليومي المحفوظ من هذا الجهاز.") },
-                        confirmButton = {
-                            TextButton(onClick = {
-                                viewModel.clearSchedule()
-                                showDeleteConfirmation = false
-                            }) {
-                                Text("حذف", color = MaterialTheme.colorScheme.error)
-                            }
-                        },
-                        dismissButton = {
-                            TextButton(onClick = { showDeleteConfirmation = false }) {
-                                Text("إلغاء")
-                            }
-                        }
-                    )
-                }
-            }
-
-            // Generated Schedule details
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(12.dp))
-                    .padding(16.dp)
-            ) {
-                Text(schedule?.scheduleText.orEmpty(), fontSize = 13.sp)
-            }
-        }
-    }
-}
+fun OrganizerScreen(viewModel: AppViewModel) = AcademicOrganizerScreen(viewModel)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -3086,20 +5025,13 @@ fun QuranCoachScreen(viewModel: AppViewModel) {
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        Text(
-            "تجويد القرآن",
-            fontSize = 22.sp,
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.primary
+        HubSectionHeading(
+            title = "تجويد القرآن",
+            description = "اختر السورة والآية، ثم سجّل تلاوتك لتحصل على ملاحظات مختصرة."
         )
-        Text(
-            "اختر السورة والآية، ثم سجّل تلاوتك لتحصل على ملاحظات مختصرة.",
-            fontSize = 13.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Card(
+        HubCard(
             modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+            accentColor = AccentColors.Quran
         ) {
             Column(
                 modifier = Modifier.fillMaxWidth().padding(14.dp),
@@ -3167,7 +5099,7 @@ fun QuranCoachScreen(viewModel: AppViewModel) {
         Box(modifier = Modifier.fillMaxWidth()) {
             OutlinedButton(
                 onClick = { isSurahMenuExpanded = true },
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().smartCatActionHeight(),
                 enabled = !isLoadingQuran
             ) {
                 Text(
@@ -3195,7 +5127,7 @@ fun QuranCoachScreen(viewModel: AppViewModel) {
         Box(modifier = Modifier.fillMaxWidth()) {
             OutlinedButton(
                 onClick = { isAyahMenuExpanded = true },
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().smartCatActionHeight(),
                 enabled = selectedSurah != null && !isLoadingAyahs && ayahs.isNotEmpty()
             ) {
                 Text(
@@ -3245,14 +5177,14 @@ fun QuranCoachScreen(viewModel: AppViewModel) {
         ) {
             OutlinedButton(
                 onClick = { viewModel.playQuranReciterSurah(6, "محمود خليل الحصري") },
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1f).smartCatActionHeight(),
                 enabled = selectedSurah != null
             ) {
                 Text(if (reciterName?.startsWith("محمود خليل الحصري") == true) "إيقاف الحصري" else "الحصري")
             }
             OutlinedButton(
                 onClick = { viewModel.playQuranReciterSurah(9, "محمد صديق المنشاوي") },
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1f).smartCatActionHeight(),
                 enabled = selectedSurah != null
             ) {
                 Text(if (reciterName?.startsWith("محمد صديق المنشاوي") == true) "إيقاف المنشاوي" else "المنشاوي")
@@ -3270,7 +5202,7 @@ fun QuranCoachScreen(viewModel: AppViewModel) {
                 if (hasMicrophonePermission) viewModel.startQuranRecording()
                 else permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
             },
-            modifier = Modifier.fillMaxWidth().height(58.dp),
+            modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
             enabled = selectedSurah != null && selectedAyah != null && !isRecording && !isChecking
         ) {
             Icon(Icons.Default.Mic, contentDescription = null)
@@ -3280,7 +5212,7 @@ fun QuranCoachScreen(viewModel: AppViewModel) {
         if (isRecording) {
             OutlinedButton(
                 onClick = { viewModel.stopQuranRecordingAndCheck() },
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth().smartCatActionHeight()
             ) {
                 Icon(Icons.Default.Stop, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
@@ -3359,7 +5291,7 @@ fun QuranCoachScreen(viewModel: AppViewModel) {
                                 }
                                 context.startActivity(Intent.createChooser(shareIntent, "مشاركة نتيجة التلاوة"))
                             },
-                            modifier = Modifier.weight(1f)
+                            modifier = Modifier.weight(1f).smartCatActionHeight()
                         ) {
                             Icon(Icons.Default.Share, contentDescription = null)
                             Spacer(Modifier.width(6.dp))
@@ -3375,7 +5307,7 @@ fun QuranCoachScreen(viewModel: AppViewModel) {
                                     permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                                 }
                             },
-                            modifier = Modifier.weight(1f)
+                            modifier = Modifier.weight(1f).smartCatActionHeight()
                         ) {
                             Icon(Icons.Default.Replay, contentDescription = null)
                             Spacer(Modifier.width(6.dp))
@@ -3548,6 +5480,7 @@ fun SettingsDialog(
                         .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
+                    AccountSection()
                     if (section == AppScreen.CHAT) {
                     Column(
                         modifier = Modifier
@@ -3821,18 +5754,15 @@ fun SettingsDialog(
                                 Text("إعدادات شخصيات AI", fontWeight = FontWeight.Bold)
                                 Text("الشخصية الافتراضية")
                                 listOf(
-                                    "hasan" to "حسن",
-                                    "jana" to "ريتاج",
-                                    "teacher" to "المعلم",
-                                    "coder" to "Coder AI",
+                                    "teacher" to "أ. أحمد",
                                     "doctor" to "د. خالد",
                                     "business" to "أ. سمير",
                                     "legal" to "المستشار عادل",
                                     "sheikh" to "الشيخ عبد الرحمن",
                                     "coach" to "الكابتن فهد",
-                                    "designer" to "المصممة آيه",
+                                    "designer" to "المصممة آية",
                                     "chef" to "الشيف مراد",
-                                    "nanny" to "المربية فاطمة"
+                                    "nanny" to "المربية أسماء"
                                 ).forEach { (id, name) ->
                                     Row(
                                         Modifier.fillMaxWidth().clickable { viewModel.setDefaultPersona(id) },
@@ -4069,8 +5999,8 @@ fun VoiceSetupDialog(
                                     tint = if (selectedVoice == "hasan") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
                                     modifier = Modifier.size(32.dp)
                                 )
-                                Text("حسن (صوت ولد)", fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                                Text("صوت ذكوري مصري عميق", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+                                Text("حسن (نبرة أخفض)", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                Text("الصوت العربي على الجهاز بنبرة أخفض", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
                             }
                         }
 
@@ -4098,8 +6028,8 @@ fun VoiceSetupDialog(
                                     tint = if (selectedVoice == "jana") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
                                     modifier = Modifier.size(32.dp)
                                 )
-                                Text("ريتاج (صوت بنت)", fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                                Text("صوت أنثوي مصري رقيق", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+                                Text("ريتاج (نبرة أعلى)", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                Text("الصوت العربي على الجهاز بنبرة أعلى", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
                             }
                         }
                     }

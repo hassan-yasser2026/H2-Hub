@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -26,7 +27,10 @@ import java.util.concurrent.TimeUnit
 
 object PushNotifications {
     const val CHANNEL_ID = "h2_push_notifications"
-    const val CHANNEL_NAME = "إشعارات H2 Hub"
+    const val CHAT_CHANNEL_ID = "chat_replies"
+    const val QURAN_CHANNEL_ID = "quran_reminders"
+    const val STUDY_CHANNEL_ID = "study_reminders"
+    const val UPDATE_CHANNEL_ID = "app_updates"
 
     private const val PREFS_NAME = "h2_push_notifications"
     private const val KEY_REGISTERED_TOKEN = "registered_token"
@@ -37,18 +41,41 @@ object PushNotifications {
         .readTimeout(15, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
         .build()
+    private val _navigationRequests =
+        kotlinx.coroutines.flow.MutableStateFlow<NotificationNavigation?>(null)
+    val navigationRequests: kotlinx.coroutines.flow.StateFlow<NotificationNavigation?> =
+        _navigationRequests
+
+    fun openNotificationIntent(intent: Intent?) {
+        val target = intent?.getStringExtra(MainActivity.EXTRA_NOTIFICATION_TARGET)
+            ?: intent?.data?.host
+        if (target.isNullOrBlank()) return
+        _navigationRequests.value = NotificationNavigation(
+            eventId = System.nanoTime(),
+            target = target,
+            sessionId = intent?.getStringExtra(MainActivity.EXTRA_CHAT_SESSION_ID),
+            speakText = intent?.getStringExtra(MainActivity.EXTRA_SPEAK_TEXT),
+            notificationId = intent?.getStringExtra(MainActivity.EXTRA_CHAT_JOB_ID)
+        )
+    }
+
+    fun clearNavigationRequest(eventId: Long) {
+        if (_navigationRequests.value?.eventId == eventId) _navigationRequests.value = null
+    }
 
     fun createChannel(context: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                CHANNEL_NAME,
-                NotificationManager.IMPORTANCE_DEFAULT
-            ).apply {
-                description = "تنبيهات وإعلانات H2 Hub"
+            val manager = context.getSystemService(NotificationManager::class.java)
+            listOf(
+                NotificationChannel(CHANNEL_ID, "إشعارات H2 Hub", NotificationManager.IMPORTANCE_DEFAULT),
+                NotificationChannel(CHAT_CHANNEL_ID, "ردود Smart Cat", NotificationManager.IMPORTANCE_DEFAULT),
+                NotificationChannel(QURAN_CHANNEL_ID, "تذكيرات القرآن", NotificationManager.IMPORTANCE_DEFAULT),
+                NotificationChannel(STUDY_CHANNEL_ID, "تذكيرات الدراسة", NotificationManager.IMPORTANCE_DEFAULT),
+                NotificationChannel(UPDATE_CHANNEL_ID, "تحديثات التطبيق", NotificationManager.IMPORTANCE_LOW)
+            ).forEach { channel ->
+                channel.description = "إشعارات H2 Hub"
+                manager.createNotificationChannel(channel)
             }
-            context.getSystemService(NotificationManager::class.java)
-                .createNotificationChannel(channel)
         }
     }
 
@@ -116,18 +143,78 @@ object PushNotifications {
         }.start()
     }
 
+    fun registeredToken(context: Context): String? =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(KEY_REGISTERED_TOKEN, null)
+            ?.takeIf(String::isNotBlank)
+
     fun showNotification(context: Context, title: String, body: String) {
+        showTypedNotification(context, "general", title, body)
+    }
+
+    fun showTypedNotification(
+        context: Context,
+        type: String,
+        title: String,
+        body: String,
+        target: String = "",
+        sessionId: String = "",
+        speakText: String? = null,
+        jobId: String = "",
+        ignorePreference: Boolean = false,
+    ) {
         if (!hasNotificationPermission(context)) return
+        val preferenceKey = when (type) {
+            "chat_reply" -> NotificationScheduler.KEY_CHAT_ENABLED
+            "quran_reminder" -> NotificationScheduler.KEY_QURAN_ENABLED
+            "study_reminder" -> NotificationScheduler.KEY_STUDY_ENABLED
+            "quiz_result" -> NotificationScheduler.KEY_QUIZ_ENABLED
+            "app_update" -> NotificationScheduler.KEY_UPDATES_ENABLED
+            else -> null
+        }
+        if (!ignorePreference && preferenceKey != null && !NotificationScheduler.isEnabled(
+                context,
+                preferenceKey,
+                defaultValue = type == "chat_reply" || type == "app_update"
+            )
+        ) {
+            return
+        }
         createChannel(context)
+        val notificationId = when (type) {
+            "chat_reply" -> (sessionId.hashCode() xor System.currentTimeMillis().toInt()) and 0x7fffffff
+            "quran_reminder" -> 743
+            else -> (type.hashCode() xor (System.currentTimeMillis() / 60_000L).toInt()) and 0x7fffffff
+        }
+        val deepLink = when (target) {
+            "chat" -> "h2hub://chat/$sessionId"
+            "quran" -> "h2hub://quran"
+            "organizer" -> "h2hub://organizer"
+            "learning_profile" -> "h2hub://learning-profile"
+            else -> "h2hub://home"
+        }
+        val openIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            data = Uri.parse(deepLink)
+            putExtra(MainActivity.EXTRA_NOTIFICATION_TARGET, target)
+            if (sessionId.isNotBlank()) putExtra(MainActivity.EXTRA_CHAT_SESSION_ID, sessionId)
+            if (!speakText.isNullOrBlank()) putExtra(MainActivity.EXTRA_SPEAK_TEXT, speakText)
+            if (jobId.isNotBlank()) putExtra(MainActivity.EXTRA_CHAT_JOB_ID, jobId)
+        }
         val openApp = PendingIntent.getActivity(
             context,
-            System.currentTimeMillis().toInt(),
-            Intent(context, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-            },
+            notificationId,
+            openIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+        val channelId = when (type) {
+            "chat_reply" -> CHAT_CHANNEL_ID
+            "quran_reminder" -> QURAN_CHANNEL_ID
+            "study_reminder" -> STUDY_CHANNEL_ID
+            "app_update", "quiz_result" -> UPDATE_CHANNEL_ID
+            else -> CHANNEL_ID
+        }
+        val builder = NotificationCompat.Builder(context, channelId)
             .setSmallIcon(R.drawable.ic_stat_h2hub)
             .setContentTitle(title.ifBlank { "H2 Hub" })
             .setContentText(body)
@@ -135,17 +222,50 @@ object PushNotifications {
             .setContentIntent(openApp)
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-            .build()
+            .setNumber(NotificationManagerCompat.from(context).activeNotifications.size + 1)
+
+        when (type) {
+            "chat_reply" -> {
+                builder.addAction(0, "افتح", openApp)
+                val dismiss = PendingIntent.getBroadcast(
+                    context,
+                    notificationId + 1,
+                    Intent(context, NotificationActionReceiver::class.java)
+                        .setAction(NotificationActionReceiver.ACTION_DISMISS)
+                        .putExtra(NotificationActionReceiver.EXTRA_NOTIFICATION_ID, notificationId),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                builder.addAction(0, "تجاهل", dismiss)
+            }
+            "quran_reminder" -> {
+                if (!speakText.isNullOrBlank()) builder.addAction(0, "اسمع الآية", openApp)
+                val snooze = PendingIntent.getBroadcast(
+                    context,
+                    notificationId + 2,
+                    Intent(context, NotificationActionReceiver::class.java)
+                        .setAction(NotificationActionReceiver.ACTION_SNOOZE_QURAN)
+                        .putExtra(NotificationActionReceiver.EXTRA_NOTIFICATION_ID, notificationId),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                builder.addAction(0, "تأجيل 10 دقائق", snooze)
+            }
+            "study_reminder" -> builder.addAction(0, "افتح المنظم", openApp)
+        }
         try {
-            NotificationManagerCompat.from(context).notify(
-                System.currentTimeMillis().toInt(),
-                notification
-            )
+            NotificationManagerCompat.from(context).notify(notificationId, builder.build())
         } catch (_: SecurityException) {
             Log.w(TAG, "Notification permission is not granted.")
         }
     }
 }
+
+data class NotificationNavigation(
+    val eventId: Long,
+    val target: String,
+    val sessionId: String?,
+    val speakText: String?,
+    val notificationId: String?,
+)
 
 class H2FirebaseMessagingService : FirebaseMessagingService() {
     override fun onNewToken(token: String) {
@@ -157,11 +277,39 @@ class H2FirebaseMessagingService : FirebaseMessagingService() {
         val title = message.notification?.title ?: message.data["title"].orEmpty()
         val body = message.notification?.body ?: message.data["body"].orEmpty()
         if (title.isNotBlank() || body.isNotBlank()) {
-            PushNotifications.showNotification(
+            PushNotifications.showTypedNotification(
                 applicationContext,
+                message.data["type"].orEmpty(),
                 title.ifBlank { "H2 Hub" },
-                body
+                body,
+                target = message.data["target"].orEmpty(),
+                sessionId = message.data["sessionId"].orEmpty(),
+                jobId = message.data["jobId"].orEmpty()
             )
         }
+
+    }
+}
+
+class NotificationActionReceiver : android.content.BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        when (intent?.action) {
+            ACTION_DISMISS -> {
+                val id = intent.getIntExtra(EXTRA_NOTIFICATION_ID, -1)
+                if (id >= 0) NotificationManagerCompat.from(context).cancel(id)
+            }
+            ACTION_SNOOZE_QURAN -> {
+                NotificationManagerCompat.from(context).cancel(
+                    intent.getIntExtra(EXTRA_NOTIFICATION_ID, 743)
+                )
+                NotificationScheduler.scheduleQuranTest(context, delayMinutes = 10)
+            }
+        }
+    }
+
+    companion object {
+        const val ACTION_DISMISS = "com.example.action.DISMISS_NOTIFICATION"
+        const val ACTION_SNOOZE_QURAN = "com.example.action.SNOOZE_QURAN"
+        const val EXTRA_NOTIFICATION_ID = "notification_id"
     }
 }

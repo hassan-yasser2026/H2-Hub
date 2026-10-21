@@ -18,19 +18,30 @@ android {
     applicationId = "com.aistudio.h2hub.nqpwbz"
     minSdk = 24
     targetSdk = 36
-    versionCode = 3
-    versionName = "1.2.0"
+    versionCode = 9
+    versionName = "1.3.5"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 
   signingConfigs {
     create("release") {
-      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
-      storeFile = file(keystorePath)
-      storePassword = System.getenv("STORE_PASSWORD")
-      keyAlias = "upload"
-      keyPassword = System.getenv("KEY_PASSWORD")
+      val keystorePath = System.getenv("RELEASE_KEYSTORE_PATH") ?: rootProject.file("release-key.jks").path
+      val releaseStorePassword = System.getenv("RELEASE_STORE_PASSWORD")
+      val releaseKeyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+      val isReleaseSigningConfigured = !releaseStorePassword.isNullOrBlank() && !releaseKeyPassword.isNullOrBlank() && file(keystorePath).exists()
+
+      if (isReleaseSigningConfigured) {
+        storeFile = file(keystorePath)
+        this.storePassword = releaseStorePassword
+        keyAlias = System.getenv("RELEASE_KEY_ALIAS") ?: "h2hub-upload"
+        this.keyPassword = releaseKeyPassword
+      } else {
+        storeFile = file("${rootDir}/debug.keystore")
+        this.storePassword = "android"
+        keyAlias = "androiddebugkey"
+        this.keyPassword = "android"
+      }
     }
     create("debugConfig") {
       storeFile = file("${rootDir}/debug.keystore")
@@ -60,11 +71,10 @@ android {
   testOptions { unitTests { isIncludeAndroidResources = true } }
 }
 
-// Configure the Secrets Gradle Plugin to use .env and .env.example files
-// to match the convention used in Web projects.
+// Keep Android build properties separate from server secrets in the root .env file.
 secrets {
-  propertiesFileName = ".env"
-  defaultPropertiesFileName = ".env.example"
+  propertiesFileName = "app/android.properties"
+  defaultPropertiesFileName = "app/android-defaults.properties"
 }
 
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
@@ -86,7 +96,9 @@ dependencies {
   implementation(libs.androidx.compose.ui)
   implementation(libs.androidx.compose.ui.graphics)
   implementation(libs.androidx.compose.ui.tooling.preview)
+  implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.34.0")
   implementation(libs.androidx.core.ktx)
+  implementation(libs.androidx.exifinterface)
   // implementation(libs.androidx.datastore.preferences)
   implementation(libs.androidx.lifecycle.runtime.compose)
   implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -94,21 +106,22 @@ dependencies {
   implementation(libs.androidx.navigation.compose)
   implementation(libs.androidx.room.ktx)
   implementation(libs.androidx.room.runtime)
+  implementation(libs.androidx.work.runtime.ktx)
   implementation(libs.coil.compose)
   implementation(libs.converter.moshi)
   implementation(libs.firebase.ai)
-  // Uncomment to use Firestore:
+  implementation(libs.firebase.firestore)
   implementation(libs.firebase.messaging)
-  // implementation(libs.firebase.firestore)
 
   // Firebase Auth with Google Sign-In requires all of the following to be uncommented together.
   // If you are using Firebase Auth with other providers (e.g. Email/Password), you may only need
   // firebase-auth.
-  // implementation(libs.firebase.auth)
-  // implementation(libs.androidx.credentials)
-  // implementation(libs.androidx.credentials.play.services)
-  // implementation(libs.googleid)
-  implementation(libs.firebase.appcheck.recaptcha)
+  implementation(libs.firebase.auth)
+  implementation(libs.androidx.credentials)
+  implementation(libs.androidx.credentials.play.services)
+  implementation(libs.googleid)
+  implementation(libs.firebase.appcheck.playintegrity)
+  debugImplementation(libs.firebase.appcheck.debug)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
   implementation(libs.logging.interceptor)

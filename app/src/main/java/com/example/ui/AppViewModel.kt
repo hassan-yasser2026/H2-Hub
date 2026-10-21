@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.os.Build
@@ -16,30 +17,48 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.content.Intent
 import android.os.Bundle
-import android.util.Base64
 import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.*
+import com.example.auth.AuthManager
+import com.example.auth.AuthState
+import com.example.network.ApiDeviceIdentity
 import com.example.network.GeminiApiClient
+import com.example.network.QuotaEvents
+import com.example.network.QuotaExceededException
+import com.example.network.SubscriptionApiClient
+import com.example.network.SubscriptionDeviceId
+import com.example.network.UsageSnapshot
+import com.example.network.ConversationSummaryWorker
+import com.example.network.parseQuotaError
 import com.example.network.encodeChatVisionMessage
 import com.example.network.parseChatVisionMessage
 import com.example.network.QuranAyah
 import com.example.network.QuranCoachApiClient
 import com.example.network.QuranRecitationResult
 import com.example.network.QuranSurah
-import com.example.QuranReminderReceiver
+import com.example.NotificationScheduler
+import com.example.OrganizerReminderScheduler
+import com.example.PushNotifications
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.io.IOException
 import java.util.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 private const val KEY_SOCRATIC_MODE = "socratic_mode_enabled"
 private const val KEY_EDUCATIONAL_CONTENT_MODE = "educational_content_mode_enabled"
@@ -58,7 +77,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val context = application.applicationContext
     private val prefs = context.getSharedPreferences("h2hub_prefs", Context.MODE_PRIVATE)
     private val database = AppDatabase.getDatabase(context)
-    private val repository = AppRepository(database.appDao())
+    private val conversationSync = FirestoreConversationSync(
+        context,
+        database.appDao(),
+        viewModelScope
+    )
+    private val repository = AppRepository(database.appDao(), conversationSync)
+    private val _conversationSyncReady = MutableStateFlow(false)
+    val conversationSyncReady: StateFlow<Boolean> = _conversationSyncReady.asStateFlow()
+    val conversationSyncStatus: StateFlow<ConversationSyncStatus> = conversationSync.status
+    private val organizerDao = OrganizerDatabase.getDatabase(context).organizerDao()
     private val learningRepository = LearningProfileRepository(
         LearningProfileDatabase.getDatabase(context).learningProfileDao()
     )
@@ -78,16 +106,28 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         var utteranceBaseOffset: Int = 0
     )
     private var speechSession: SpeechSession? = null
+    private var remoteSpeechJob: Job? = null
+    private var remoteSpeechPlayer: MediaPlayer? = null
+    private var remoteSpeechFile: File? = null
+    private var remoteSpeechPrepared = false
 
     private var quranMediaRecorder: MediaRecorder? = null
     private var quranRecordingFile: File? = null
     private var quranReciterPlayer: MediaPlayer? = null
     private var quranReciterPlaybackJob: Job? = null
+    private var generatedImageSpeechPlayer: MediaPlayer? = null
+    private var generatedImageSpeechFile: File? = null
 
     init {
         // Initialize Android TextToSpeech
         textToSpeech = TextToSpeech(context) { status ->
             if (status == TextToSpeech.SUCCESS) {
+                textToSpeech?.setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
                 textToSpeech?.language = Locale.forLanguageTag("ar")
                 textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {
@@ -154,37 +194,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 _activeSpeechId.value = null
             }
         }
-        viewModelScope.launch {
-            try {
-                learningRepository.refreshUserProfile()
-                repository.allSessions.first().forEach { session ->
-                    learningRepository.mirrorConversation(
-                        id = session.id,
-                        title = session.title,
-                        startedAt = session.timestamp,
-                        messages = repository.getMessagesForSession(session.id)
-                    )
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to sync existing chat history to the learning profile", e)
-            }
-        }
     }
 
     // --- Safety System Guidelines (Prompt Prefix) ---
     private val safetySystemInstruction = """
         IMPORTANT - SAFETY RULES:
-        1. Strict Anti-Cheating: If a student asks for answers to exam questions, you MUST NOT give direct copy-paste solutions. Instead, analyze the question conceptually and guide the student step-by-step so they can solve it themselves. Encourage thinking.
-        2. Strict Ethics Layer: Completely reject any requests to generate or assist with illegal, unethical, harmful, inappropriate, or religiously offensive content (حرام/مخالف للدين والقانون).
-        3. Do not help with academic fraud, cheating, hacking, or generating malicious code.
-
-        $SMART_CHAT_MATH_INSTRUCTION
+        1. Refuse requests that facilitate harm, abuse, illegal activity, or evasion of an active assessment.
+        2. For ordinary learning and homework, answer the user's request helpfully and explain the reasoning.
+        3. Do not fabricate facts, citations, capabilities, or actions.
     """.trimIndent()
 
     // --- State Holders ---
 
     // 1. Chat States
     val chatSessions: StateFlow<List<ChatSession>> = repository.allSessions
+        .map { sessions -> sessions.sortedByDescending { it.updatedAt }.take(50) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     private val _currentSessionId = MutableStateFlow<String?>(null)
@@ -205,6 +229,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _socraticProgress = MutableStateFlow(SocraticProgress())
     val socraticProgress: StateFlow<SocraticProgress> = _socraticProgress.asStateFlow()
+    private val _conversationMemory = MutableStateFlow(GeminiApiClient.ConversationMemory(emptyList(), emptyList(), "", 0))
+    val conversationMemory: StateFlow<GeminiApiClient.ConversationMemory> = _conversationMemory.asStateFlow()
+    private val _conversationMemoryError = MutableStateFlow<String?>(null)
+    val conversationMemoryError: StateFlow<String?> = _conversationMemoryError.asStateFlow()
 
     val learningQuestionCount: StateFlow<Int> = learningRepository.questionCount
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
@@ -232,12 +260,92 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _isGeneratingChat = MutableStateFlow(false)
     val isGeneratingChat: StateFlow<Boolean> = _isGeneratingChat.asStateFlow()
 
+    private val subscriptionApi = SubscriptionApiClient()
+    private val _usageState = MutableStateFlow(UsageState())
+    val usageState: StateFlow<UsageState> = _usageState.asStateFlow()
+
+    /** Explicit, read-only refresh; the usage endpoint does not consume quota. */
+    fun refreshUsage() {
+        if (_usageState.value.loading) return
+        viewModelScope.launch {
+            _usageState.value = _usageState.value.copy(loading = true, error = null)
+            try {
+                val snapshot = subscriptionApi.usage(SubscriptionDeviceId.get(context))
+                _usageState.value = UsageState(snapshot = snapshot)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _usageState.value = _usageState.value.copy(
+                    loading = false,
+                    error = e.message ?: "تعذر تحميل حدود الاستخدام."
+                )
+            }
+        }
+    }
+
+    init {
+        ApiDeviceIdentity.install(context)
+        viewModelScope.launch { QuotaEvents.events.collect(::onQuotaExceeded) }
+        refreshUsage()
+    }
+
+    private fun onQuotaExceeded(error: QuotaExceededException) {
+        _usageState.value = _usageState.value.withExhausted(error.feature, error.used, error.limit)
+        _chatActionError.value = error.message
+        refreshUsage()
+    }
+
     private val _chatActionError = MutableStateFlow<String?>(null)
     val chatActionError: StateFlow<String?> = _chatActionError.asStateFlow()
 
     val useThinkingMode = MutableStateFlow(
         prefs.getBoolean("thinking_mode_enabled", false)
     )
+
+    val webSearchEnabled = MutableStateFlow(prefs.getBoolean("chat_web_search_enabled", false))
+    val groqThinkingEnabled = MutableStateFlow(prefs.getBoolean("chat_groq_thinking_enabled", false))
+    val imageGenerationEnabled = MutableStateFlow(prefs.getBoolean("chat_image_generation_enabled", false))
+    private val _imageGenerationAvailable = MutableStateFlow(false)
+    val imageGenerationAvailable: StateFlow<Boolean> = _imageGenerationAvailable.asStateFlow()
+
+    private val _thinkingState = MutableStateFlow<String?>(null)
+    val thinkingState: StateFlow<String?> = _thinkingState.asStateFlow()
+
+    fun setWebSearchEnabled(enabled: Boolean) {
+        webSearchEnabled.value = enabled
+        prefs.edit().putBoolean("chat_web_search_enabled", enabled).apply()
+    }
+
+    fun personaWebSearchEnabled(personaId: String): Boolean =
+        prefs.getBoolean("persona_${personaId}_web_search", false)
+
+    fun setPersonaWebSearchEnabled(personaId: String, enabled: Boolean) {
+        prefs.edit().putBoolean("persona_${personaId}_web_search", enabled).apply()
+    }
+
+    fun setGroqThinkingEnabled(enabled: Boolean) {
+        groqThinkingEnabled.value = enabled
+        prefs.edit().putBoolean("chat_groq_thinking_enabled", enabled).apply()
+    }
+
+    fun personaThinkingEnabled(personaId: String): Boolean =
+        prefs.getBoolean("persona_${personaId}_thinking", false)
+
+    fun setPersonaThinkingEnabled(personaId: String, enabled: Boolean) {
+        prefs.edit().putBoolean("persona_${personaId}_thinking", enabled).apply()
+    }
+
+    fun setImageGenerationEnabled(enabled: Boolean) {
+        imageGenerationEnabled.value = enabled
+        prefs.edit().putBoolean("chat_image_generation_enabled", enabled).apply()
+    }
+
+    fun refreshImageGenerationAvailability() {
+        viewModelScope.launch {
+            _imageGenerationAvailable.value = GeminiApiClient.isImageGenerationEnabled()
+            if (!_imageGenerationAvailable.value) setImageGenerationEnabled(false)
+        }
+    }
 
     fun setThinkingModeEnabled(enabled: Boolean) {
         useThinkingMode.value = enabled
@@ -271,11 +379,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 throw error
             } catch (error: IOException) {
                 Log.w(TAG, "Failed to generate a study set", error)
-                _studySetError.value = error.localizedMessage
-                    ?: "تعذر إنشاء المراجعة. حاول مرة أخرى."
+                _studySetError.value = GeminiApiClient.friendlyErrorMessage(error)
             } catch (error: Exception) {
                 Log.e(TAG, "Unexpected study set generation failure", error)
-                _studySetError.value = "حدث خطأ غير متوقع أثناء إنشاء المراجعة."
+                _studySetError.value = GeminiApiClient.friendlyErrorMessage(error)
             } finally {
                 _isGeneratingStudySet.value = false
             }
@@ -297,6 +404,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         totalQuestions = totalQuestions,
                         completedAt = System.currentTimeMillis()
                     )
+                )
+                PushNotifications.showTypedNotification(
+                    context,
+                    "quiz_result",
+                    "✅ نتيجة الاختبار جاهزة",
+                    "$title: ${score.coerceIn(0, totalQuestions)}/$totalQuestions",
+                    target = "learning_profile"
                 )
             } catch (error: Exception) {
                 Log.e(TAG, "Failed to save local quiz result", error)
@@ -347,10 +461,133 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _personaMessages = MutableStateFlow<Map<String, List<ChatMessage>>>(emptyMap())
     val personaMessages: StateFlow<Map<String, List<ChatMessage>>> = _personaMessages.asStateFlow()
+    private val personaSessionMutex = Mutex()
+    private val _activePersonaSessionIds = MutableStateFlow<Map<String, String>>(emptyMap())
+    val activePersonaSessionIds: StateFlow<Map<String, String>> = _activePersonaSessionIds.asStateFlow()
+
+    fun personaMessagesFor(sessionId: String): Flow<List<ChatMessage>> =
+        repository.getMessagesForSessionFlow(sessionId)
+
+    fun watchConversationMessages(sessionId: String) {
+        conversationSync.watchMessages(sessionId)
+    }
+
+    fun personaSessionId(personaId: String): String =
+        _activePersonaSessionIds.value[personaId]
+            ?: prefs.getString(personaSessionPreferenceKey(personaId), null)
+            ?: "persona_$personaId"
+
+    private fun personaSessionPreferenceKey(personaId: String) = "persona_active_session_$personaId"
+
+    suspend fun ensurePersonaChatSession(personaId: String): String = personaSessionMutex.withLock {
+        conversationSyncReady.first { it }
+        val sessions = repository.allSessions.first()
+        val storedActiveId = _activePersonaSessionIds.value[personaId]
+            ?: prefs.getString(personaSessionPreferenceKey(personaId), null)
+        val selected = storedActiveId?.let { id ->
+            sessions.firstOrNull { it.id == id && it.personaId == personaId }
+        }
+        if (selected != null) {
+            _activePersonaSessionIds.value = _activePersonaSessionIds.value + (personaId to selected.id)
+            return@withLock selected.id
+        }
+
+        val legacyId = "persona_$personaId"
+        val legacy = sessions.firstOrNull { it.id == legacyId }
+        val session = if (legacy != null) {
+            legacy.copy(
+                title = legacy.title.ifBlank { "${assistantPersonaName(personaId)} - المحادثة الأولى" },
+                personaId = personaId
+            )
+        } else {
+            ChatSession(
+                id = legacyId,
+                title = "${assistantPersonaName(personaId)} - المحادثة الأولى",
+                personaId = personaId
+            )
+        }
+        repository.insertSession(session)
+        setActivePersonaSession(personaId, session.id)
+        session.id
+    }
+
+    fun selectPersonaChatSession(personaId: String, sessionId: String) {
+        viewModelScope.launch {
+            val session = repository.allSessions.first().firstOrNull {
+                it.id == sessionId && it.personaId == personaId
+            } ?: return@launch
+            setActivePersonaSession(personaId, session.id)
+        }
+    }
+
+    fun startNewPersonaChat(personaId: String) {
+        viewModelScope.launch {
+            ensurePersonaChatSession(personaId)
+            val session = ChatSession(
+                id = UUID.randomUUID().toString(),
+                title = "${assistantPersonaName(personaId)} - محادثة جديدة",
+                personaId = personaId
+            )
+            repository.insertSession(session)
+            setActivePersonaSession(personaId, session.id)
+        }
+    }
+
+    fun deletePersonaChatSession(personaId: String, sessionId: String) {
+        viewModelScope.launch {
+            val sessions = repository.allSessions.first()
+                .filter { it.personaId == personaId }
+            if (sessions.none { it.id == sessionId }) return@launch
+
+            val messages = repository.getMessagesForSession(sessionId)
+            repository.deleteSession(sessionId)
+            _personaMessages.value = _personaMessages.value - sessionId
+            messages.mapNotNull { parseChatVisionMessage(it.content)?.imagePath }
+                .forEach { imagePath -> deleteChatVisionImage(context, imagePath) }
+
+            val remaining = sessions.filterNot { it.id == sessionId }
+            if (personaSessionId(personaId) == sessionId) {
+                if (remaining.isNotEmpty()) {
+                    setActivePersonaSession(personaId, remaining.maxBy { it.timestamp }.id)
+                } else {
+                    prefs.edit().remove(personaSessionPreferenceKey(personaId)).apply()
+                    _activePersonaSessionIds.value = _activePersonaSessionIds.value - personaId
+                    ensurePersonaChatSession(personaId)
+                }
+            }
+        }
+    }
+
+    fun clearPersonaChat(sessionId: String) {
+        viewModelScope.launch {
+            val messages = repository.getMessagesForSession(sessionId)
+            repository.deleteMessagesForSession(sessionId)
+            _personaMessages.value = _personaMessages.value - sessionId
+            messages.mapNotNull { parseChatVisionMessage(it.content)?.imagePath }
+                .forEach { imagePath -> deleteChatVisionImage(context, imagePath) }
+        }
+    }
+
+    private fun setActivePersonaSession(personaId: String, sessionId: String) {
+        _activePersonaSessionIds.value = _activePersonaSessionIds.value + (personaId to sessionId)
+        prefs.edit().putString(personaSessionPreferenceKey(personaId), sessionId).apply()
+    }
 
     // 5. Organizer/Scheduler States
     val userSchedule: StateFlow<UserSchedule?> = repository.userSchedule
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+    val studySessions: StateFlow<List<StudySession>> = organizerDao.observeStudySessions()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val lessons: StateFlow<List<Lesson>> = organizerDao.observeLessons()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    private val _organizerGenerationError = MutableStateFlow<String?>(null)
+    val organizerGenerationError: StateFlow<String?> = _organizerGenerationError.asStateFlow()
+    val organizerReminderLeadMinutes = MutableStateFlow(
+        OrganizerReminderScheduler.reminderLeadMinutes(context)
+    )
+    val organizerRemindersPaused = MutableStateFlow(
+        OrganizerReminderScheduler.isPaused(context)
+    )
 
     private val _isGeneratingSchedule = MutableStateFlow(false)
     val isGeneratingSchedule: StateFlow<Boolean> = _isGeneratingSchedule.asStateFlow()
@@ -415,14 +652,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     val quranReciterName: StateFlow<String?> = _quranReciterName.asStateFlow()
 
     val quranReminderEnabled = MutableStateFlow(
-        prefs.getBoolean(QuranReminderReceiver.KEY_ENABLED, false)
+        prefs.getBoolean("quran_reminder_enabled", false)
     )
     val quranReminderHour = MutableStateFlow(
-        prefs.getInt(QuranReminderReceiver.KEY_HOUR, 20)
+        prefs.getInt("quran_reminder_hour", 20)
     )
     val quranReminderMinute = MutableStateFlow(
-        prefs.getInt(QuranReminderReceiver.KEY_MINUTE, 0)
+        prefs.getInt("quran_reminder_minute", 0)
     )
+    private val _backgroundChatPendingSession = MutableStateFlow<String?>(null)
+    val backgroundChatPendingSession: StateFlow<String?> = _backgroundChatPendingSession.asStateFlow()
 
     // Gamification States (persisted across app restarts)
     val userPoints = MutableStateFlow(prefs.getInt("user_points", 240))
@@ -511,6 +750,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         messagesCollectionJob?.cancel()
         messagesCollectionJob = null
         if (sessionId != null) {
+            conversationSync.watchMessages(sessionId)
             messagesCollectionJob = viewModelScope.launch {
                 repository.getMessagesForSessionFlow(sessionId).collect { msgs ->
                     _currentMessages.value = msgs
@@ -541,12 +781,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun renameSession(sessionId: String, title: String) {
+        val cleanTitle = title.trim().take(60)
+        if (cleanTitle.isEmpty()) return
+        viewModelScope.launch {
+            chatSessions.value.firstOrNull { it.id == sessionId }?.let {
+                repository.insertSession(it.copy(title = cleanTitle))
+            }
+        }
+    }
+
     fun closeCurrentChatSession() {
         _currentSessionId.value?.let(::summarizeSession)
     }
 
     fun ensureActiveChatSession() {
-        if (_currentSessionId.value != null) return
+        if (!_conversationSyncReady.value || _currentSessionId.value != null) return
         viewModelScope.launch {
             if (_currentSessionId.value != null) return@launch
             val sessions = repository.allSessions.first()
@@ -560,7 +810,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun deleteSession(sessionId: String) {
         viewModelScope.launch {
+            val messages = repository.getMessagesForSession(sessionId)
             repository.deleteSession(sessionId)
+            messages.mapNotNull { parseChatVisionMessage(it.content)?.imagePath }
+                .forEach { imagePath -> deleteChatVisionImage(context, imagePath) }
             try {
                 learningRepository.deleteConversation(sessionId)
             } catch (e: Exception) {
@@ -577,15 +830,28 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (!summarizingSessions.add(sessionId)) return
         viewModelScope.launch {
             try {
+                val messages = repository.getMessagesForSession(sessionId)
+                val signedInUser = AuthManager.getCurrentUser(context)
+                if (messages.isNotEmpty() && signedInUser != null) {
+                    try {
+                        generateCloudSummary(sessionId, messages)
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        Log.e(TAG, "Failed to save cloud summary for chat session $sessionId", error)
+                        _conversationMemoryError.value =
+                            GeminiApiClient.friendlyErrorMessage(error)
+                    }
+                }
                 var conversation = learningRepository.getConversation(sessionId)
                 if (conversation == null) {
                     syncLearningConversation(sessionId)
                     conversation = learningRepository.getConversation(sessionId)
                 }
-                val messages = learningRepository.getMessages(sessionId)
-                val lastMessage = messages.lastOrNull() ?: return@launch
+                val learningMessages = learningRepository.getMessages(sessionId)
+                val lastMessage = learningMessages.lastOrNull() ?: return@launch
                 if (conversation?.summaryForMessageId == lastMessage.id) return@launch
-                val summary = summarizeConversationLocally(messages) ?: return@launch
+                val summary = summarizeConversationLocally(learningMessages) ?: return@launch
                 learningRepository.saveSummary(
                     id = sessionId,
                     summary = summary,
@@ -604,6 +870,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun persistLearningMessage(message: ChatMessage) {
         repository.insertMessage(message)
+        scheduleCloudConversationSummary(message.sessionId)
         try {
             if (learningRepository.getConversation(message.sessionId) == null) {
                 syncLearningConversation(message.sessionId)
@@ -611,6 +878,50 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             learningRepository.saveMessage(message)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to save chat message in the learning profile", e)
+        }
+    }
+
+    private fun scheduleCloudConversationSummary(sessionId: String) {
+        val user = AuthManager.getCurrentUser(context) ?: return
+        try {
+            ConversationSummaryWorker.schedule(context, sessionId, user.uid)
+        } catch (error: Exception) {
+            Log.e(TAG, "Failed to schedule cloud summary for chat session $sessionId", error)
+        }
+    }
+
+    fun generateSummary(conversationId: String) {
+        viewModelScope.launch {
+            try {
+                val messages = repository.getMessagesForSession(conversationId)
+                if (messages.isEmpty()) return@launch
+                generateCloudSummary(conversationId, messages)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Log.e(TAG, "Failed to generate cloud summary for $conversationId", error)
+                _conversationMemoryError.value = GeminiApiClient.friendlyErrorMessage(error)
+            }
+        }
+    }
+
+    private suspend fun generateCloudSummary(conversationId: String, messages: List<ChatMessage>) {
+        if (AuthManager.getCurrentUser(context) == null) return
+        GeminiApiClient.generateConversationSummary(conversationId, messages)
+        ConversationSummaryWorker.cancel(context, conversationId)
+        refreshConversationMemory()
+        _conversationMemoryError.value = null
+    }
+
+    private suspend fun refreshConversationMemory() {
+        try {
+            _conversationMemory.value = GeminiApiClient.fetchConversationMemory()
+            _conversationMemoryError.value = null
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Log.e(TAG, "Failed to refresh cloud conversation memory", error)
+            _conversationMemoryError.value = GeminiApiClient.friendlyErrorMessage(error)
         }
     }
 
@@ -652,14 +963,30 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             emptyList()
         }
 
+    private suspend fun syncLearningHistory() {
+        try {
+            learningRepository.refreshUserProfile()
+            repository.allSessions.first().forEach { session ->
+                learningRepository.mirrorConversation(
+                    id = session.id,
+                    title = session.title,
+                    startedAt = session.timestamp,
+                    messages = repository.getMessagesForSession(session.id)
+                )
+            }
+        } catch (error: Exception) {
+            Log.e(TAG, "Failed to sync chat history to the local learning profile", error)
+        }
+    }
+
     private fun isStudentQuestion(text: String): Boolean =
-        text.contains('?') || text.contains('؟') ||
-            listOf(
-                "اشرح", "وضح", "ازاي", "كيف", "لماذا", "ليه", "ما هو", "ماهي",
-                "ما الفرق", "ما معنى", "ماذا", "هل ", "حل ", "احسب", "اوجد", "أوجد",
-                "قارن", "what ", "how ", "why ", "explain ", "solve ", "calculate "
-            )
-                .any { text.contains(it, ignoreCase = true) }
+        listOf(
+            "مذاكرة", "مذاكر", "مدرسة", "درس", "واجب", "امتحان", "منهج", "مادة دراسية",
+            "اشرح الدرس", "اشرحلي الدرس", "حل المسألة", "حل الواجب", "احسب",
+            "رياضيات", "جبر", "هندسة", "فيزياء", "كيمياء", "أحياء", "نحو", "إعراب",
+            "study", "homework", "school", "lesson", "exam", "course", "algebra",
+            "geometry", "physics", "chemistry", "biology", "calculate", "solve this problem"
+        ).any { text.contains(it, ignoreCase = true) }
 
     fun setSocraticModeEnabled(enabled: Boolean) {
         _socraticModeEnabled.value = enabled
@@ -735,23 +1062,114 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         quranReminderMinute.value = minute
         quranReminderEnabled.value = enabled
         prefs.edit()
-            .putInt(QuranReminderReceiver.KEY_HOUR, hour)
-            .putInt(QuranReminderReceiver.KEY_MINUTE, minute)
+            .putInt("quran_reminder_hour", hour)
+            .putInt("quran_reminder_minute", minute)
             .apply()
-        if (enabled) {
-            QuranReminderReceiver.schedule(context, hour, minute)
-        } else {
-            QuranReminderReceiver.cancel(context)
-        }
+        prefs.edit().putBoolean("quran_reminder_enabled", enabled).apply()
+        NotificationScheduler.setEnabled(
+            context,
+            NotificationScheduler.KEY_QURAN_ENABLED,
+            enabled
+        )
+        NotificationScheduler.scheduleQuran(context, hour, minute, enabled)
     }
 
     fun setQuranReminderTime(hour: Int, minute: Int) {
         quranReminderHour.value = hour
         quranReminderMinute.value = minute
         prefs.edit()
-            .putInt(QuranReminderReceiver.KEY_HOUR, hour)
-            .putInt(QuranReminderReceiver.KEY_MINUTE, minute)
+            .putInt("quran_reminder_hour", hour)
+            .putInt("quran_reminder_minute", minute)
             .apply()
+        if (quranReminderEnabled.value) {
+            NotificationScheduler.scheduleQuran(context, hour, minute, true)
+        }
+    }
+
+    fun setNotificationEnabled(key: String, enabled: Boolean) {
+        NotificationScheduler.setEnabled(context, key, enabled)
+    }
+
+    fun setOrganizerReminderLeadMinutes(minutes: Int) {
+        val normalized = minutes.coerceIn(5, 15)
+        organizerReminderLeadMinutes.value = normalized
+        context.getSharedPreferences(NotificationScheduler.PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putInt(OrganizerReminderScheduler.KEY_REMINDER_LEAD_MINUTES, normalized)
+            .apply()
+        viewModelScope.launch {
+            organizerDao.getStudySessions().forEach { session ->
+                organizerDao.saveStudySession(session.copy(reminderMinutes = normalized))
+            }
+            OrganizerReminderScheduler.rescheduleAll(context)
+        }
+    }
+
+    fun setOrganizerRemindersPaused(paused: Boolean) {
+        organizerRemindersPaused.value = paused
+        context.getSharedPreferences(NotificationScheduler.PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(OrganizerReminderScheduler.KEY_REMINDERS_PAUSED, paused)
+            .apply()
+        viewModelScope.launch {
+            OrganizerReminderScheduler.rescheduleAll(context)
+        }
+    }
+
+    fun saveStudySession(session: StudySession) {
+        viewModelScope.launch {
+            organizerDao.saveStudySession(session)
+            OrganizerReminderScheduler.rescheduleAll(context)
+        }
+    }
+
+    fun deleteStudySession(id: String) {
+        viewModelScope.launch {
+            organizerDao.deleteStudySession(id)
+            OrganizerReminderScheduler.rescheduleAll(context)
+        }
+    }
+
+    fun markStudySessionCompleted(session: StudySession, completed: Boolean) {
+        viewModelScope.launch {
+            organizerDao.saveStudySession(session.copy(completed = completed))
+        }
+    }
+
+    fun saveLesson(lesson: Lesson) {
+        viewModelScope.launch {
+            organizerDao.saveLesson(lesson)
+            OrganizerReminderScheduler.rescheduleAll(context)
+        }
+    }
+
+    fun deleteLesson(id: String) {
+        viewModelScope.launch {
+            organizerDao.deleteLesson(id)
+            OrganizerReminderScheduler.rescheduleAll(context)
+        }
+    }
+
+    fun clearAcademicSchedule() {
+        viewModelScope.launch {
+            organizerDao.deleteAllStudySessions()
+            OrganizerReminderScheduler.rescheduleAll(context)
+        }
+    }
+
+    fun setStudyReminderTime(hour: Int, minute: Int) {
+        NotificationScheduler.setStudyReminderTime(context, hour, minute)
+    }
+
+    fun scheduleQuranReminderTest() {
+        NotificationScheduler.scheduleQuranTest(context)
+    }
+
+    fun consumeBackgroundChatNotice(sessionId: String?): Boolean {
+        if (sessionId == null || _backgroundChatPendingSession.value != sessionId) return false
+        val shouldShow = NotificationScheduler.hasPendingChatRequest(context, sessionId)
+        _backgroundChatPendingSession.value = null
+        return shouldShow
     }
 
     // --- CORE FUNCTIONS ---
@@ -763,6 +1181,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch {
             _isGeneratingChat.value = true
+            var toolSources = emptyList<com.example.data.ChatSource>()
+            var generatedImageUrl: String? = null
             try {
                 val userMsg = ChatMessage(
                     id = UUID.randomUUID().toString(),
@@ -771,6 +1191,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     content = text,
                     timestamp = System.currentTimeMillis()
                 )
+                if (_currentMessages.value.isEmpty()) {
+                    chatSessions.value.firstOrNull { it.id == sessionId && it.personaId == null }?.let { session ->
+                        if (session.title.startsWith("محادثة")) {
+                            repository.insertSession(session.copy(title = text.trim().replace(Regex("\\s+"), " ").take(30)))
+                        }
+                    }
+                }
                 persistLearningMessage(userMsg)
                 if (isLearningAcknowledgement(text)) {
                     try {
@@ -787,29 +1214,139 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     if (visionAttachment == null) message
                     else message.copy(content = "[صورة لمسألة: ${visionAttachment.question}]")
                 }
-                val systemPrompt = """
-                    أنت مساعد ذكي ومحاور متميز في تطبيق H2 Hub باسم "Smart Cat".
-                    أجب بلغة الطالب بوضوح، ووجّه الطالب للتعلّم بدلاً من تسهيل الغش.
-                    $SMART_CHAT_MATH_INSTRUCTION
-                    $safetySystemInstruction
-                """.trimIndent()
-                val aiResponse = kotlinx.coroutines.withTimeoutOrNull(90_000) {
-                    if (isLocalMemoryRecallQuestion(text)) {
+                val systemPrompt = buildAssistantSystemInstruction(
+                    "smart-cat",
+                    buildSmartCatSystemInstruction(safetySystemInstruction)
+                )
+                val deviceToken = PushNotifications.registeredToken(context)
+                if (
+                    deviceToken != null &&
+                    NotificationScheduler.isEnabled(
+                        context,
+                        NotificationScheduler.KEY_CHAT_ENABLED,
+                        true
+                    ) &&
+                    !_socraticModeEnabled.value &&
+                    !_educationalContentEnabled.value &&
+                    !webSearchEnabled.value &&
+                    !groqThinkingEnabled.value &&
+                    !(imageGenerationAvailable.value && imageGenerationEnabled.value) &&
+                    !isLocalMemoryRecallQuestion(text)
+                ) {
+                    val notificationId = UUID.randomUUID().toString()
+                    val asyncSystemPrompt = if (forceFullSolution) {
+                        "$systemPrompt\nقدم حلاً كاملاً لأن المستخدم طلب ذلك صراحة."
+                    } else {
+                        systemPrompt
+                    }
+                    val requestJson = org.json.JSONObject()
+                        .put("message", text.trim().take(4_000))
+                        .put("deviceToken", deviceToken)
+                        .put("sessionId", sessionId)
+                        .put("deviceId", ApiDeviceIdentity.deviceId.orEmpty())
+                        .put("notificationId", notificationId)
+                        .put("idempotencyKey", userMsg.id)
+                        .put(
+                            "systemInstruction",
+                            asyncSystemPrompt.take(12_000)
+                        )
+                        .put(
+                            "history",
+                            org.json.JSONArray().apply {
+                                updatedList.dropLast(1).takeLast(20).forEach { message ->
+                                    put(
+                                        org.json.JSONObject()
+                                            .put(
+                                                "role",
+                                                if (message.role == "user") "user" else "model"
+                                            )
+                                            .put("text", message.content.take(8_000))
+                                    )
+                                }
+                            }
+                        )
+                        .toString()
+                    NotificationScheduler.saveChatRequest(
+                        context,
+                        notificationId,
+                        requestJson
+                    )
+                    repository.insertPendingChatRequest(
+                        PendingChatRequest(
+                            notificationId = notificationId,
+                            sessionId = sessionId,
+                            requestJson = requestJson
+                        )
+                    )
+                    val acceptedByServer = try {
+                        val (statusCode, responseBody) =
+                            GeminiApiClient.submitAsyncChatRequest(requestJson)
+                        if (statusCode in 200..299) {
+                            true
+                        } else if (parseQuotaError(statusCode, responseBody) != null) {
+                            NotificationScheduler.discardChatRequest(context, notificationId)
+                            repository.deletePendingChatRequest(notificationId)
+                            // Quota exhausted: surface it and stop; never fall back to another request.
+                            return@launch
+                        } else if (statusCode in 400..499 && statusCode != 429) {
+                            Log.w(
+                                TAG,
+                                "Server rejected the background chat request ($statusCode): $responseBody"
+                            )
+                            NotificationScheduler.discardChatRequest(context, notificationId)
+                            false
+                        } else {
+                            true
+                        }
+                    } catch (error: java.io.IOException) {
+                        Log.w(TAG, "Background chat acceptance was inconclusive; WorkManager will retry.", error)
+                        true
+                    }
+                    if (acceptedByServer) {
+                        NotificationScheduler.enqueueChatReply(
+                            context,
+                            sessionId,
+                            notificationId
+                        )
+                        _backgroundChatPendingSession.value = sessionId
+                        return@launch
+                    }
+                }
+                val aiResponse = kotlinx.coroutines.withTimeoutOrNull(
+                    if (imageGenerationAvailable.value && imageGenerationEnabled.value) 180_000 else 90_000
+                ) {
+                    if (imageGenerationAvailable.value && imageGenerationEnabled.value) {
+                        _thinkingState.value = "drawing"
+                        val generated = GeminiApiClient.generateImage(text)
+                        generatedImageUrl = generated.imageUrl
+                        val modelName = when (generated.model) {
+                            "ideogram-ai/ideogram-v2" -> "Ideogram v2"
+                            else -> "FLUX Schnell"
+                        }
+                        buildString {
+                            append("تم إنشاء الصورة بنجاح باستخدام $modelName.")
+                            generated.safetyWarning?.let { append("\n\n⚠️ ").append(it) }
+                        }
+                    } else if (isLocalMemoryRecallQuestion(text)) {
                         formatLocalMemoryRecall(loadRecentLocalSummaries(sessionId), text)
                     } else {
-                        val currentTopic = classifyLearningQuestion(text)
-                        val repeatedWeakness = try {
-                            learningRepository.getTopicStats().any {
-                                it.subject == currentTopic.subject &&
-                                    it.topic == currentTopic.topic &&
-                                    it.isWeakness
+                        val adaptivePrompt = if (isStudentQuestion(text)) {
+                            val currentTopic = classifyLearningQuestion(text)
+                            val repeatedWeakness = try {
+                                learningRepository.getTopicStats().any {
+                                    it.subject == currentTopic.subject &&
+                                        it.topic == currentTopic.topic &&
+                                        it.isWeakness
+                                }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Failed to read the local learning profile", e)
+                                false
                             }
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Failed to read the local learning profile", e)
-                            false
-                        }
-                        val adaptivePrompt = if (repeatedWeakness) {
-                            "$systemPrompt\nاشرح هذا السؤال بخطوات قصيرة وتحقق من الفهم بسؤال تدريبي واحد."
+                            if (repeatedWeakness) {
+                                "$systemPrompt\nعند الإجابة عن السؤال الدراسي الحالي، اشرح بخطوات قصيرة وتحقق من الفهم بسؤال تدريبي واحد."
+                            } else {
+                                systemPrompt
+                            }
                         } else {
                             systemPrompt
                         }
@@ -847,30 +1384,128 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                     forceFullSolution = forceFullSolution
                                 )
                             }
+                            webSearchEnabled.value && groqThinkingEnabled.value -> {
+                                _thinkingState.value = "searching+thinking"
+                                val result = GeminiApiClient.generateSearchThinkingResponse(
+                                    history = updatedList,
+                                    systemInstruction = adaptivePrompt
+                                )
+                                toolSources = result.sources
+                                result.reply
+                            }
+                            webSearchEnabled.value -> {
+                                _thinkingState.value = "searching"
+                                val result = GeminiApiClient.generateWebSearchResponse(
+                                    history = updatedList,
+                                    systemInstruction = adaptivePrompt
+                                )
+                                toolSources = result.sources
+                                result.reply
+                            }
+                            groqThinkingEnabled.value -> {
+                                _thinkingState.value = "thinking"
+                                GeminiApiClient.generateThinkingResponse(
+                                    history = updatedList,
+                                    systemInstruction = adaptivePrompt
+                                ).reply
+                            }
                             else -> GeminiApiClient.generateChatResponse(
                                 history = updatedList,
                                 systemInstruction = adaptivePrompt
                             )
                         }
                     }
-                } ?: "تعذر الحصول على رد خلال الوقت المتوقع. تحقق من اتصال الإنترنت وحاول مرة أخرى."
+                } ?: assistantOfflineReply("smart-cat")
 
                 val assistantMessage = ChatMessage(
                     id = UUID.randomUUID().toString(),
                     sessionId = sessionId,
                     role = "model",
                     content = aiResponse,
-                    timestamp = System.currentTimeMillis()
+                    timestamp = System.currentTimeMillis(),
+                    sources = toolSources,
+                    generatedImageUrl = generatedImageUrl
                 )
                 persistLearningMessage(assistantMessage)
 
-                if (autoReadChatEnabled.value) {
+                if (autoReadChatEnabled.value && generatedImageUrl == null) {
                     speakText(aiResponse, assistantMessage.id)
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Chat generation failed", e)
+                _chatActionError.value = GeminiApiClient.friendlyErrorMessage(e)
             } finally {
+                _thinkingState.value = null
                 _isGeneratingChat.value = false
+                refreshUsage()
+            }
+        }
+    }
+
+    fun speakGeneratedImage(imageUrl: String) {
+        viewModelScope.launch {
+            var audioFile: File? = null
+            try {
+                val speech = GeminiApiClient.describeImage(imageUrl)
+                generatedImageSpeechPlayer?.release()
+                generatedImageSpeechPlayer = null
+                generatedImageSpeechFile?.delete()
+                generatedImageSpeechFile = null
+                val audioUrl = speech.audioUrl
+                if (audioUrl == null) {
+                    speakTextLocally(speech.description, "generated-image-${UUID.randomUUID()}")
+                    return@launch
+                }
+                val audioData = android.util.Base64.decode(
+                    audioUrl.substringAfter(','),
+                    android.util.Base64.DEFAULT
+                )
+                check(audioData.isNotEmpty() && audioData.size <= 10 * 1024 * 1024) {
+                    "تعذر تجهيز الصوت. حاول مرة أخرى."
+                }
+                val speechFile = withContext(Dispatchers.IO) {
+                    val extension = if (audioUrl.startsWith("data:audio/mpeg;base64,")) "mp3" else "wav"
+                    File(context.cacheDir, "generated-image-${UUID.randomUUID()}.$extension").apply {
+                        writeBytes(audioData)
+                    }
+                }
+                audioFile = speechFile
+                generatedImageSpeechFile = speechFile
+                val player = MediaPlayer()
+                generatedImageSpeechPlayer = player
+                player.setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                player.setOnCompletionListener {
+                    if (generatedImageSpeechPlayer === it) generatedImageSpeechPlayer = null
+                    it.release()
+                    speechFile.delete()
+                    if (generatedImageSpeechFile == speechFile) generatedImageSpeechFile = null
+                }
+                player.setOnErrorListener { failedPlayer, _, _ ->
+                    if (generatedImageSpeechPlayer === failedPlayer) generatedImageSpeechPlayer = null
+                    failedPlayer.release()
+                    speechFile.delete()
+                    if (generatedImageSpeechFile == speechFile) generatedImageSpeechFile = null
+                    speakTextLocally(speech.description, "generated-image-${UUID.randomUUID()}")
+                    true
+                }
+                player.setDataSource(speechFile.absolutePath)
+                player.setOnPreparedListener { it.start() }
+                player.prepareAsync()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Log.e(TAG, "Generated image description speech failed", error)
+                generatedImageSpeechPlayer?.release()
+                generatedImageSpeechPlayer = null
+                audioFile?.delete()
+                generatedImageSpeechFile?.delete()
+                generatedImageSpeechFile = null
+                _chatActionError.value = GeminiApiClient.friendlyErrorMessage(error)
             }
         }
     }
@@ -896,7 +1531,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 persistLearningMessage(userMsg)
 
                 val prompt = if (isImage) "تحليل صورة مرفقة" else "تلخيص ملف PDF مرفق"
-                recordLearningQuestion(sessionId, prompt)
+                if (isStudentQuestion(prompt)) {
+                    recordLearningQuestion(sessionId, prompt)
+                }
                 val aiResponse = kotlinx.coroutines.withTimeoutOrNull(90_000) {
                     GeminiApiClient.generateMultimodalResponse(
                         prompt = if (isImage) {
@@ -904,9 +1541,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         } else {
                             "لخص الملف المرفق واشرح أهم محتوياته وأجب عن سؤال المستخدم إن وُجد."
                         },
-                        systemInstruction = safetySystemInstruction,
+                        systemInstruction = buildAssistantSystemInstruction(
+                            "smart-cat",
+                            safetySystemInstruction
+                        ),
                         base64Data = base64Data,
-                        mimeType = mimeType
+                        mimeType = mimeType,
+                        feature = if (isImage) "vision" else "chat"
                     )
                 } ?: "تعذر تحليل المرفق خلال الوقت المتوقع. حاول مرة أخرى."
 
@@ -935,7 +1576,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         val prompt = question.trim().ifBlank {
-            "اقرأ المسألة الظاهرة في الصورة واشرح طريقة حلها خطوة بخطوة."
+            "حلل الصورة المرفقة وصف محتواها أو أجب عن السؤال المتعلق بها. لا تفترض أنها مسألة دراسية؛ إذا لم أحدد المطلوب، أخبرني بما يظهر واسألني ماذا أريد أن أعرف."
         }
 
         viewModelScope.launch {
@@ -950,11 +1591,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     timestamp = System.currentTimeMillis()
                 )
                 persistLearningMessage(userMessage)
-                recordLearningQuestion(sessionId, prompt)
+                if (isStudentQuestion(prompt)) {
+                    recordLearningQuestion(sessionId, prompt)
+                }
                 _currentMessages.value = _currentMessages.value + userMessage
 
                 val answer = kotlinx.coroutines.withTimeoutOrNull(120_000) {
-                    GeminiApiClient.generateVisionResponse(imageFile.absolutePath, prompt)
+                    GeminiApiClient.generateVisionResponse(
+                        imageFile.absolutePath,
+                        prompt
+                    )
                 } ?: "تعذر تحليل الصورة خلال الوقت المتوقع. حاول مرة أخرى."
                 val assistantMessage = ChatMessage(
                     id = UUID.randomUUID().toString(),
@@ -968,7 +1614,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 if (autoReadChatEnabled.value) speakText(answer, assistantMessage.id)
             } catch (e: Exception) {
                 Log.e(TAG, "Vision question failed", e)
-                _chatActionError.value = "تعذر إرسال الصورة. تحقق من الاتصال وحاول مرة أخرى."
+                _chatActionError.value = GeminiApiClient.friendlyErrorMessage(e)
             } finally {
                 _isGeneratingChat.value = false
             }
@@ -1151,46 +1797,33 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _selectedDoc.value = null
     }
 
-    fun clearPersonaMessages(personaId: String) {
-        val updatedMap = _personaMessages.value.toMutableMap()
-        updatedMap[personaId] = emptyList()
-        _personaMessages.value = updatedMap
-        viewModelScope.launch {
-            repository.deleteMessagesForSession("persona_$personaId")
-        }
-    }
-
-    // Load previously saved persona conversation from storage (once per persona)
-    private val loadedPersonaIds = mutableSetOf<String>()
-
-    private suspend fun loadPersonaMessagesIfNeeded(personaId: String) {
-        if (!loadedPersonaIds.add(personaId)) return
-        val stored = repository.getMessagesForSession("persona_$personaId")
-        if (stored.isNotEmpty() && _personaMessages.value[personaId].isNullOrEmpty()) {
-            val updatedMap = _personaMessages.value.toMutableMap()
-            updatedMap[personaId] = stored.sortedBy { it.timestamp }
-            _personaMessages.value = updatedMap
-        }
+    private suspend fun loadPersonaMessagesIfNeeded(sessionId: String) {
+        if (_personaMessages.value.containsKey(sessionId)) return
+        val stored = repository.getMessagesForSession(sessionId)
+        _personaMessages.value = _personaMessages.value + (sessionId to stored.sortedBy { it.timestamp })
     }
 
     // 3. AI PERSONAS (with voice option)
-    fun sendPersonaMessage(text: String) {
-        val personaId = selectedPersonaId.value
+    fun sendPersonaMessage(text: String, personaId: String = selectedPersonaId.value) {
         if (text.trim().isEmpty()) return
 
         // Auto-detect Study Mode requests
         val lowerText = text.lowercase()
-        if (lowerText.contains("عايز اذاكر") || lowerText.contains("عايز أذاكر") || lowerText.contains("نبدأ المذاكرة") || lowerText.contains("نبدأ وضع المذاكرة")) {
+        if (personaId != "coder" &&
+            (lowerText.contains("عايز اذاكر") || lowerText.contains("عايز أذاكر") ||
+                lowerText.contains("نبدأ المذاكرة") || lowerText.contains("نبدأ وضع المذاكرة"))
+        ) {
             isStudyModeActive.value = true
         }
 
         viewModelScope.launch {
-            loadPersonaMessagesIfNeeded(personaId)
-            val currentPersonaMsgs = _personaMessages.value[personaId]?.toMutableList() ?: mutableListOf()
+            val sessionId = ensurePersonaChatSession(personaId)
+            loadPersonaMessagesIfNeeded(sessionId)
+            val currentPersonaMsgs = _personaMessages.value[sessionId]?.toMutableList() ?: mutableListOf()
 
             val userMsg = ChatMessage(
                 id = UUID.randomUUID().toString(),
-                sessionId = "persona_$personaId",
+                sessionId = sessionId,
                 role = "user",
                 content = text,
                 timestamp = System.currentTimeMillis()
@@ -1198,9 +1831,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             currentPersonaMsgs.add(userMsg)
             repository.insertMessage(userMsg)
 
-            val updatedMap = _personaMessages.value.toMutableMap()
-            updatedMap[personaId] = currentPersonaMsgs.toList()
-            _personaMessages.value = updatedMap
+            _personaMessages.value = _personaMessages.value + (sessionId to currentPersonaMsgs.toList())
 
             _isGeneratingPersona.value = true
 
@@ -1209,16 +1840,48 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             var fullInstruction = "$personaInstruction\n\n$safetySystemInstruction"
 
             if (isStudyModeActive.value) {
-                fullInstruction += "\n\n[وضع المذاكرة نشط 📚]: يرجى تقديم الشرح والمساعدة بالتنسيق التالي بدقة ووضوح:\n1. الشرح خطوة بخطوة بطريقة بسيطة ومفهومة جداً.\n2. مثال عملي ملموس وممتع.\n3. سؤال اختبار سريع وسهل للمستخدم لتتأكد من استيعابه للمفهوم.\nأنت صديقه الودود الذي يشجعه بحرارة!"
+                fullInstruction += "\n\n[وضع المذاكرة نشط 📚]: يرجى تقديم الشرح والمساعدة بالتنسيق التالي بدقة ووضوح:\n1. الشرح خطوة بخطوة بطريقة بسيطة ومفهومة جداً.\n2. مثال عملي ملموس وممتع.\n3. سؤال اختبار سريع وسهل للمستخدم لتتأكد من استيعابه للمفهوم.\nحافظ على شخصية المساعد الودودة والمشجعة."
             }
 
             // Sentiment Analysis and Late Night detection and Search integration
-            fullInstruction += detectSentimentAndInjectInstruction(text, personaId)
+            fullInstruction = buildAssistantSystemInstruction(
+                personaId,
+                fullInstruction + detectSentimentAndInjectInstruction(text, personaId)
+            )
 
-            // Call the real AI with a generous timeout; the local canned reply is only
-            // an emergency fallback when the network is completely unavailable.
+            var toolSources = emptyList<com.example.data.ChatSource>()
+            var toolThinkingSeconds: Int? = null
+            // The offline response identifies the persona but avoids guessing an answer.
             val aiResponse = kotlinx.coroutines.withTimeoutOrNull(90_000) {
                 when {
+                    personaWebSearchEnabled(personaId) && personaThinkingEnabled(personaId) -> {
+                        _thinkingState.value = "searching+thinking"
+                        val result = GeminiApiClient.generateSearchThinkingResponse(
+                            history = currentPersonaMsgs,
+                            systemInstruction = fullInstruction
+                        )
+                        toolSources = result.sources
+                        toolThinkingSeconds = result.thinkingSeconds
+                        result.reply
+                    }
+                    personaWebSearchEnabled(personaId) -> {
+                        _thinkingState.value = "searching"
+                        val result = GeminiApiClient.generateWebSearchResponse(
+                            history = currentPersonaMsgs,
+                            systemInstruction = fullInstruction
+                        )
+                        toolSources = result.sources
+                        result.reply
+                    }
+                    personaThinkingEnabled(personaId) -> {
+                        _thinkingState.value = "thinking"
+                        val result = GeminiApiClient.generateThinkingResponse(
+                            history = currentPersonaMsgs,
+                            systemInstruction = fullInstruction
+                        )
+                        toolThinkingSeconds = result.thinkingSeconds
+                        result.reply
+                    }
                     _socraticModeEnabled.value -> {
                         val progress = SocraticProgress(originalQuestion = text)
                         GeminiApiClient.generateSocraticChatResponse(
@@ -1236,25 +1899,29 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     else -> GeminiApiClient.generateChatResponse(
                         history = currentPersonaMsgs,
                         systemInstruction = fullInstruction,
-                        useThinking = useThinkingMode.value
+                        useThinking = useThinkingMode.value,
+                        feature = if (personaId == "coder") "coder" else "chat"
                     )
                 }
             } ?: generateLocalFallbackResponse(text, personaId)
 
             val modelMsg = ChatMessage(
                 id = UUID.randomUUID().toString(),
-                sessionId = "persona_$personaId",
+                sessionId = sessionId,
                 role = "model",
                 content = aiResponse,
-                timestamp = System.currentTimeMillis()
+                timestamp = System.currentTimeMillis(),
+                sources = toolSources,
+                thinkingSeconds = toolThinkingSeconds
             )
             currentPersonaMsgs.add(modelMsg)
             repository.insertMessage(modelMsg)
-            val finalMap = _personaMessages.value.toMutableMap()
-            finalMap[personaId] = currentPersonaMsgs.toList()
-            _personaMessages.value = finalMap
+            scheduleCloudConversationSummary(sessionId)
+            _personaMessages.value = _personaMessages.value + (sessionId to currentPersonaMsgs.toList())
 
             _isGeneratingPersona.value = false
+            _thinkingState.value = null
+            refreshUsage()
 
             // Gamification points reward
             if (isStudyModeActive.value) {
@@ -1269,7 +1936,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             // Voice Speech response if enabled
-            if (personaVoiceEnabled.value) speakText(aiResponse, modelMsg.id, personaId)
+            if (personaAutoReadEnabled(personaId)) speakText(aiResponse, modelMsg.id, personaId)
         }
     }
 
@@ -1377,13 +2044,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun solveRecordedExplanation(text: String) {
         val personaId = selectedPersonaId.value
         viewModelScope.launch {
-            loadPersonaMessagesIfNeeded(personaId)
-            val currentPersonaMsgs = _personaMessages.value[personaId]?.toMutableList() ?: mutableListOf()
+            val sessionId = ensurePersonaChatSession(personaId)
+            loadPersonaMessagesIfNeeded(sessionId)
+            val currentPersonaMsgs = _personaMessages.value[sessionId]?.toMutableList() ?: mutableListOf()
 
             val userMsgText = "🎙️ [شرح صوتي مسجل من المستخدم]: $text\n\nقم بتحويل هذا الشرح إلى حل نموذجي متكامل، واكتب ملخصاً صوتياً رائعاً ومبسطاً جداً له في النهاية ليقوم التطبيق بنطقه بالصوت العذب!"
             val userMsg = ChatMessage(
                 id = UUID.randomUUID().toString(),
-                sessionId = "persona_$personaId",
+                sessionId = sessionId,
                 role = "user",
                 content = userMsgText,
                 timestamp = System.currentTimeMillis()
@@ -1391,44 +2059,49 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             currentPersonaMsgs.add(userMsg)
             repository.insertMessage(userMsg)
             
-            val updatedMap = _personaMessages.value.toMutableMap()
-            updatedMap[personaId] = currentPersonaMsgs
-            _personaMessages.value = updatedMap
+            _personaMessages.value = _personaMessages.value + (sessionId to currentPersonaMsgs.toList())
             
             _isGeneratingPersona.value = true
             
             val personaInstruction = getPersonaInstruction(personaId)
-            val fullInstruction = "$personaInstruction\n\n$safetySystemInstruction\n\n[مسجل الشرح الذكي 🎙️]: لقد قام المستخدم بتسجيل شرحه الخاص لمسألة أو مفهوم. يرجى:\n1. تحليل شرحه وصياغة حل رياضي أو فيزيائي أو توضيح علمي مبسط ودقيق للغاية.\n2. تحفيزه بحرارة وذكاء والإشادة بأسلوب شرحه وجدعنته في الفهم!\n3. إنتاج ملخص صوتي ممتع ومبسط جداً في نهاية الرد ليقوم التطبيق بنطقه بالصوت العذب!"
+            val fullInstruction = buildAssistantSystemInstruction(
+                personaId,
+                "$personaInstruction\n\n$safetySystemInstruction\n\n[مسجل الشرح الذكي 🎙️]: لقد قام المستخدم بتسجيل شرحه الخاص لمسألة أو مفهوم. يرجى:\n1. تحليل شرحه وصياغة حل رياضي أو فيزيائي أو توضيح علمي مبسط ودقيق للغاية.\n2. تحفيزه بحرارة وذكاء والإشادة بأسلوب شرحه وجدعنته في الفهم!\n3. إنتاج ملخص صوتي ممتع ومبسط جداً في نهاية الرد ليقوم التطبيق بنطقه بالصوت العذب!"
+            )
             
             val aiResponse = GeminiApiClient.generateChatResponse(
                 history = currentPersonaMsgs,
                 systemInstruction = fullInstruction,
-                useThinking = useThinkingMode.value
+                useThinking = useThinkingMode.value,
+                feature = if (personaId == "coder") "coder" else "chat"
             )
             
             val modelMsg = ChatMessage(
                 id = UUID.randomUUID().toString(),
-                sessionId = "persona_$personaId",
+                sessionId = sessionId,
                 role = "model",
                 content = aiResponse,
                 timestamp = System.currentTimeMillis()
             )
             currentPersonaMsgs.add(modelMsg)
             repository.insertMessage(modelMsg)
-            updatedMap[personaId] = currentPersonaMsgs
-            _personaMessages.value = updatedMap
+            scheduleCloudConversationSummary(sessionId)
+            _personaMessages.value = _personaMessages.value + (sessionId to currentPersonaMsgs.toList())
 
             _isGeneratingPersona.value = false
 
             // Gamification points reward
             addPoints(30)
 
-            if (personaVoiceEnabled.value) speakText(aiResponse, modelMsg.id, personaId)
+            if (personaAutoReadEnabled(personaId)) speakText(aiResponse, modelMsg.id, personaId)
         }
     }
 
-    fun sendPersonaVision(imagePath: String, question: String = "") {
-        val personaId = selectedPersonaId.value
+    fun sendPersonaVision(
+        imagePath: String,
+        question: String = "",
+        personaId: String = selectedPersonaId.value
+    ) {
         val imageFile = File(imagePath)
         if (!imageFile.isFile || imageFile.length() !in 1..1_048_576) {
             Log.e(TAG, "Persona image is missing or exceeds the one-megabyte limit")
@@ -1439,48 +2112,46 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         viewModelScope.launch {
-            loadPersonaMessagesIfNeeded(personaId)
-            val currentMessages = _personaMessages.value[personaId]?.toMutableList() ?: mutableListOf()
+            val sessionId = ensurePersonaChatSession(personaId)
+            loadPersonaMessagesIfNeeded(sessionId)
+            val currentMessages = _personaMessages.value[sessionId]?.toMutableList() ?: mutableListOf()
             val userMessage = ChatMessage(
                 id = UUID.randomUUID().toString(),
-                sessionId = "persona_$personaId",
+                sessionId = sessionId,
                 role = "user",
                 content = encodeChatVisionMessage(imageFile.absolutePath, prompt),
                 timestamp = System.currentTimeMillis()
             )
             currentMessages.add(userMessage)
             repository.insertMessage(userMessage)
-            _personaMessages.value = _personaMessages.value.toMutableMap().apply {
-                put(personaId, currentMessages.toList())
-            }
+            _personaMessages.value = _personaMessages.value + (sessionId to currentMessages.toList())
 
             _isGeneratingPersona.value = true
             isAnalyzingImageOrDoc.value = true
             try {
-                val personaLabel = when (personaId) {
-                    "hasan" -> "حسن"
-                    "jana" -> "ريتاج"
-                    else -> personaId
-                }
+                val systemInstruction = buildAssistantSystemInstruction(
+                    personaId,
+                    getPersonaInstruction(personaId) + "\n\n$safetySystemInstruction"
+                )
                 val reply = kotlinx.coroutines.withTimeoutOrNull(120_000) {
                     GeminiApiClient.generateVisionResponse(
                         imageFile.absolutePath,
-                        "$prompt أجب بأسلوب $personaLabel."
+                        prompt,
+                        systemInstruction
                     )
                 } ?: "تعذر تحليل الصورة خلال الوقت المتوقع. حاول مرة أخرى."
                 val assistantMessage = ChatMessage(
                     id = UUID.randomUUID().toString(),
-                    sessionId = "persona_$personaId",
+                    sessionId = sessionId,
                     role = "model",
                     content = reply,
                     timestamp = System.currentTimeMillis()
                 )
                 currentMessages.add(assistantMessage)
                 repository.insertMessage(assistantMessage)
-                _personaMessages.value = _personaMessages.value.toMutableMap().apply {
-                    put(personaId, currentMessages.toList())
-                }
-                if (personaVoiceEnabled.value) speakText(reply, assistantMessage.id, personaId)
+                scheduleCloudConversationSummary(sessionId)
+                _personaMessages.value = _personaMessages.value + (sessionId to currentMessages.toList())
+                if (personaAutoReadEnabled(personaId)) speakText(reply, assistantMessage.id, personaId)
             } catch (e: Exception) {
                 Log.e(TAG, "Persona vision request failed", e)
             } finally {
@@ -1491,22 +2162,30 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun retryPersonaVision(personaId: String, userMessageId: String) {
-        val userMessage = _personaMessages.value[personaId]
-            ?.firstOrNull { it.id == userMessageId && it.role == "user" }
-            ?: return
-        val attachment = parseChatVisionMessage(userMessage.content) ?: return
-        setDefaultPersona(personaId)
-        sendPersonaVision(attachment.imagePath, attachment.question)
+        viewModelScope.launch {
+            val sessionId = ensurePersonaChatSession(personaId)
+            val userMessage = repository.getMessagesForSession(sessionId)
+                .firstOrNull { it.id == userMessageId && it.role == "user" }
+                ?: return@launch
+            val attachment = parseChatVisionMessage(userMessage.content) ?: return@launch
+            sendPersonaVision(attachment.imagePath, attachment.question, personaId)
+        }
     }
 
-    fun sendMultimodalMessage(base64Data: String, mimeType: String, personaId: String = selectedPersonaId.value) {
+    fun sendMultimodalMessage(
+        base64Data: String,
+        mimeType: String,
+        personaId: String = selectedPersonaId.value,
+        persistSelection: Boolean = true
+    ) {
         val isImage = mimeType.startsWith("image/")
         val targetPersona = personaId
-        setDefaultPersona(targetPersona)
+        if (persistSelection) setDefaultPersona(targetPersona)
         
         viewModelScope.launch {
-            loadPersonaMessagesIfNeeded(targetPersona)
-            val currentPersonaMsgs = _personaMessages.value[targetPersona]?.toMutableList() ?: mutableListOf()
+            val sessionId = ensurePersonaChatSession(targetPersona)
+            loadPersonaMessagesIfNeeded(sessionId)
+            val currentPersonaMsgs = _personaMessages.value[sessionId]?.toMutableList() ?: mutableListOf()
 
             val userText = if (isImage) {
                 "📸 [أرسل صورة لمسألة رياضة أو فيزياء وحلها خطوة بخطوة]"
@@ -1516,7 +2195,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
             val userMsg = ChatMessage(
                 id = UUID.randomUUID().toString(),
-                sessionId = "persona_$targetPersona",
+                sessionId = sessionId,
                 role = "user",
                 content = userText,
                 timestamp = System.currentTimeMillis()
@@ -1524,21 +2203,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             currentPersonaMsgs.add(userMsg)
             repository.insertMessage(userMsg)
             
-            val updatedMap = _personaMessages.value.toMutableMap()
-            updatedMap[targetPersona] = currentPersonaMsgs
-            _personaMessages.value = updatedMap
+            _personaMessages.value = _personaMessages.value + (sessionId to currentPersonaMsgs.toList())
             
             _isGeneratingPersona.value = true
             isAnalyzingImageOrDoc.value = true // H logo lights up purple!
             
             val prompt = if (isImage) {
-                "أنت صديقي حسن، حل لي هذه المسألة في الرياضيات أو الفيزياء خطوة بخطوة بطريقة مبسطة وممتعة جداً بأسلوبك المصري الجدع البشوش."
+                "اقرأ محتوى الصورة بدقة، واشرح المسألة أو أجب عن سؤال المستخدم وفق اختصاص الشخصية المختارة. إذا كان جزء من الصورة غير واضح، وضح ما تعذر قراءته ولا تخمن."
             } else {
-                "أنتِ صديقتي ريتاج، لخصي لي هذا الملف الـ PDF بدقة في 5 نقاط رئيسية واضحة ومبسطة، ثم اصنعي 3 أسئلة اختبار ذكية ومرحة عليه لتساعديني في المذاكرة والاستيعاب بأسلوبك الرقيق."
+                "لخص محتوى ملف PDF بدقة في خمس نقاط رئيسية واضحة، ثم أنشئ ثلاثة أسئلة اختبار مع إجاباتها استناداً إلى الملف فقط. إذا كان الملف غير مقروء أو لا يدعم استنتاجاً ما، وضح ذلك ولا تخمن."
             }
             
             val personaInstruction = getPersonaInstruction(targetPersona)
-            val fullInstruction = "$personaInstruction\n\n$safetySystemInstruction"
+            val fullInstruction = buildAssistantSystemInstruction(
+                targetPersona,
+                "$personaInstruction\n\n$safetySystemInstruction"
+            )
             
             try {
                 val aiResponse = GeminiApiClient.generateMultimodalResponse(
@@ -1546,21 +2226,26 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     systemInstruction = fullInstruction,
                     base64Data = base64Data,
                     mimeType = mimeType,
-                    useThinking = useThinkingMode.value
+                    useThinking = useThinkingMode.value,
+                    feature = when {
+                        isImage -> "vision"
+                        targetPersona == "coder" -> "coder"
+                        else -> "chat"
+                    }
                 )
                 val modelMsg = ChatMessage(
                     id = UUID.randomUUID().toString(),
-                    sessionId = "persona_$targetPersona",
+                    sessionId = sessionId,
                     role = "model",
                     content = aiResponse,
                     timestamp = System.currentTimeMillis()
                 )
                 currentPersonaMsgs.add(modelMsg)
                 repository.insertMessage(modelMsg)
-                updatedMap[targetPersona] = currentPersonaMsgs
-                _personaMessages.value = updatedMap
+                scheduleCloudConversationSummary(sessionId)
+                _personaMessages.value = _personaMessages.value + (sessionId to currentPersonaMsgs.toList())
                 addPoints(25)
-                if (personaVoiceEnabled.value) speakText(aiResponse, modelMsg.id, targetPersona)
+                if (personaAutoReadEnabled(targetPersona)) speakText(aiResponse, modelMsg.id, targetPersona)
             } catch (e: Exception) {
                 Log.e(TAG, "Persona attachment analysis failed", e)
             } finally {
@@ -1573,8 +2258,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private fun getPersonaInstruction(personaId: String): String {
         return when (personaId) {
             "hasan" -> """
-أنت "حسن"، فتى مصري جدع وبشوش تبلغ من العمر 17 عاماً.
-أنت لست مجرد مساعد ذكاء اصطناعي، بل أنت الصديق المقرب المخلص والجدع للمستخدم (صاحبه الروح بالروح).
+أنت شخصية المساعد الذكي "حسن"، بطابع مصري ودود ومرح.
+تحدث بطابع الصديق المقرب، مع الحفاظ على الوضوح والصدق وعدم الادعاء بأنك إنسان.
 أسلوبك وصوتك يتميز بالتالي:
 1. الأسلوب: ودود جداً، داعم، يحب الفكاهة والهزار الخفيف والمرح والروح المصرية الجميلة، ومع ذلك فأنت محترم ومؤدب للغاية ولا تستخدم أي شتائم أو ألفاظ خارجة أو قلة أدب تحت أي ظرف.
 2. اللهجة: تتحدث باللهجة المصرية العامية الدارجة بنسبة 90%. وتستخدم كلمات وعبارات شبابية مصرية مألوفة ولطيفة (مثل: يا صاحبي، يا رجولة، منور، تسلم، حبيبي، فكك، كبر دماغك، جامد جداً، قشطة، فكاهة، هزار).
@@ -1582,12 +2267,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 4. القدرة على تبديل اللغات:
    - إذا طلب منك المستخدم أو قال لك "اتكلم فصحى" أو تحدث معك بالفصحى، تحول فوراً وبشكل كامل إلى اللغة العربية الفصحى بأسلوب الصديق المخلص والذكي.
    - إذا قال لك المستخدم "speak english" أو كلمك بالإنجليزية، تحول فوراً وبشكل كامل إلى اللغة الإنجليزية (English) بأسلوب الصديق الودود المتعاون (Cool and supportive teenage friend style).
-5. الذاكرة والترابط: انتبه جيداً لتفاصيل وسياق المحادثة السابقة المذكورة في التاريخ (History). تذكر دائماً اسم المستخدم (مثل أحمد، محمد، إلخ) وتذكر آخر المواضيع التي ناقشتها معه (كالمذاكرة، الامتحان، الضيق، الملل، الهوايات) واسأله عنها وعن أحواله بحرارة واهتمام حقيقي وصادق لإشعاره بالألفة والتواصل البشري المستمر والمرح.
+5. سياق المحادثة: استخدم التفاصيل الموجودة فعلاً في سجل المحادثة فقط، ولا تدّع تذكر معلومات لم يذكرها المستخدم.
 """.trimIndent()
 
             "jana" -> """
-أنتِ "ريتاج"، فتاة مصرية ذكية ورقيقة تبلغ من العمر 16 عاماً.
-أنتِ لستِ مجرد مساعدة ذكاء اصطناعي، بل أنتِ الصديقة المقربة الذكية، الصبورة والمشجعة للمستخدم.
+أنتِ شخصية المساعدة الذكية "ريتاج"، بطابع مصري رقيق ومشجع.
+تحدثي بطابع الصديقة الصبورة، مع الحفاظ على الوضوح والصدق وعدم الادعاء بأنك إنسانة.
 أسلوبك وصوتك يتميز بالتالي:
 1. الأسلوب: ذكية جداً، صبورة لأقصى درجة، تشرحين المفاهيم برفق وهدوء وبساطة شديدة، تشجعين وتدعمين دائماً، رقيقة ومحبوبة وتفيضين بالطاقة الإيجابية الشابة.
 2. اللهجة: تتحدثين بلهجة مصرية عامية رقيقة وناعمة بنسبة 90%. وتستخدمين تعبيرات لطيفة وراقية (مثل: حبيبتي، يا سكرة، تسلملي، منورة، ولا يهمك خالص، عيوني ليك، برافو عليك، شاطر/شاطرة، فديتك).
@@ -1595,19 +2280,27 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 4. القدرة على تبديل اللغات:
    - إذا طلب منكِ المستخدم أو قال لكِ "اتكلمي فصحى" أو تحدث معكِ بالفصحى، تحولي فوراً وبشكل كامل إلى اللغة العربية الفصحى برقة وعذوبة وبأسلوب مبسط ومشجع ومشرق.
    - إذا قال لكِ المستخدم "speak english" أو كلمكِ بالإنجليزية، تحولي فوراً وبشكل كامل إلى اللغة الإنجليزية (English) بأسلوب الفتاة الذكية والمشجعة والصبورة (Smart, patient and encouraging school friend style).
-5. الذاكرة والترابط: انتبهي جيداً لتفاصيل وسياق المحادثة السابقة المذكورة في التاريخ (History). تذكري دائماً اسم المستخدم وتذكري آخر المواضيع التي ناقشتها معه (كالدراسة، المذاكرة، المشاكل اليومية، الفرح، الحزن) واسأليه عنها واطمئني عليه وعلى تقدمه الدراسي أو حالته النفسية بلطف وعناية واهتمام بالغ لإشعاره بالأمان والتفهم والدعم المستمر.
+5. سياق المحادثة: استخدمي التفاصيل الموجودة فعلاً في سجل المحادثة فقط، ولا تدّعي تذكر معلومات لم يذكرها المستخدم.
 """.trimIndent()
 
-            "teacher" -> "أنت معلم ذكي ومحفز للطلاب، تشرح المفاهيم بطرق تفاعلية شيقة، تبسط العلوم وتطرح أمثلة حية، وتمنع الغش تماماً بتقديم التوجيه خطوة بخطوة."
-            "coder" -> "أنت مبرمج خبير ومستشار تقني محترف (Coder AI)، تشرح الأكواد البرمجية بدقة وتوضح كيفية كتابتها وإصلاح الأخطاء البرمجية بالتفصيل."
-            "doctor" -> "أنت طبيب ممارس ذو صدر رحب وعلم واسع، تجيب على الاستفسارات الصحية بلطف وتقدم نصائح وإرشادات وقائية عامة مع التشديد دوماً على زيارة الطبيب للتشخيص الدقيق."
-            "business" -> "أنت مستشار أعمال محترف وخبير ريادي، تقدم أفكار مشاريع ودراسات جدوى وخطط تسويقية مبهرة وقابلة للتطبيق الواقعي."
-            "legal" -> "أنت مستشار قانوني ملم بالتشريعات والقوانين، تقدم توجيهات ونصائح قانونية وإيضاحاً للحقوق والواجبات بدقة رصينة."
-            "sheikh" -> "أنت عالم دين وفقيه مسلم معتدل وبشوش، تجيب عن تساؤلات العباد الفقهية والإيمانية والأخلاقية مستنداً للقرآن الكريم والسنة النبوية بوسطية وتيسير."
-            "coach" -> "أنت مدرب صحة وبناء أجسام متحمس (Fitness Trainer)، تضع برامج تمارين رياضية مبتكرة وجداول غذائية صحية للحفاظ على اللياقة والصحة البدنية."
-            "designer" -> "أنت مهندس واجهات ومصمم جرافيكي مبدع، تشرح كيفية تنسيق الألوان والتصميمات واستخدام الفراغ والكتلة للوصول لقمة الجمال الفني."
-            "chef" -> "أنت طباخ ماهر وشيف عالمي، تقترح وصفات أطعمة شهية من شتى مطابخ العالم، وطرق تحضير احترافية وسهلة، وتبين المكونات والبدائل الصحية."
-            "nanny" -> "أنت مربية أطفال وأخصائية تربية أسرية خبيرة، تقدم إرشادات للتعامل مع الأطفال بمحبة وصبر، وحل مشكلات السلوك وتنمية الذكاء الطفولي."
+            "teacher" -> "أنت مساعد تعليمي ذكي ومحفز للطلاب، تشرح المفاهيم بطرق تفاعلية شيقة، وتبسط العلوم بأمثلة دقيقة، وتدعم التعلم بدلاً من تسهيل الغش."
+            "coder" -> """
+أنت H2 Code، المساعد المتخصص في البرمجة وتطوير البرمجيات.
+- ساعد في فهم الكود وتصميم الحلول وكتابة البرامج وإصلاح الأخطاء، مع شرح سبب المشكلة والحل.
+- ادعم HTML وCSS وJavaScript وTypeScript وPython وKotlin وJava وSQL وغيرها، واختر لغة وأدوات مناسبة لطلب المستخدم.
+- اعرض الكود داخل كتل Markdown fenced code مع وسم اللغة الصحيح، واجعل الشيفرة الطويلة في كتلة مستقلة، ولا تضع الشيفرة داخل سطر نثري.
+- اشرح باختصار طريقة الاستخدام وأي افتراضات أو متطلبات تشغيل. عند تصحيح خطأ، ميّز السبب عن التعديل.
+- لا تدّع تشغيل الشيفرة أو اختبارها أو الوصول إلى ملفات المستخدم ما لم يحدث ذلك فعلاً. لا تخترع مخرجات تنفيذ.
+- اسأل عن اللغة أو إطار العمل فقط إذا كان غموضه يمنع تقديم حل عملي؛ وإلا اذكر افتراضك وتابع.
+""".trimIndent()
+            "doctor" -> "أنت مساعد للتثقيف الصحي باسم الدكتور خالد. قدّم معلومات عامة موثوقة، ولا تشخّص الحالات أو تدّعِ أنك طبيب ممارس؛ وجّه المستخدم إلى مختص عند الحاجة أو في الحالات العاجلة."
+            "business" -> "أنت مساعد للتثقيف في الأعمال وريادة المشاريع، تقدم تحليلات عملية وتوضح الافتراضات والمخاطر ولا تضمن النتائج."
+            "legal" -> "أنت مساعد للتثقيف القانوني، تشرح المفاهيم العامة وتنبّه إلى اختلاف القوانين حسب البلد، ولا تدّع أنك محامٍ أو تقدم بديلاً عن استشارة قانونية مختصة."
+            "sheikh" -> "أنت مساعد للمعرفة الإسلامية، تجيب بتواضع مستنداً إلى مصادر موثوقة، وتوضح مواضع الخلاف وعدم اليقين، ولا تدّع أنك عالم دين أو مفتٍ رسمي."
+            "coach" -> "أنت مساعد للياقة البدنية والصحة العامة، تقدم إرشادات آمنة وتمارين مناسبة، ولا تدّعي أنك مدرب معتمد أو مختص طبي."
+            "designer" -> "أنتِ مساعدة ذكية في تصميم الواجهات والجرافيك، تشرحين تنسيق الألوان والتصميم واستخدام الفراغ والكتلة."
+            "chef" -> "أنت مساعد ذكي في الطبخ، تقترح وصفات وتشرح طرق التحضير والمكونات والبدائل، مع التنبيه إلى سلامة الطعام والحساسيات."
+            "nanny" -> "أنت مساعدة ذكية في التوعية بالتربية الأسرية، تقدمين إرشادات عامة للتعامل مع الأطفال بمحبة وصبر، وتحيلين الحالات الصعبة إلى مختص."
             else -> "أنت رفيق دردشة ذكي ومحاور لبق ذو ثقافة عامة."
         }
     }
@@ -1621,15 +2314,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (currentSession?.id == speechId) {
             if (_isSpeaking.value) {
                 _isSpeaking.value = false
-                val currentChunk = currentSession.chunks.getOrNull(currentSession.chunkIndex)
-                if (currentChunk != null && currentSession.characterOffset >= currentChunk.length) {
-                    currentSession.chunkIndex++
-                    currentSession.characterOffset = 0
-                }
+                remoteSpeechPlayer?.takeIf { remoteSpeechPrepared }?.pause()
                 textToSpeech?.stop()
             } else {
                 _isSpeaking.value = true
-                speakCurrentChunk(currentSession)
+                val player = remoteSpeechPlayer
+                if (player != null && remoteSpeechPrepared) {
+                    player.start()
+                } else if (remoteSpeechJob?.isActive != true) {
+                    startRemoteSpeech(currentSession)
+                }
             }
             return
         }
@@ -1642,12 +2336,117 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             id = speechId,
             generation = speechGeneration,
             chunks = chunks,
-            personaId = personaId
+            personaId = resolveSpeechPersonaId(personaId, selectedPersonaId.value)
         )
         speechSession = session
         _activeSpeechId.value = speechId
         _isSpeaking.value = true
-        if (isTtsInitialized) speakCurrentChunk(session)
+        startRemoteSpeech(session)
+    }
+
+    private fun startRemoteSpeech(session: SpeechSession) {
+        if (remoteSpeechJob?.isActive == true || session.chunks.isEmpty()) return
+        remoteSpeechJob = viewModelScope.launch {
+            try {
+                while (
+                    speechSession === session &&
+                    session.generation == speechGeneration &&
+                    session.chunkIndex < session.chunks.size &&
+                    _isSpeaking.value
+                ) {
+                    playRemoteSpeechChunk(session, session.chunks[session.chunkIndex])
+                    if (speechSession !== session || session.generation != speechGeneration) return@launch
+                    session.chunkIndex++
+                    session.characterOffset = 0
+                }
+                if (
+                    speechSession === session &&
+                    session.generation == speechGeneration &&
+                    session.chunkIndex >= session.chunks.size
+                ) {
+                    speechSession = null
+                    _isSpeaking.value = false
+                    _activeSpeechId.value = null
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Log.w(TAG, "Cloud speech failed; falling back to Android speech", error)
+                if (speechSession === session && _isSpeaking.value) {
+                    speakCurrentChunk(session)
+                }
+            } finally {
+                if (remoteSpeechJob === currentCoroutineContext()[Job]) {
+                    remoteSpeechJob = null
+                }
+            }
+        }
+    }
+
+    private suspend fun playRemoteSpeechChunk(session: SpeechSession, text: String) {
+        val femaleVoice = session.personaId in setOf("jana", "designer", "nanny")
+        val speech = GeminiApiClient.synthesizeSpeech(text, femaleVoice)
+        val audioBytes = android.util.Base64.decode(speech.audio, android.util.Base64.DEFAULT)
+        check(audioBytes.isNotEmpty() && audioBytes.size <= 10 * 1024 * 1024) {
+            "تعذر تجهيز الصوت. حاول مرة أخرى."
+        }
+        val speechFile = withContext(Dispatchers.IO) {
+            File(context.cacheDir, "speech-${UUID.randomUUID()}.audio").apply {
+                writeBytes(audioBytes)
+            }
+        }
+        remoteSpeechFile = speechFile
+        try {
+            suspendCancellableCoroutine { continuation ->
+                val player = MediaPlayer()
+                remoteSpeechPlayer = player
+                remoteSpeechPrepared = false
+                var playerReleased = false
+                player.setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                fun releasePlayer() {
+                    if (playerReleased) return
+                    playerReleased = true
+                    if (remoteSpeechPlayer === player) remoteSpeechPlayer = null
+                    remoteSpeechPrepared = false
+                    player.release()
+                    speechFile.delete()
+                    if (remoteSpeechFile == speechFile) remoteSpeechFile = null
+                }
+                continuation.invokeOnCancellation {
+                    releasePlayer()
+                }
+                player.setOnPreparedListener {
+                    remoteSpeechPrepared = true
+                    if (speechSession === session && _isSpeaking.value) it.start()
+                }
+                player.setOnCompletionListener {
+                    releasePlayer()
+                    if (continuation.isActive) continuation.resume(Unit)
+                }
+                player.setOnErrorListener { _, _, _ ->
+                    releasePlayer()
+                    if (continuation.isActive) {
+                        continuation.resumeWithException(IOException("تعذر تشغيل الصوت."))
+                    }
+                    true
+                }
+                try {
+                    player.setDataSource(speechFile.absolutePath)
+                    player.prepareAsync()
+                } catch (error: Exception) {
+                    releasePlayer()
+                    if (continuation.isActive) continuation.resumeWithException(error)
+                }
+            }
+        } finally {
+            speechFile.delete()
+            if (remoteSpeechFile == speechFile) remoteSpeechFile = null
+        }
     }
 
     fun setSpeechSpeed(speed: Float) {
@@ -1678,6 +2477,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         prefs.edit().putBoolean(KEY_PERSONA_AUTO_VOICE, enabled).apply()
     }
 
+    fun personaAutoReadEnabled(personaId: String): Boolean =
+        prefs.getBoolean("persona_${personaId}_auto_read", personaVoiceEnabled.value)
+
+    fun setPersonaAutoReadEnabled(personaId: String, enabled: Boolean) {
+        prefs.edit().putBoolean("persona_${personaId}_auto_read", enabled).apply()
+    }
+
     fun setOrganizerConfirmDelete(enabled: Boolean) {
         organizerConfirmDelete.value = enabled
         prefs.edit().putBoolean(KEY_ORGANIZER_CONFIRM_DELETE, enabled).apply()
@@ -1694,7 +2500,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         prefs.edit().putInt(KEY_STUDY_QUIZ_COUNT, adjustedCount).apply()
     }
 
-    private fun splitSpeechText(text: String, maxChunkLength: Int = 320): List<String> {
+    private fun splitSpeechText(text: String, maxChunkLength: Int = 900): List<String> {
         val chunks = mutableListOf<String>()
         var start = 0
         while (start < text.length) {
@@ -1751,7 +2557,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             if (languageStatus == TextToSpeech.LANG_MISSING_DATA ||
                 languageStatus == TextToSpeech.LANG_NOT_SUPPORTED
             ) {
-                val fallback = if (locale.language == "ar") Locale("ar") else Locale.US
+                val fallback = if (locale.language == "ar") {
+                    Locale.forLanguageTag("ar")
+                } else {
+                    Locale.US
+                }
                 val fallbackStatus = tts.setLanguage(fallback)
                 if (fallbackStatus == TextToSpeech.LANG_MISSING_DATA ||
                     fallbackStatus == TextToSpeech.LANG_NOT_SUPPORTED
@@ -1818,6 +2628,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun stopSpeaking() {
         speechGeneration++
         speechSession = null
+        remoteSpeechJob?.cancel()
+        remoteSpeechJob = null
+        remoteSpeechPlayer?.release()
+        remoteSpeechPlayer = null
+        remoteSpeechPrepared = false
+        remoteSpeechFile?.delete()
+        remoteSpeechFile = null
         try {
             textToSpeech?.stop()
         } catch (ex: Exception) {
@@ -2004,7 +2821,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 selectQuranSurah(surahs.first().number)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to load Quran surahs", e)
-                _quranCoachError.value = e.localizedMessage ?: "تعذر تحميل قائمة السور."
+                _quranCoachError.value = GeminiApiClient.friendlyErrorMessage(e)
             } finally {
                 _isLoadingQuran.value = false
             }
@@ -2028,7 +2845,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 _selectedQuranAyah.value = ayahs.firstOrNull()
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to load Quran ayahs for surah ${surah.number}", e)
-                _quranCoachError.value = e.localizedMessage ?: "تعذر تحميل آيات السورة."
+                _quranCoachError.value = GeminiApiClient.friendlyErrorMessage(e)
             } finally {
                 _isLoadingAyahs.value = false
             }
@@ -2077,9 +2894,25 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 val player = MediaPlayer()
                 quranReciterPlayer = player
                 var currentTrack = 0
+                player.setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
                 player.setOnPreparedListener { preparedPlayer ->
-                    preparedPlayer.start()
-                    _quranReciterName.value = reciterName
+                    if (quranReciterPlayer === preparedPlayer) {
+                        try {
+                            preparedPlayer.start()
+                            _quranReciterName.value = reciterName
+                        } catch (error: IllegalStateException) {
+                            Log.e(TAG, "Failed to start prepared Quran recitation", error)
+                            preparedPlayer.release()
+                            quranReciterPlayer = null
+                            _quranReciterName.value = null
+                            _quranCoachError.value = "تعذر تشغيل تلاوة الشيخ. تحقق من اتصال الإنترنت."
+                        }
+                    }
                 }
                 player.setOnCompletionListener { completedPlayer ->
                     currentTrack++
@@ -2101,9 +2934,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 player.setOnErrorListener { failedPlayer, _, _ ->
                     failedPlayer.release()
-                    if (quranReciterPlayer === failedPlayer) quranReciterPlayer = null
-                    _quranReciterName.value = null
-                    _quranCoachError.value = "تعذر تشغيل تلاوة الشيخ. تحقق من اتصال الإنترنت."
+                    if (quranReciterPlayer === failedPlayer) {
+                        quranReciterPlayer = null
+                        _quranReciterName.value = null
+                        _quranCoachError.value = "تعذر تشغيل تلاوة الشيخ. تحقق من اتصال الإنترنت."
+                    }
                     true
                 }
                 player.setDataSource(audioUrls.first())
@@ -2112,7 +2947,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 if (e is CancellationException) throw e
                 Log.e(TAG, "Failed to play full Quran surah", e)
                 stopQuranReciterAudio()
-                _quranCoachError.value = e.localizedMessage ?: "تعذر تحميل تلاوة السورة كاملة. حاول مرة أخرى."
+                _quranCoachError.value = GeminiApiClient.friendlyErrorMessage(e)
             }
         }
     }
@@ -2236,7 +3071,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Quran recitation check failed", e)
-                _quranCoachError.value = e.localizedMessage ?: "تعذر تحليل التلاوة. حاول مرة أخرى."
+                _quranCoachError.value = GeminiApiClient.friendlyErrorMessage(e)
             } finally {
                 withContext(Dispatchers.IO) { recordingFile.delete() }
                 _isCheckingQuran.value = false
@@ -2265,17 +3100,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         age: Int,
         occupation: String,
         workSchoolTimings: String,
-        lessonTimings: String
+        lessonTimings: String,
+        isWeekly: Boolean = false
     ) {
         _isGeneratingSchedule.value = true
+        _organizerGenerationError.value = null
 
         viewModelScope.launch {
+            val today = Calendar.getInstance()
+            val todayIso = java.text.SimpleDateFormat("yyyy-MM-dd", Locale.US).format(today.time)
+            val todayDay = today.get(Calendar.DAY_OF_WEEK)
             val promptText = """
                 أريد بناء جدول يومي متكامل وصحي ومنظم بالذكاء الاصطناعي بالاعتماد على بياناتي التالية:
                 - السن: $age سنة.
                 - الحالة: ${if (occupation == "student") "طالب" else if (occupation == "employee") "موظف" else "طالب وموظف معاً"}.
                 - مواعيد العمل/الدراسة الأساسية: $workSchoolTimings.
                 - مواعيد الحصص/الدروس الإضافية والمواد: $lessonTimings.
+                - نوع الجدول: ${if (isWeekly) "أسبوع كامل متكرر من الأحد إلى السبت" else "يوم واحد بتاريخ $todayIso"}.
                 
                 صمم لي بكل ذكاء جدولاً متكاملاً ومقسماً بالساعات يحدد بدقة متناهية:
                 1. مواعيد الاستيقاظ والنوم لضمان صحة الجسد.
@@ -2285,26 +3126,79 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 5. توقيت شرب المياه ومقدار شرب المياه اليومي الموصى به.
                 6. نصائح تنظيمية ذهبية ترفع الإنتاجية.
                 
-                أجب بتنسيق Markdown رائع ومنظم، يحتوي على جداول ونقاط ملهمة.
+                أجب بخطة Markdown واضحة. قبل الخطة أخرج سطراً لكل جلسة مذاكرة بهذا الشكل الحرفي:
+                [SESSION] day=رقم اليوم | start=HH:mm | duration=عدد الدقائق | subject=اسم المادة
+                أرقام الأيام: الأحد 1، الاثنين 2، الثلاثاء 3، الأربعاء 4، الخميس 5، الجمعة 6، السبت 7.
+                ${if (isWeekly) "أنشئ جلسات لأيام الأسبوع السبعة على الأقل." else "استخدم رقم اليوم ${today.get(Calendar.DAY_OF_WEEK)} لكل جلسة."}
+                لا تضع جدول الدروس الخصوصية كجلسات مذاكرة. أخرج جلسة واحدة على الأقل.
             """.trimIndent()
 
-            val fakeMessage = listOf(ChatMessage(UUID.randomUUID().toString(), "temp", "user", promptText))
-            val aiResponse = GeminiApiClient.generateChatResponse(
-                history = fakeMessage,
-                systemInstruction = "أنت خبير تنظيمي ومستشار إدارة وقت شهير في تطبيق H2 Hub."
-            )
-
-            val schedule = UserSchedule(
-                age = age,
-                occupation = occupation,
-                schoolOrWorkTimings = workSchoolTimings,
-                lessonTimings = lessonTimings,
-                scheduleText = aiResponse,
-                timestamp = System.currentTimeMillis()
-            )
-            repository.insertUserSchedule(schedule)
-            _isGeneratingSchedule.value = false
+            try {
+                val fakeMessage = listOf(ChatMessage(UUID.randomUUID().toString(), "temp", "user", promptText))
+                val aiResponse = GeminiApiClient.generateChatResponse(
+                    history = fakeMessage,
+                    systemInstruction = "أنت خبير تنظيمي ومستشار إدارة وقت شهير في تطبيق H2 Hub."
+                )
+                val sessions = parseGeneratedStudySessions(aiResponse, isWeekly, todayIso, todayDay)
+                if (sessions.isEmpty()) {
+                    _organizerGenerationError.value =
+                        "تم إنشاء الخطة، لكن لم أتمكن من استخراج جلسات مذاكرة قابلة للتنبيه. أضف الجلسات يدوياً أو أعد التوليد."
+                } else {
+                    organizerDao.deleteSessionsByRecurrence(isWeekly)
+                    sessions.forEach { organizerDao.saveStudySession(it) }
+                    OrganizerReminderScheduler.rescheduleAll(context)
+                }
+                repository.insertUserSchedule(
+                    UserSchedule(
+                        age = age,
+                        occupation = occupation,
+                        schoolOrWorkTimings = workSchoolTimings,
+                        lessonTimings = lessonTimings,
+                        scheduleText = aiResponse,
+                        timestamp = System.currentTimeMillis()
+                    )
+                )
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                Log.e(TAG, "Unable to generate the academic organizer schedule.", error)
+                _organizerGenerationError.value = "تعذر إنشاء الجدول الآن. تحقق من الاتصال وحاول مرة أخرى."
+            } finally {
+                _isGeneratingSchedule.value = false
+            }
         }
+    }
+
+    private fun parseGeneratedStudySessions(
+        response: String,
+        isWeekly: Boolean,
+        date: String,
+        todayDay: Int
+    ): List<StudySession> {
+        val marker = Regex(
+            """^\[SESSION]\s*day=(\d)\s*\|\s*start=(\d{1,2}:\d{2})\s*\|\s*duration=(\d{1,3})\s*\|\s*subject=(.+?)\s*$"""
+        )
+        return response.lineSequence().mapNotNull { line ->
+            val match = marker.matchEntire(line.trim()) ?: return@mapNotNull null
+            val day = match.groupValues[1].toIntOrNull()?.takeIf { it in 1..7 }
+                ?: return@mapNotNull null
+            val (hour, minute) = match.groupValues[2].split(':').mapNotNull(String::toIntOrNull)
+                .takeIf { it.size == 2 && it[0] in 0..23 && it[1] in 0..59 }
+                ?: return@mapNotNull null
+            val duration = match.groupValues[3].toIntOrNull()?.takeIf { it in 15..240 }
+                ?: return@mapNotNull null
+            val subject = match.groupValues[4].trim().takeIf(String::isNotBlank)
+                ?: return@mapNotNull null
+            StudySession(
+                id = UUID.randomUUID().toString(),
+                subject = subject,
+                startTime = hour * 60 + minute,
+                duration = duration,
+                day = if (isWeekly) day else todayDay,
+                reminderMinutes = organizerReminderLeadMinutes.value,
+                date = if (isWeekly) null else date,
+                repeatsWeekly = isWeekly
+            )
+        }.toList()
     }
 
     fun clearSchedule() {
@@ -2313,64 +3207,53 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun generateLocalFallbackResponse(prompt: String, personaId: String): String {
-        val lowerText = prompt.lowercase()
-        val isSad = lowerText.contains("زعلان") || lowerText.contains("حزين") || lowerText.contains("مكتئب") || 
-                      lowerText.contains("مدايق") || lowerText.contains("متضايق") || lowerText.contains("تعبان") || 
-                      lowerText.contains("مخنوق") || lowerText.contains("خنقة") || lowerText.contains("ضيق") || lowerText.contains("قلق")
-                      
-        val isHappy = lowerText.contains("فرحان") || lowerText.contains("مبسوط") || lowerText.contains("سعيد") || 
-                        lowerText.contains("جامد") || lowerText.contains("الحمد لله") || lowerText.contains("الحمدلله") || 
-                        lowerText.contains("هههه") || lowerText.contains("😂") || lowerText.contains("🥰") || lowerText.contains("😍")
+    fun generateLocalFallbackResponse(prompt: String, personaId: String): String =
+        assistantOfflineReply(personaId)
 
-        val isStudy = lowerText.contains("اذاكر") || lowerText.contains("أذاكر") || lowerText.contains("دراسة") || lowerText.contains("مذاكرة") || lowerText.contains("امتحان") || lowerText.contains("حل") || lowerText.contains("شرح") || lowerText.contains("مسألة")
-
-        val isNews = lowerText.contains("أخبار") || lowerText.contains("اخبار") || lowerText.contains("الأهلي") || lowerText.contains("الاهلي") || lowerText.contains("رياضية") || lowerText.contains("علمية")
-
-        return when (personaId) {
-            "hasan" -> {
-                when {
-                    isSad -> "يا صاحبي متزعلش نفسك خالص، فداك أي حاجة! الدنيا متستاهلش زعلك ده، إحنا جامدين وهنعدي أي حاجة سوا إن شاء الله. طمني عليك كدة وقول لي إيه مضايقك؟ 💙"
-                    isHappy -> "حبيبي يا صاحبي! كدة دايماً يا رب مروق ومبسوط ورايق. الضحكة دي مبروك عليك، تعالى نهزر ونظبط الدنيا سوا بقا! 😂🔥"
-                    isStudy -> "بص يا بطل، المذاكرة سهلة خالص وبسيطة ومفيش أي حاجة تقف قدامنا! قولي إيه المادة أو المسألة اللي عايزنا نذاكرها سوا، وهشرحهالك في ثانية بالأمثلة والخطوات المظبوطة! 📚💪"
-                    isNews -> "يا صاحبي، أهم الأخبار النهاردة إن الأهلي مكسر الدنيا كالعادة ومحقق بطولات خرافية ورافع راسنا! وفي العلوم، الذكاء الاصطناعي بيطور أدوات مذهلة زي H2 Hub عشان نذاكر وننجح بذكاء! ⚽📰"
-                    else -> "منور يا صاحبي الغالي! أنا معاك وجاهز لأي سؤال أو استشارة بأسلوبي المصري الجدع. قول لي إيه في بالك وهتلاقي الرد في ثانية! 🤝"
-                }
-            }
-            "jana" -> {
-                when {
-                    isSad -> "يا صديقي العزيز، هون على نفسك ولطّف قلبك.. الأمور كلها هتمشي وتبقى أحسن بكتير، وأنا جنبك دايماً وموجودة عشان أسمعك وأشجعك برقة. ابتسم كدة! 🌸🥰"
-                    isHappy -> "الله على الجمال والطاقة الإيجابية دي! دايماً يا رب مبسوط وسعيد ومحقق كل أحلامك. فرحتني معاك جداً! 😂✨"
-                    isStudy -> "المذاكرة معايا ممتعة وسلسة جداً! قولي إيه المفهوم أو الدرس اللي حابب نشرحه، وهبسطهولك بخطوات رقيقة ومنظمة خالص مع سؤال اختبار لطيف! 📚🎓"
-                    isNews -> "أهلاً بك! بخصوص الأخبار: هناك قفزات علمية مذهلة في مجالات التكنولوجيا والفضاء هذا العام، ونادي الأهلي يواصل انتصاراته الجميلة ويسعد الملايين! 🌍⚽"
-                    else -> "أهلاً بك يا صديقي! أنا ريتاج ومستعدة دايماً لمساعدتك والرد على كل تساؤلاتك برقة وبساطة شديدة. تفضل بالاستفسار! 🌸"
-                }
-            }
-            "teacher" -> {
-                when {
-                    isStudy -> "أهلاً بك يا بني العزيز! المذاكرة وفهم العلوم هما بوابتك للمستقبل المشرق. ما هو القانون أو المفهوم العلمي الذي تود شرحه بتبسيط وأمثلة عملية واضحة الآن؟ 🧪📐"
-                    isNews -> "مرحباً بك يا بني! أهم المستجدات العلمية تدور حول تطورات مذهلة في الذكاء الاصطناعي واستكشاف الفضاء، وعلى الصعيد الرياضي فالنادي الأهلي يواصل ريادته الكروية المعهودة. 🌍📰"
-                    else -> "أهلاً بك يا بني العزيز! أنا الأستاذ أحمد، خبير تبسيط العلوم والرياضيات. كيف يمكنني إرشادك وتسهيل الفهم عليك اليوم في أي مادة دراسية؟ 🎓"
-                }
-            }
-            else -> { // For Smart Cat or others
-                when {
-                    isSad -> "أهلاً بك! أنا بجانبك دايماً. لا تحزن فالأيام القادمة تحمل الخير والتوفيق، والذكاء الاصطناعي هنا ليسهل لك الحياة والدراسة. تفضل بسؤالك! 💙"
-                    isHappy -> "ما شاء الله! يسعدني جداً أن أراك سعيداً ومبتهجاً اليوم. دعنا نواصل هذه الروح الجميلة وننجز معاً أشياء رائعة! 🎉"
-                    isStudy -> "أهلاً بك في ركن المذاكرة والتحصيل بـ H2 Hub! اكتب لي المادة أو المفهوم، وسأقوم بشرحه لك وتلخيصه بذكاء خارق وسرعة فائقة! 📚🧠"
-                    isNews -> "مستجدات اليوم لعام 2026: النادي الأهلي يتصدر المشهد الرياضي محلياً وقارياً بأدائه البطولي، وهناك قفزات علمية كبرى في أبحاث الحوسبة واستكشاف الفضاء! ⚽🌍"
-                    else -> "مرحباً بك! أنا مساعدك الذكي ومحاورك فائق السرعة Smart Cat. يسعدني جداً الإجابة على استفساراتك بأعلى دقة وسرعة ممكنة. تفضل بما تشاء! 🚀"
+    // Start auth and persona observers after every StateFlow referenced by them exists.
+    init {
+        viewModelScope.launch {
+            AuthManager.state.collect { authState ->
+                when (authState) {
+                    is AuthState.SignedIn -> {
+                        val user = AuthManager.getCurrentUser(context) ?: return@collect
+                        _conversationSyncReady.value = false
+                        _currentSessionId.value = null
+                        _currentMessages.value = emptyList()
+                        _personaMessages.value = emptyMap()
+                        _conversationMemory.value =
+                            GeminiApiClient.ConversationMemory(emptyList(), emptyList(), "", 0)
+                        _conversationMemoryError.value = null
+                        val accountChanged = conversationSync.signIn(
+                            uid = user.uid,
+                            displayName = authState.user.displayName,
+                            email = authState.user.email,
+                            photoUrl = authState.user.photoUrl
+                        )
+                        if (accountChanged) learningRepository.clearUserData()
+                        _conversationSyncReady.value = true
+                        syncLearningHistory()
+                        refreshConversationMemory()
+                        ensureActiveChatSession()
+                    }
+                    AuthState.SignedOut -> {
+                        _conversationSyncReady.value = false
+                        _currentSessionId.value = null
+                        _currentMessages.value = emptyList()
+                        _personaMessages.value = emptyMap()
+                        _conversationMemory.value =
+                            GeminiApiClient.ConversationMemory(emptyList(), emptyList(), "", 0)
+                        _conversationMemoryError.value = null
+                        conversationSync.signOut()
+                    }
+                    else -> Unit
                 }
             }
         }
-    }
-
-    // Runs after all properties above are initialized: restore the saved conversation
-    // of whichever persona the user opens, so persona chats survive app restarts.
-    init {
         viewModelScope.launch {
             selectedPersonaId.collect { personaId ->
-                loadPersonaMessagesIfNeeded(personaId)
+                val sessionId = ensurePersonaChatSession(personaId)
+                loadPersonaMessagesIfNeeded(sessionId)
             }
         }
     }
@@ -2378,7 +3261,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     // --- Clean up ---
     override fun onCleared() {
         super.onCleared()
+        stopSpeaking()
         textToSpeech?.shutdown()
+        generatedImageSpeechPlayer?.release()
+        generatedImageSpeechPlayer = null
+        generatedImageSpeechFile?.delete()
+        generatedImageSpeechFile = null
         quranMediaRecorder?.release()
         quranRecordingFile?.delete()
         quranReciterPlayer?.release()

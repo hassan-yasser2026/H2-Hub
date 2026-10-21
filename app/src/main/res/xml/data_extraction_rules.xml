@@ -5,15 +5,19 @@
 -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <exclude domain="database" path="h2_learning_profile.db" />
+        <exclude domain="database" path="h2_learning_profile.db-wal" />
+        <exclude domain="database" path="h2_learning_profile.db-shm" />
+        <exclude domain="sharedpref" path="h2hub_data.xml" />
+        <exclude domain="sharedpref" path="subscription_prefs.xml" />
+        <exclude domain="file" path="chat-vision/" />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="database" path="h2_learning_profile.db" />
+        <exclude domain="database" path="h2_learning_profile.db-wal" />
+        <exclude domain="database" path="h2_learning_profile.db-shm" />
+        <exclude domain="sharedpref" path="h2hub_data.xml" />
+        <exclude domain="sharedpref" path="subscription_prefs.xml" />
+        <exclude domain="file" path="chat-vision/" />
     </device-transfer>
-    -->
 </data-extraction-rules>

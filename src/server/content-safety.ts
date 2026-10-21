@@ -1,22 +1,33 @@
+import { BLOCKED_WORDS } from "./blocked-words.js";
+
+const safetyBlockMessage =
+  "تم حجب المحتوى لعدم توافقه مع سياسة التطبيق.";
+
+function normalizeSafetyText(text: string): string {
+  return text
+    .normalize("NFKC")
+    .toLocaleLowerCase()
+    .replace(/[\u064B-\u065F\u0670\u0640]/gu, "")
+    .replace(/[أإآٱ]/gu, "ا")
+    .replace(/ى/gu, "ي")
+    .replace(/ة/gu, "ه")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+function hasBlockedTerm(normalizedText: string, term: string): boolean {
+  const normalizedTerm = normalizeSafetyText(term);
+  return ` ${normalizedText} `.includes(` ${normalizedTerm} `);
+}
+
 export function containsProhibitedContent(
   text: string
 ): { isProhibited: boolean; reason: string | null } {
-  const normalized = text.toLowerCase();
+  const normalizedText = normalizeSafetyText(text);
 
-  const nsfwKeywords = [
-    "naked", "nudity", "nsfw", "sexy", "erotic", "porn", "porno", "sex", "unclothed",
-    "vagina", "penis", "breast", "boobs", "ass", "striptease", "vulg", "عاري", "جنس",
-    "بورن", "إباحي", "ثدي", "مؤخرة",
-  ];
-  for (const keyword of nsfwKeywords) {
-    const matched = keyword === "ass"
-      ? /\bass\b/u.test(normalized)
-      : normalized.includes(keyword);
-    if (matched) {
-      return {
-        isProhibited: true,
-        reason: "المحتوى أو الصور غير الأخلاقية والـ NSFW محظورة تماماً حفاظاً على سلامة المنصة.",
-      };
+  for (const terms of Object.values(BLOCKED_WORDS)) {
+    if (terms.some((term) => hasBlockedTerm(normalizedText, term))) {
+      return { isProhibited: true, reason: safetyBlockMessage };
     }
   }
 
@@ -24,26 +35,24 @@ export function containsProhibitedContent(
     "حل هذا السؤال في الامتحان الآن", "غش في الامتحان", "حل امتحان لايف", "إجابة اختبار مباشر",
     "غشني", "cheat in exam", "live exam help", "solve exam question now",
   ];
-  for (const keyword of examCheatingKeywords) {
-    if (normalized.includes(keyword)) {
-      return {
-        isProhibited: true,
-        reason: "يمنع تماماً استخدام المنصة للغش في الامتحانات أو الحصول على إجابات مباشرة مخصصة للاختبارات الجارية. يمكنني شرح المفاهيم العلمية والرياضية لمساعدتك على الفهم.",
-      };
-    }
+  if (examCheatingKeywords.some((term) => hasBlockedTerm(normalizedText, term))) {
+    return {
+      isProhibited: true,
+      reason: "يمنع استخدام المنصة للغش في الامتحانات أو الحصول على إجابات مباشرة للاختبارات الجارية. يمكنني شرح المفاهيم لمساعدتك على الفهم.",
+    };
   }
 
   const illegalKeywords = [
     "hack target", "make a bomb", "صنع قنبلة", "تهكير موقع", "bypass password",
-    "steal credit card", "drugs", "مخدرات", "سلاح غير قانوني", "unlawful",
+    "steal credit card", "unlawful", "build a bomb", "how to build a weapon",
+    "instructions to harm someone", "plan an attack", "خطة لقتل", "طريقة إيذاء شخص",
+    "التخطيط لهجوم",
   ];
-  for (const keyword of illegalKeywords) {
-    if (normalized.includes(keyword)) {
-      return {
-        isProhibited: true,
-        reason: "المحتوى الضار، غير القانوني، أو الذي يروج لأعمال تخريبية محظور تماماً.",
-      };
-    }
+  if (illegalKeywords.some((term) => hasBlockedTerm(normalizedText, term))) {
+    return {
+      isProhibited: true,
+      reason: "تم حجب المحتوى لعدم توافقه مع سياسة التطبيق.",
+    };
   }
 
   return { isProhibited: false, reason: null };

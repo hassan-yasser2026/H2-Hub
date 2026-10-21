@@ -13,7 +13,10 @@ let tableReady: Promise<void> | undefined;
 export type PushMessage = {
   title: string;
   body: string;
+  type?: "app_update" | "quiz_result";
 };
+
+export type PushData = Record<string, string>;
 
 export function isValidPushToken(value: unknown): value is string {
   return typeof value === "string" &&
@@ -35,7 +38,21 @@ export function parsePushMessage(value: unknown): PushMessage | null {
   ) {
     return null;
   }
-  return { title: input.title.trim(), body: input.body.trim() };
+  if (
+    input.type !== undefined &&
+    input.type !== "app_update" &&
+    input.type !== "quiz_result"
+  ) {
+    return null;
+  }
+  const message: PushMessage = {
+    title: input.title.trim(),
+    body: input.body.trim(),
+  };
+  if (input.type === "app_update" || input.type === "quiz_result") {
+    message.type = input.type;
+  }
+  return message;
 }
 
 async function ensurePushTokenTable(): Promise<void> {
@@ -63,6 +80,14 @@ export async function registerPushToken(token: string): Promise<void> {
      ON CONFLICT (token) DO UPDATE SET updated_at = now()`,
     [token]
   );
+}
+
+export async function getRegisteredPushDeviceCount(): Promise<number> {
+  await ensurePushTokenTable();
+  const result = await getDatabasePool().query<{ count: string }>(
+    `SELECT count(*)::text AS count FROM ${PUSH_TOKEN_TABLE}`
+  );
+  return Number(result.rows[0]?.count ?? 0);
 }
 
 async function listPushTokens(): Promise<string[]> {
@@ -145,10 +170,21 @@ export async function sendPushBroadcast(message: PushMessage): Promise<{
 
   for (let offset = 0; offset < tokens.length; offset += 500) {
     const batch = tokens.slice(offset, offset + 500);
-    const result = await messaging.sendEachForMulticast({
-      tokens: batch,
-      notification: message,
-    });
+    const result = await messaging.sendEachForMulticast(message.type
+      ? {
+          tokens: batch,
+          data: {
+            title: message.title,
+            body: message.body,
+            type: message.type,
+            target: message.type === "quiz_result" ? "learning_profile" : "home",
+          },
+          android: { priority: "high" },
+        }
+      : {
+          tokens: batch,
+          notification: { title: message.title, body: message.body },
+        });
     sent += result.successCount;
     failed += result.failureCount;
     result.responses.forEach((response, index) => {
@@ -160,4 +196,25 @@ export async function sendPushBroadcast(message: PushMessage): Promise<{
 
   await removePushTokens(invalidTokens);
   return { attempted: tokens.length, sent, failed };
+}
+
+export async function sendPushToToken(
+  token: string,
+  message: PushMessage,
+  data: PushData,
+): Promise<void> {
+  try {
+    await getFirebaseMessaging().send({
+      token,
+      data: { title: message.title, body: message.body, ...data },
+      android: { priority: "high" },
+    });
+  } catch (error) {
+    const code = (error as { code?: unknown })?.code;
+    if (typeof code === "string" && INVALID_TOKEN_CODES.has(code)) {
+      await removePushTokens([token]);
+      return;
+    }
+    throw error;
+  }
 }
