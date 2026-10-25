@@ -10,7 +10,7 @@ import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.credentials.exceptions.GetCredentialException
 import androidx.credentials.exceptions.NoCredentialException
 import com.example.R
-import com.google.android.libraries.identity.googleid.GetGoogleIdOption
+import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import com.google.android.libraries.identity.googleid.GoogleIdTokenParsingException
 import com.google.firebase.FirebaseApp
@@ -66,10 +66,9 @@ object AuthManager {
         }
         _state.value = AuthState.SigningIn()
         try {
-            val option = GetGoogleIdOption.Builder()
-                .setServerClientId(context.getString(R.string.default_web_client_id))
-                .setFilterByAuthorizedAccounts(false)
-                .setAutoSelectEnabled(false)
+            val option = GetSignInWithGoogleOption.Builder(
+                context.getString(R.string.default_web_client_id)
+            )
                 .build()
             val request = GetCredentialRequest.Builder().addCredentialOption(option).build()
             val result = CredentialManager.create(context).getCredential(context, request)
