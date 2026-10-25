@@ -1251,8 +1251,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     buildSmartCatSystemInstruction(safetySystemInstruction)
                 )
                 val deviceToken = PushNotifications.registeredToken(context)
+                val signedInUserId = AuthManager.getCurrentUser(context)?.uid
                 if (
                     deviceToken != null &&
+                    signedInUserId != null &&
                     NotificationScheduler.isEnabled(
                         context,
                         NotificationScheduler.KEY_CHAT_ENABLED,
@@ -1338,7 +1340,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         NotificationScheduler.enqueueChatReply(
                             context,
                             sessionId,
-                            notificationId
+                            notificationId,
+                            signedInUserId
                         )
                         _backgroundChatPendingSession.value = sessionId
                         return@launch

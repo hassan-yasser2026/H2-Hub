@@ -67,8 +67,14 @@ class FirestoreConversationSync(
             dao.clearChatHistory()
             clearAccountData()
             accountPreferences.edit().clear().apply()
-        } else if (previousOwner == null) {
-            migrateLocalHistory(uid)
+        } else {
+            try {
+                migrateLocalHistory(uid)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                reportError("تعذر رفع بعض المحادثات المحفوظة لهذا الحساب.", error)
+            }
         }
         preferences.edit().putString(KEY_CONVERSATION_OWNER, uid).apply()
 
@@ -104,9 +110,6 @@ class FirestoreConversationSync(
         settingsListener?.let(accountPreferences::unregisterOnSharedPreferenceChangeListener)
         settingsListener = null
         activeUserId = null
-        if (preferences.contains(KEY_CONVERSATION_OWNER)) {
-            dao.clearChatHistory()
-        }
         _status.value = ConversationSyncStatus()
     }
 
@@ -612,19 +615,29 @@ class FirestoreConversationSync(
     private suspend fun migrateLocalHistory(uid: String) {
         val localSessions = dao.getAllSessionsFlow().first()
         localSessions.forEach { session ->
-            enqueue(
-                conversations(uid).document(session.id)
-                    .set(conversationData(session, dao.getMessagesForSession(session.id).size), SetOptions.merge()),
-                "تعذر ترحيل محادثة قديمة."
+            val conversation = conversations(uid).document(session.id)
+            val messages = dao.getMessagesForSession(session.id)
+            var batch = firestore.batch()
+            var writeCount = 0
+            batch.set(
+                conversation,
+                conversationData(session, messages.size),
+                SetOptions.merge()
             )
-            dao.getMessagesForSession(session.id).forEach { message ->
-                enqueue(
-                    conversations(uid).document(session.id)
-                    .collection(COLLECTION_MESSAGES).document(message.id)
-                        .set(message.toFirestoreData()),
-                    "تعذر ترحيل رسالة قديمة."
+            writeCount++
+            messages.forEach { message ->
+                if (writeCount == MAX_BATCH_WRITES) {
+                    batch.commit().await()
+                    batch = firestore.batch()
+                    writeCount = 0
+                }
+                batch.set(
+                    conversation.collection(COLLECTION_MESSAGES).document(message.id),
+                    message.toFirestoreData()
                 )
+                writeCount++
             }
+            if (writeCount > 0) batch.commit().await()
         }
     }
 

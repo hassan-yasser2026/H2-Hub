@@ -198,12 +198,18 @@ object NotificationScheduler {
                 }.getOrDefault(false)
             }
 
-    fun enqueueChatReply(context: Context, sessionId: String, notificationId: String): UUID {
+    fun enqueueChatReply(
+        context: Context,
+        sessionId: String,
+        notificationId: String,
+        userId: String
+    ): UUID {
         val request = OneTimeWorkRequestBuilder<ChatReplyWorker>()
             .setInputData(
                 Data.Builder()
                     .putString("sessionId", sessionId)
                     .putString("notificationId", notificationId)
+                    .putString("userId", userId)
                     .build()
             )
             .setConstraints(

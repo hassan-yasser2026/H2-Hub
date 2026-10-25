@@ -12,6 +12,7 @@ import com.example.data.OrganizerDatabase
 import com.example.network.ApiDeviceIdentity
 import com.example.network.GeminiApiClient
 import com.example.network.parseQuotaError
+import com.google.firebase.auth.FirebaseAuth
 import java.io.IOException
 import java.util.Calendar
 import kotlinx.coroutines.delay
@@ -140,11 +141,18 @@ class ChatReplyWorker(
             ?: return Result.failure()
         val notificationId = inputData.getString("notificationId")
             ?: return Result.failure()
+        val expectedUserId = inputData.getString("userId")
+            ?: return Result.failure()
         val repository = AppRepository(AppDatabase.getDatabase(applicationContext).appDao())
         val pendingRequest = repository.getPendingChatRequest(notificationId)
         val requestJson = pendingRequest?.requestJson
             ?: NotificationScheduler.chatRequest(applicationContext, notificationId)
             ?: return Result.failure()
+        if (FirebaseAuth.getInstance().currentUser?.uid != expectedUserId) {
+            NotificationScheduler.discardChatRequest(applicationContext, notificationId)
+            repository.deletePendingChatRequest(notificationId)
+            return Result.success()
+        }
         ApiDeviceIdentity.install(applicationContext)
         val token = PushNotifications.registeredToken(applicationContext)
             ?: return Result.retry()
@@ -173,6 +181,11 @@ class ChatReplyWorker(
 
             val deadline = System.currentTimeMillis() + MAX_POLLING_MILLIS
             while (System.currentTimeMillis() < deadline) {
+                if (FirebaseAuth.getInstance().currentUser?.uid != expectedUserId) {
+                    NotificationScheduler.discardChatRequest(applicationContext, notificationId)
+                    repository.deletePendingChatRequest(notificationId)
+                    return Result.success()
+                }
                 val state = GeminiApiClient.getAsyncChatStatus(jobId, token)
                 when (state.status) {
                     "completed" -> {
@@ -180,6 +193,11 @@ class ChatReplyWorker(
                             ?: return Result.failure(
                                 Data.Builder().putString("error", "وصل رد فارغ من الخادم.").build()
                             )
+                        if (FirebaseAuth.getInstance().currentUser?.uid != expectedUserId) {
+                            NotificationScheduler.discardChatRequest(applicationContext, notificationId)
+                            repository.deletePendingChatRequest(notificationId)
+                            return Result.success()
+                        }
                         repository.insertMessage(
                             ChatMessage(
                                 id = "async-reply-$notificationId",
