@@ -38,6 +38,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.ui.unit.dp
+import com.example.BuildConfig
 import com.example.auth.AuthManager
 import com.example.auth.AuthState
 import com.example.ui.AppUi
@@ -70,7 +71,7 @@ class MainActivity : ComponentActivity() {
         PushNotifications.openNotificationIntent(intent)
         AuthManager.refreshState(this)
 
-        MobileAds.initialize(this)
+        if (BuildConfig.ADS_ENABLED) MobileAds.initialize(this)
 
         setContent {
             val viewModel: AppViewModel = viewModel()

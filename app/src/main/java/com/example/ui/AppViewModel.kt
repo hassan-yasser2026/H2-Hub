@@ -77,20 +77,43 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val context = application.applicationContext
     private val prefs = context.getSharedPreferences("h2hub_prefs", Context.MODE_PRIVATE)
     private val database = AppDatabase.getDatabase(context)
+    private val organizerDao = OrganizerDatabase.getDatabase(context).organizerDao()
     private val conversationSync = FirestoreConversationSync(
         context,
         database.appDao(),
+        organizerDao,
         viewModelScope
     )
     private val repository = AppRepository(database.appDao(), conversationSync)
     private val _conversationSyncReady = MutableStateFlow(false)
     val conversationSyncReady: StateFlow<Boolean> = _conversationSyncReady.asStateFlow()
     val conversationSyncStatus: StateFlow<ConversationSyncStatus> = conversationSync.status
-    private val organizerDao = OrganizerDatabase.getDatabase(context).organizerDao()
     private val learningRepository = LearningProfileRepository(
         LearningProfileDatabase.getDatabase(context).learningProfileDao()
     )
     private val summarizingSessions = mutableSetOf<String>()
+
+    private fun refreshAccountPreferences() {
+        _socraticModeEnabled.value = prefs.getBoolean(KEY_SOCRATIC_MODE, false)
+        _educationalContentEnabled.value = prefs.getBoolean(KEY_EDUCATIONAL_CONTENT_MODE, false)
+        useThinkingMode.value = prefs.getBoolean("thinking_mode_enabled", false)
+        GeminiApiClient.setThinkingModeEnabled(useThinkingMode.value)
+        webSearchEnabled.value = prefs.getBoolean("chat_web_search_enabled", false)
+        groqThinkingEnabled.value = prefs.getBoolean("chat_groq_thinking_enabled", false)
+        imageGenerationEnabled.value = prefs.getBoolean("chat_image_generation_enabled", false)
+        autoReadChatEnabled.value = prefs.getBoolean("chat_auto_read", false)
+        appTheme.value = prefs.getString("app_theme", "purple") ?: "purple"
+        speechSpeed.value = prefs.getFloat(KEY_TTS_SPEECH_SPEED, 0.95f).coerceIn(0.75f, 1.25f)
+        organizerConfirmDelete.value = prefs.getBoolean(KEY_ORGANIZER_CONFIRM_DELETE, true)
+        trackLearningProfile.value = prefs.getBoolean(KEY_TRACK_LEARNING_PROFILE, true)
+        studyQuizQuestionCount.value = prefs.getInt(KEY_STUDY_QUIZ_COUNT, 5).coerceIn(5, 10)
+        quranReminderEnabled.value = prefs.getBoolean("quran_reminder_enabled", false)
+        quranReminderHour.value = prefs.getInt("quran_reminder_hour", 20)
+        quranReminderMinute.value = prefs.getInt("quran_reminder_minute", 0)
+        userPoints.value = prefs.getInt("user_points", 240)
+        userBadges.value = loadPersistedBadges()
+        leaderboardList.value = buildLeaderboard(userPoints.value)
+    }
 
     // Text to Speech Fallback (Android Native)
     private var textToSpeech: TextToSpeech? = null
@@ -1099,7 +1122,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             .apply()
         viewModelScope.launch {
             organizerDao.getStudySessions().forEach { session ->
-                organizerDao.saveStudySession(session.copy(reminderMinutes = normalized))
+                val updated = session.copy(reminderMinutes = normalized)
+                organizerDao.saveStudySession(updated)
+                conversationSync.saveStudySession(updated)
             }
             OrganizerReminderScheduler.rescheduleAll(context)
         }
@@ -1119,6 +1144,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun saveStudySession(session: StudySession) {
         viewModelScope.launch {
             organizerDao.saveStudySession(session)
+            conversationSync.saveStudySession(session)
             OrganizerReminderScheduler.rescheduleAll(context)
         }
     }
@@ -1126,19 +1152,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun deleteStudySession(id: String) {
         viewModelScope.launch {
             organizerDao.deleteStudySession(id)
+            conversationSync.deleteStudySession(id)
             OrganizerReminderScheduler.rescheduleAll(context)
         }
     }
 
     fun markStudySessionCompleted(session: StudySession, completed: Boolean) {
         viewModelScope.launch {
-            organizerDao.saveStudySession(session.copy(completed = completed))
+            val updated = session.copy(completed = completed)
+            organizerDao.saveStudySession(updated)
+            conversationSync.saveStudySession(updated)
         }
     }
 
     fun saveLesson(lesson: Lesson) {
         viewModelScope.launch {
             organizerDao.saveLesson(lesson)
+            conversationSync.saveLesson(lesson)
             OrganizerReminderScheduler.rescheduleAll(context)
         }
     }
@@ -1146,12 +1176,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun deleteLesson(id: String) {
         viewModelScope.launch {
             organizerDao.deleteLesson(id)
+            conversationSync.deleteLesson(id)
             OrganizerReminderScheduler.rescheduleAll(context)
         }
     }
 
     fun clearAcademicSchedule() {
         viewModelScope.launch {
+            organizerDao.getStudySessions().forEach { conversationSync.deleteStudySession(it.id) }
             organizerDao.deleteAllStudySessions()
             OrganizerReminderScheduler.rescheduleAll(context)
         }
@@ -3144,8 +3176,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     _organizerGenerationError.value =
                         "تم إنشاء الخطة، لكن لم أتمكن من استخراج جلسات مذاكرة قابلة للتنبيه. أضف الجلسات يدوياً أو أعد التوليد."
                 } else {
+                    organizerDao.getStudySessions()
+                        .filter { it.repeatsWeekly == isWeekly }
+                        .forEach { conversationSync.deleteStudySession(it.id) }
                     organizerDao.deleteSessionsByRecurrence(isWeekly)
-                    sessions.forEach { organizerDao.saveStudySession(it) }
+                    sessions.forEach {
+                        organizerDao.saveStudySession(it)
+                        conversationSync.saveStudySession(it)
+                    }
                     OrganizerReminderScheduler.rescheduleAll(context)
                 }
                 repository.insertUserSchedule(
@@ -3231,6 +3269,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             photoUrl = authState.user.photoUrl
                         )
                         if (accountChanged) learningRepository.clearUserData()
+                        refreshAccountPreferences()
                         _conversationSyncReady.value = true
                         syncLearningHistory()
                         refreshConversationMemory()

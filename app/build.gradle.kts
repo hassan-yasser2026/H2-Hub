@@ -21,6 +21,8 @@ android {
     versionCode = 9
     versionName = "1.3.5"
 
+    buildConfigField("boolean", "ADS_ENABLED", "false")
+
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 

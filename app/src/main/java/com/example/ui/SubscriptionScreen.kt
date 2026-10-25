@@ -24,6 +24,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import android.widget.Toast
+import com.example.auth.AuthManager
+import com.example.auth.AuthState
 import com.example.network.*
 import com.example.ui.theme.AccentColors
 import kotlinx.coroutines.CancellationException
@@ -31,6 +33,8 @@ import kotlinx.coroutines.launch
 import java.io.IOException
 
 const val VODAFONE_CASH_NUMBER = "01067254988"
+private const val LINKED_ACCOUNT_ERROR =
+    "هذا الجهاز مرتبط بحساب آخر. سجّل الدخول بالحساب المرتبط به."
 
 private fun statusLabel(status: String) = when (status) {
     "active", "approved", "paid" -> "مدفوع"
@@ -68,6 +72,7 @@ fun SubscriptionScreen(accentColor: Color = AccentColors.Subscription) {
     var payment by remember { mutableStateOf<PaymentCode?>(null) }
     var screenshotUploaded by remember { mutableStateOf(false) }
     var pickedName by remember { mutableStateOf<String?>(null) }
+    val authState by AuthManager.state.collectAsState()
 
     fun deviceId() = SubscriptionDeviceId.get(context)
 
@@ -105,6 +110,27 @@ fun SubscriptionScreen(accentColor: Color = AccentColors.Subscription) {
                 error = e.message ?: "حدث خطأ غير متوقع."
             } finally {
                 busy = false
+            }
+        }
+    }
+
+    fun signInToLinkedAccount() {
+        runAction {
+            AuthManager.signInWithGoogle(context)
+            when (val result = AuthManager.state.value) {
+                is AuthState.SignedIn -> {
+                    val loadedPlans = api.fetchPlans()
+                    if (loadedPlans.isEmpty()) throw IOException("لم يعرض الخادم أي خطط اشتراك.")
+                    plans = loadedPlans
+                    val loadedStatus = api.status(deviceId())
+                    status = loadedStatus
+                    if (phone.isBlank()) phone = loadedStatus.user.vodafoneNumber
+                }
+                is AuthState.Error -> {
+                    AuthManager.clearError()
+                    throw IOException(result.message)
+                }
+                else -> Unit
             }
         }
     }
@@ -161,6 +187,19 @@ fun SubscriptionScreen(accentColor: Color = AccentColors.Subscription) {
                 Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer), shape = RoundedCornerShape(16.dp)) {
                     Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(message, color = MaterialTheme.colorScheme.onErrorContainer)
+                        if (
+                            message == LINKED_ACCOUNT_ERROR &&
+                            AuthManager.getCurrentUser(context) == null &&
+                            authState !is AuthState.SigningIn
+                        ) {
+                            Text(
+                                "لاستعادة حالة الاشتراك، سجّل الدخول بنفس حساب Google المرتبط بهذا الجهاز.",
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                            TextButton(onClick = ::signInToLinkedAccount, enabled = !busy) {
+                                Text("تسجيل الدخول بالحساب المرتبط")
+                            }
+                        }
                         TextButton(onClick = { refresh() }, enabled = !loading) { Text("إعادة المحاولة") }
                     }
                 }

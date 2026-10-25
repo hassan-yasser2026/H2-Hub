@@ -66,10 +66,12 @@ class AppRepository(
 
     suspend fun insertProductivityDoc(doc: ProductivityDoc) {
         appDao.insertProductivityDoc(doc)
+        conversationSync?.saveProductivityDoc(doc)
     }
 
     suspend fun deleteProductivityDoc(id: String) {
         appDao.deleteProductivityDoc(id)
+        conversationSync?.deleteProductivityDoc(id)
     }
 
     // User Schedules
@@ -81,10 +83,12 @@ class AppRepository(
 
     suspend fun insertUserSchedule(schedule: UserSchedule) {
         appDao.insertUserSchedule(schedule)
+        conversationSync?.saveUserSchedule(schedule)
     }
 
     suspend fun deleteUserSchedule() {
         appDao.deleteUserSchedule()
+        conversationSync?.deleteUserSchedule()
     }
 
     // Quran Records
@@ -92,9 +96,11 @@ class AppRepository(
 
     suspend fun insertQuranRecord(record: QuranRecord) {
         appDao.insertQuranRecord(record)
+        conversationSync?.saveQuranRecord(record)
     }
 
     suspend fun deleteQuranRecord(id: String) {
         appDao.deleteQuranRecord(id)
+        conversationSync?.deleteQuranRecord(id)
     }
 }

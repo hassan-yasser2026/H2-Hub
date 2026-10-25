@@ -12,6 +12,8 @@ Open the repository in Android Studio and build the debug app, or run this from 
 
 The APK is written to `app/build/outputs/apk/debug/app-debug.apk`.
 
+Google sign-in is required so conversations, subscription status, server-side usage, saved study schedules and sessions, lessons, educational documents, Quran recitation records, and app preferences follow the Firebase account across devices. Existing local schedules, documents, and recitation records are copied to the first signed-in account; switching accounts loads that account's data instead. AdMob remains disabled (`ADS_ENABLED = false` in `app/build.gradle.kts`) until it is intentionally enabled.
+
 The Android UI uses shared dark surface colors and rounded shapes from `ui/theme`, with reusable `HubCard` and `HubSectionHeading` components for consistent section layouts. `AccentColors` assigns each section and AI persona its own accent without changing the shared layout. The dashboard, persona grid, friend cards, and sign-in screen adapt their spacing and component sizes to compact, wide, and short displays.
 
 ### Subscription plan catalog (stage 1)

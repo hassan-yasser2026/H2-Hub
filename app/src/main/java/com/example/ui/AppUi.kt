@@ -72,6 +72,7 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.testTag
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import com.example.BuildConfig
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -448,7 +449,7 @@ fun AppUi(viewModel: AppViewModel) {
                     AppScreen.FRIEND_CHAT
                 )
                 Column(Modifier.fillMaxSize()) {
-                    if (isChatDestination) {
+                    if (isChatDestination && BuildConfig.ADS_ENABLED) {
                         BannerAdView(
                             modifier = Modifier
                                 .fillMaxWidth()
