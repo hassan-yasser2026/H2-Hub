@@ -1245,6 +1245,7 @@ fun ChatScreen(
     val isGenerating by viewModel.isGeneratingChat.collectAsState()
     val thinkingState by viewModel.thinkingState.collectAsState()
     val chatActionError by viewModel.chatActionError.collectAsState()
+    val quotaExceeded by viewModel.quotaExceeded.collectAsState()
     val usageState by viewModel.usageState.collectAsState()
     val conversationSyncStatus by viewModel.conversationSyncStatus.collectAsState()
     val socraticModeEnabled by viewModel.socraticModeEnabled.collectAsState()
@@ -1594,6 +1595,14 @@ fun ChatScreen(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)
             )
         }
+        QuotaExceededDialog(
+            error = quotaExceeded,
+            onDismiss = viewModel::clearQuotaExceeded,
+            onSubscribe = {
+                viewModel.clearQuotaExceeded()
+                onOpenSubscription()
+            }
+        )
         if (showRenameDialog && currentSession != null) {
             var newTitle by remember { mutableStateOf(currentSession.title) }
             AlertDialog(
@@ -3765,6 +3774,7 @@ fun PersonasScreen(
     val thinkingModeEnabled by viewModel.useThinkingMode.collectAsState()
     val thinkingState by viewModel.thinkingState.collectAsState()
     val usageState by viewModel.usageState.collectAsState()
+    val quotaExceeded by viewModel.quotaExceeded.collectAsState()
     val socraticModeEnabled by viewModel.socraticModeEnabled.collectAsState()
     val educationalContentEnabled by viewModel.educationalContentEnabled.collectAsState()
     if (personaOnlyId != null && onBack != null) {
@@ -4696,6 +4706,14 @@ fun PersonasScreen(
             }
         )
     }
+    QuotaExceededDialog(
+        error = quotaExceeded,
+        onDismiss = viewModel::clearQuotaExceeded,
+        onSubscribe = {
+            viewModel.clearQuotaExceeded()
+            onOpenSubscription()
+        }
+    )
 }
 
 @Composable

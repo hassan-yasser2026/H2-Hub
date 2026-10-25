@@ -312,10 +312,18 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         refreshUsage()
     }
 
+    private val _quotaExceeded = MutableStateFlow<QuotaExceededException?>(null)
+    val quotaExceeded: StateFlow<QuotaExceededException?> = _quotaExceeded.asStateFlow()
+
     private fun onQuotaExceeded(error: QuotaExceededException) {
         _usageState.value = _usageState.value.withExhausted(error.feature, error.used, error.limit)
         _chatActionError.value = error.message
+        _quotaExceeded.value = error
         refreshUsage()
+    }
+
+    fun clearQuotaExceeded() {
+        _quotaExceeded.value = null
     }
 
     private val _chatActionError = MutableStateFlow<String?>(null)

@@ -20,6 +20,7 @@ import androidx.compose.material.icons.filled.Diamond
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -41,6 +42,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.network.FeatureUsage
+import com.example.network.QuotaExceededException
 import com.example.network.UsageSnapshot
 import kotlinx.coroutines.delay
 
@@ -165,7 +167,7 @@ fun UsageBannerCard(
             Text(text, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
             if (banner?.exhausted == true) {
                 TextButton(onClick = onUpgrade) {
-                    Text("ترقية", color = content, style = MaterialTheme.typography.labelMedium)
+                    Text("اشترك الآن", color = content, style = MaterialTheme.typography.labelMedium)
                 }
             } else if (state.snapshot == null && !state.loading) {
                 TextButton(onClick = onRefresh) {
@@ -174,6 +176,42 @@ fun UsageBannerCard(
             }
         }
     }
+}
+
+@Composable
+fun QuotaExceededDialog(
+    error: QuotaExceededException?,
+    onDismiss: () -> Unit,
+    onSubscribe: () -> Unit
+) {
+    if (error == null) return
+
+    val featureName = when (error.feature) {
+        "coder" -> "مساعد البرمجة"
+        "vision" -> "تحليل الصور"
+        "quran" -> "مساعد القرآن"
+        "rag" -> "البحث في الملفات"
+        else -> "المحادثة"
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("وصلت إلى حد الاستخدام") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(error.message ?: "انتهت الحصة المتاحة لهذا الاستخدام.")
+                if (error.limit > 0) {
+                    Text("$featureName: ${error.used} من ${error.limit}")
+                }
+                Text("أوقفنا الطلب ولم نكمل الرد. اشترك لمتابعة الاستخدام.")
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onSubscribe) { Text("عرض الاشتراكات") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("لاحقًا") }
+        }
+    )
 }
 
 data class UsageIndicatorModel(
