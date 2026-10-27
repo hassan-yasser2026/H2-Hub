@@ -192,6 +192,43 @@ test("a signed-in account shares its free message balance across devices", async
   assert.deepEqual(fake.getQuotaIdentities(), ["uid:account-a"]);
 });
 
+test("Firebase UID account queries bind a single typed parameter", async () => {
+  const fake = fakeQuotaDatabase();
+  const observedQueries: Array<{ queryText: string; values: unknown[] }> = [];
+  const database: QuotaDatabase = {
+    async query<T extends import("pg").QueryResultRow>(
+      queryText: string,
+      values: unknown[] = []
+    ): Promise<{ rows: T[]; rowCount: number }> {
+      observedQueries.push({ queryText, values });
+      return fake.database.query<T>(queryText, values);
+    },
+  };
+  const getDatabase = () => database;
+  const prepare = async () => {};
+
+  await reserveMessageQuota(
+    "device-id",
+    1,
+    "chat",
+    getDatabase,
+    prepare,
+    "chat",
+    "firebase-user"
+  );
+  await getDeviceUsage("device-id", "firebase-user", getDatabase, prepare);
+
+  const accountQueries = observedQueries.filter(({ queryText }) => queryText.includes("app_users"));
+  assert.ok(accountQueries.length > 0);
+  for (const { queryText, values } of accountQueries) {
+    const placeholderNumbers = [...new Set(
+      [...queryText.matchAll(/\$(\d+)/g)].map(([, number]) => Number(number))
+    )].sort();
+    assert.deepEqual(placeholderNumbers, [1]);
+    assert.deepEqual(values, ["firebase-user"]);
+  }
+});
+
 test("unknown feature names cannot select a quota", () => {
   for (const feature of Object.keys(FREE_USAGE_LIMITS)) {
     assert.equal(isUsageFeature(feature), true);

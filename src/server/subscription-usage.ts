@@ -227,14 +227,14 @@ export async function reserveMessageQuota(
   const db = getDatabase();
   const quotaKey = firebaseUid ? `uid:${firebaseUid}` : deviceId;
   const accountFilter = firebaseUid
-    ? "(au.device_id = 'uid:' || $2 OR au.firebase_uid = $2)"
+    ? "(au.device_id = 'uid:' || $1 OR au.firebase_uid = $1)"
     : "au.device_id = $1";
-  const accountValues = firebaseUid ? [deviceId, firebaseUid] : [deviceId];
+  const accountValues = firebaseUid ? [firebaseUid] : [deviceId];
 
   await db.query(
     `UPDATE app_users
      SET is_legacy = false
-     WHERE ${firebaseUid ? "(device_id = 'uid:' || $2 OR firebase_uid = $2)" : "device_id = $1"}
+     WHERE ${firebaseUid ? "(device_id = 'uid:' || $1 OR firebase_uid = $1)" : "device_id = $1"}
        AND is_legacy = true
        AND (subscription_end_date IS NULL OR subscription_end_date <= now())`,
     accountValues
@@ -596,13 +596,13 @@ export async function getDeviceUsage(
   const db = getDatabase();
   const quotaKey = firebaseUid ? `uid:${firebaseUid}` : deviceId;
   const accountFilter = firebaseUid
-    ? "(au.device_id = 'uid:' || $2 OR au.firebase_uid = $2)"
+    ? "(au.device_id = 'uid:' || $1 OR au.firebase_uid = $1)"
     : "au.device_id = $1";
-  const accountValues = firebaseUid ? [deviceId, firebaseUid] : [deviceId];
+  const accountValues = firebaseUid ? [firebaseUid] : [deviceId];
   await db.query(
     `UPDATE app_users
      SET is_legacy = false
-     WHERE ${firebaseUid ? "(device_id = 'uid:' || $2 OR firebase_uid = $2)" : "device_id = $1"}
+     WHERE ${firebaseUid ? "(device_id = 'uid:' || $1 OR firebase_uid = $1)" : "device_id = $1"}
        AND is_legacy = true
        AND (subscription_end_date IS NULL OR subscription_end_date <= now())`,
     accountValues
