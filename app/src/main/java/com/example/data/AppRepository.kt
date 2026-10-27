@@ -57,6 +57,9 @@ class AppRepository(
     suspend fun getPendingChatRequest(notificationId: String): PendingChatRequest? =
         appDao.getPendingChatRequest(notificationId)
 
+    suspend fun getPendingChatRequests(): List<PendingChatRequest> =
+        appDao.getPendingChatRequests()
+
     suspend fun deletePendingChatRequest(notificationId: String) {
         appDao.deletePendingChatRequest(notificationId)
     }

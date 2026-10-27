@@ -89,12 +89,14 @@ class PersistentAppDaoTest {
             notificationId = "job-1",
             sessionId = "session-1",
             requestJson = """{"message":"hello"}""",
-            createdAt = 1_700_000_000_000
+            createdAt = 1_700_000_000_000,
+            userId = "user-1"
         )
 
         dao.insertPendingChatRequest(request)
 
         assertEquals(request, PersistentAppDao(context).getPendingChatRequest("job-1"))
+        assertEquals(listOf(request), PersistentAppDao(context).getPendingChatRequests())
         dao.deletePendingChatRequest("job-1")
         assertEquals(null, PersistentAppDao(context).getPendingChatRequest("job-1"))
     }

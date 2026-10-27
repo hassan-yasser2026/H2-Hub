@@ -53,7 +53,7 @@ data class UsageState(
 ) {
     fun withExhausted(feature: String, used: Int, limit: Int): UsageState {
         val current = snapshot ?: UsageSnapshot(paid = false, features = emptyMap())
-        val boundedUsage = FeatureUsage(maxOf(used, limit), limit)
+        val boundedUsage = FeatureUsage(used.coerceIn(0, limit), limit)
         val subscription = current.subscription?.let {
             it.copy(
                 used = boundedUsage.used,

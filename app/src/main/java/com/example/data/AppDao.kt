@@ -22,6 +22,7 @@ interface AppDao {
     suspend fun deleteMessagesForSession(sessionId: String)
     suspend fun insertPendingChatRequest(request: PendingChatRequest)
     suspend fun getPendingChatRequest(notificationId: String): PendingChatRequest?
+    suspend fun getPendingChatRequests(): List<PendingChatRequest>
     suspend fun deletePendingChatRequest(notificationId: String)
 
     fun getAllProductivityDocsFlow(): Flow<List<ProductivityDoc>>
@@ -111,6 +112,9 @@ class PersistentAppDao(context: Context) : AppDao {
     override suspend fun getPendingChatRequest(notificationId: String): PendingChatRequest? =
         pendingChatRequests.value.firstOrNull { it.notificationId == notificationId }
 
+    override suspend fun getPendingChatRequests(): List<PendingChatRequest> =
+        pendingChatRequests.value
+
     override suspend fun deletePendingChatRequest(notificationId: String) {
         pendingChatRequests.value =
             pendingChatRequests.value.filterNot { it.notificationId == notificationId }
@@ -191,7 +195,8 @@ class PersistentAppDao(context: Context) : AppDao {
                 notificationId = item.getString("notificationId"),
                 sessionId = item.getString("sessionId"),
                 requestJson = item.getString("requestJson"),
-                createdAt = item.optLong("createdAt", System.currentTimeMillis())
+                createdAt = item.optLong("createdAt", System.currentTimeMillis()),
+                userId = item.optString("userId").takeIf(String::isNotBlank)
             )
         }
 
@@ -254,6 +259,7 @@ class PersistentAppDao(context: Context) : AppDao {
                 .put("sessionId", item.sessionId)
                 .put("requestJson", item.requestJson)
                 .put("createdAt", item.createdAt)
+                .put("userId", item.userId)
         }
     )
 

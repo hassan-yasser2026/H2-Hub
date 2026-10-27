@@ -40,7 +40,8 @@ data class PendingChatRequest(
     val notificationId: String,
     val sessionId: String,
     val requestJson: String,
-    val createdAt: Long = System.currentTimeMillis()
+    val createdAt: Long = System.currentTimeMillis(),
+    val userId: String? = null
 )
 
 data class SocraticProgress(

@@ -179,8 +179,11 @@ async function recordServiceUsage(db: QuotaDatabase, serviceName: string): Promi
   }
 }
 
-function deviceIdFromRequest(req: Request): string | null {
-  const candidate = req.body?.deviceId ?? req.get("x-h2-device-id");
+function deviceIdFromRequest(req: Request, firebaseUid?: string): string | null {
+  if (firebaseUid) return `uid:${firebaseUid}`;
+  const candidate = req.body?.deviceId ??
+    (typeof req.query.deviceId === "string" ? req.query.deviceId : undefined) ??
+    req.get("x-h2-device-id");
   return typeof candidate === "string" &&
     candidate.length >= 1 &&
     candidate.length <= 255 &&
@@ -530,7 +533,7 @@ export function freeUsageQuota(
         next();
         return;
       }
-      const deviceId = deviceIdFromRequest(req);
+      const deviceId = deviceIdFromRequest(req, identity.uid ?? undefined);
       if (!deviceId) {
         res.status(400).json({ error: "تعذر تحديد جهازك. حدّث التطبيق وحاول مرة أخرى." });
         return;
@@ -681,20 +684,13 @@ export function registerFeatureQuota(app: Express): void {
   app.get(
     "/api/subscription/usage",
     (req: Request, res: Response, next: NextFunction) => {
-      const deviceId = typeof req.query.deviceId === "string"
-        ? req.query.deviceId
-        : req.get("x-h2-device-id");
-      if (
-        typeof deviceId !== "string" ||
-        deviceId.length < 1 ||
-        deviceId.length > 255 ||
-        /[\u0000-\u001f\u007f]/u.test(deviceId)
-      ) {
-        res.status(400).json({ error: "معرّف الجهاز غير صالح." });
-        return;
-      }
       void (async () => {
         const identity = await verifyRequestIdentity(req);
+        const deviceId = deviceIdFromRequest(req, identity.uid ?? undefined);
+        if (!deviceId) {
+          res.status(400).json({ error: "معرّف الجهاز غير صالح." });
+          return;
+        }
         if (!identity.uid) await assertAnonymousDeviceIsUnlinked(deviceId);
         const usage = await getDeviceUsage(deviceId, identity.uid ?? undefined);
         res.json(usage);

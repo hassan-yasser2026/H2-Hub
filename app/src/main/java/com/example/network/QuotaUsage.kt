@@ -133,10 +133,6 @@ object ApiDeviceIdentity {
 class DeviceQuotaInterceptor(
     serverUrl: String = BuildConfig.SERVER_URL
 ) : Interceptor {
-    private companion object {
-        const val TAG = "DeviceQuotaInterceptor"
-    }
-
     private val serverHost = serverUrl.toHttpUrlOrNull()?.host
 
     override fun intercept(chain: Interceptor.Chain): Response {
@@ -146,22 +142,17 @@ class DeviceQuotaInterceptor(
             ApiDeviceIdentity.deviceId?.takeIf(String::isNotBlank)?.let {
                 builder.header(DEVICE_ID_HEADER, it)
             }
-            val appCheckToken = try {
-                Tasks.await(
-                    FirebaseAppCheck.getInstance().getAppCheckToken(false),
-                    25,
-                    TimeUnit.SECONDS
-                ).token
-            } catch (error: Exception) {
-                if (!BuildConfig.DEBUG) {
+            if (!BuildConfig.DEBUG) {
+                val appCheckToken = try {
+                    Tasks.await(
+                        FirebaseAppCheck.getInstance().getAppCheckToken(false),
+                        25,
+                        TimeUnit.SECONDS
+                    ).token
+                } catch (error: Exception) {
                     throw IOException("تعذر توثيق التطبيق. تحقق من Google Play Services ثم أعد المحاولة.", error)
                 }
-                Log.w(TAG, "App Check token unavailable in debug build; continuing without it.", error)
-                null
-            }
-            if (appCheckToken.isNullOrBlank()) {
-                if (!BuildConfig.DEBUG) throw IOException("تعذر توثيق التطبيق.")
-            } else {
+                if (appCheckToken.isNullOrBlank()) throw IOException("تعذر توثيق التطبيق.")
                 builder.header(APP_CHECK_HEADER, appCheckToken)
             }
 

@@ -81,19 +81,19 @@ fun AccountSection() {
             onClick = { confirmSignOut = true },
             modifier = Modifier.fillMaxWidth().smartCatActionHeight(),
             colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFD32F2F))
-        ) { Text("تسجيل الخروج") }
+        ) { Text("تبديل الحساب") }
     }
 
     if (confirmSignOut) {
         AlertDialog(
             onDismissRequest = { confirmSignOut = false },
-            title = { Text("تسجيل الخروج") },
-            text = { Text("هل تريد تسجيل الخروج من حسابك؟") },
+            title = { Text("تبديل الحساب") },
+            text = { Text("سيتم تسجيل الخروج، وبعدها يمكنك اختيار حساب Google آخر. لكل حساب رصيده ومحادثاته المستقلة.") },
             confirmButton = {
                 TextButton(onClick = {
                     confirmSignOut = false
                     scope.launch { AuthManager.signOut(context) }
-                }) { Text("تسجيل الخروج", color = Color(0xFFD32F2F)) }
+                }) { Text("تبديل الحساب", color = Color(0xFFD32F2F)) }
             },
             dismissButton = { TextButton(onClick = { confirmSignOut = false }) { Text("إلغاء") } }
         )

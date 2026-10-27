@@ -173,6 +173,25 @@ test("different signed-in accounts on one device have independent free message b
   assert.deepEqual(fake.getQuotaIdentities().sort(), ["uid:account-a", "uid:account-b"]);
 });
 
+test("a signed-in account shares its free message balance across devices", async () => {
+  const fake = fakeQuotaDatabase();
+  const prepare = async () => {};
+  for (const deviceId of ["phone-a", "phone-b"]) {
+    const reservation = await reserveMessageQuota(
+      deviceId,
+      1,
+      "chat",
+      () => fake.database,
+      prepare,
+      "chat",
+      "account-a"
+    );
+    assert.equal(reservation.allowed, true);
+  }
+  assert.equal(fake.getFreeUsed("uid:account-a"), 2);
+  assert.deepEqual(fake.getQuotaIdentities(), ["uid:account-a"]);
+});
+
 test("unknown feature names cannot select a quota", () => {
   for (const feature of Object.keys(FREE_USAGE_LIMITS)) {
     assert.equal(isUsageFeature(feature), true);

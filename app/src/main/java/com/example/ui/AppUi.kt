@@ -3775,6 +3775,7 @@ fun PersonasScreen(
     val thinkingState by viewModel.thinkingState.collectAsState()
     val usageState by viewModel.usageState.collectAsState()
     val quotaExceeded by viewModel.quotaExceeded.collectAsState()
+    val chatActionError by viewModel.chatActionError.collectAsState()
     val socraticModeEnabled by viewModel.socraticModeEnabled.collectAsState()
     val educationalContentEnabled by viewModel.educationalContentEnabled.collectAsState()
     if (personaOnlyId != null && onBack != null) {
@@ -4703,6 +4704,16 @@ fun PersonasScreen(
                 } else {
                     speechPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                 }
+            }
+        )
+    }
+    chatActionError?.takeIf { quotaExceeded == null }?.let { errorMessage ->
+        AlertDialog(
+            onDismissRequest = viewModel::clearChatActionError,
+            title = { Text("تعذر إرسال الرسالة") },
+            text = { Text(errorMessage) },
+            confirmButton = {
+                TextButton(onClick = viewModel::clearChatActionError) { Text("حسنًا") }
             }
         )
     }

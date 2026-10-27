@@ -200,13 +200,16 @@ class SubscriptionApiClient(
         return parseOrWrap { parseSubscriptionStatus(execute(Request.Builder().url(url).get().build())) }
     }
 
-    suspend fun usage(deviceId: String): UsageSnapshot {
+    suspend fun usage(deviceId: String? = null): UsageSnapshot {
         return fetchUsage(deviceId)
     }
 
-    suspend fun fetchUsage(deviceId: String): UsageSnapshot {
-        val url = "$base/api/subscription/usage".toHttpUrlOrThrow().newBuilder()
-            .addQueryParameter("deviceId", deviceId).build()
+    suspend fun fetchUsage(deviceId: String? = null): UsageSnapshot {
+        val urlBuilder = "$base/api/subscription/usage".toHttpUrlOrThrow().newBuilder()
+        deviceId?.takeIf(String::isNotBlank)?.let {
+            urlBuilder.addQueryParameter("deviceId", it)
+        }
+        val url = urlBuilder.build()
         return parseOrWrap { parseUsageSnapshot(execute(Request.Builder().url(url).get().build())) }
     }
 
@@ -269,6 +272,5 @@ class SubscriptionApiClient(
         }
     }
 }
-
 
 

@@ -96,6 +96,15 @@ class QuotaUsageTest {
         assertTrue(usageBanner(s)!!.exhausted)
     }
 
+    @Test fun insufficientPaidOperationPreservesRemainingBalance() {
+        val snapshot = parseUsageSnapshot(
+            """{"paid":true,"legacy":false,"subscription":{"plan":"basic","nameAr":"أساسي","used":499,"limit":500,"remaining":1,"expiresAt":"2026-11-05T00:00:00.000Z","features":{"images":true}},"usage":{"chat":{"used":499,"limit":500}}}"""
+        )
+        val state = UsageState(snapshot).withExhausted("chat", 499, 500)
+        assertEquals(1, state.snapshot?.subscription?.remaining)
+        assertEquals(UsageLevel.CRITICAL, usageBanner(state)?.level)
+    }
+
     @Test fun operationCostsMatchServerQuotaPolicy() {
         assertEquals(1, requiredMessageQuota())
         assertEquals(2, requiredMessageQuota(webSearch = true))

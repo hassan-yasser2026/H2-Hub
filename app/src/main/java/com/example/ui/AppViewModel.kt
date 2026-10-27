@@ -286,24 +286,43 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val subscriptionApi = SubscriptionApiClient()
     private val _usageState = MutableStateFlow(UsageState())
     val usageState: StateFlow<UsageState> = _usageState.asStateFlow()
+    private var usageRefreshVersion = 0L
 
     /** Explicit, read-only refresh; the usage endpoint does not consume quota. */
     fun refreshUsage() {
         if (_usageState.value.loading) return
+        val refreshVersion = ++usageRefreshVersion
+        val requestedUserId = AuthManager.getCurrentUser(context)?.uid
         viewModelScope.launch {
             _usageState.value = _usageState.value.copy(loading = true, error = null)
             try {
                 val snapshot = subscriptionApi.usage(SubscriptionDeviceId.get(context))
+                if (
+                    refreshVersion != usageRefreshVersion ||
+                    requestedUserId != AuthManager.getCurrentUser(context)?.uid
+                ) return@launch
                 _usageState.value = UsageState(snapshot = snapshot)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
+                if (
+                    refreshVersion != usageRefreshVersion ||
+                    requestedUserId != AuthManager.getCurrentUser(context)?.uid
+                ) return@launch
                 _usageState.value = _usageState.value.copy(
                     loading = false,
                     error = e.message ?: "تعذر تحميل حدود الاستخدام."
                 )
             }
         }
+    }
+
+    private fun refreshUsageForAccount() {
+        usageRefreshVersion += 1
+        _usageState.value = UsageState()
+        _quotaExceeded.value = null
+        _chatActionError.value = null
+        refreshUsage()
     }
 
     init {
@@ -322,8 +341,35 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         refreshUsage()
     }
 
+    private fun rejectInsufficientQuota(feature: String, cost: Int): Boolean {
+        val snapshot = _usageState.value.snapshot ?: return false
+        if (snapshot.legacy) return false
+        val subscription = snapshot.subscription
+        val usage = subscription?.let { it.used to it.limit }
+            ?: snapshot.feature(feature)?.let { it.used to it.limit }
+            ?: return false
+        val remaining = (usage.second - usage.first).coerceAtLeast(0)
+        if (remaining >= cost) return false
+
+        onQuotaExceeded(
+            QuotaExceededException(
+                message = if (subscription == null) {
+                    "استهلكت رسائلك اليومية. اشترك لمتابعة المحادثة."
+                } else {
+                    "الرصيد لا يكفي لهذه العملية. جدّد اشتراكك أو اختر خطة أعلى."
+                },
+                feature = feature,
+                used = usage.first,
+                limit = usage.second,
+                resetAt = subscription?.expiresAt.orEmpty()
+            )
+        )
+        return true
+    }
+
     fun clearQuotaExceeded() {
         _quotaExceeded.value = null
+        _chatActionError.value = null
     }
 
     private val _chatActionError = MutableStateFlow<String?>(null)
@@ -1218,6 +1264,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun sendChatMessage(text: String, forceFullSolution: Boolean = false) {
         val sessionId = _currentSessionId.value ?: return
         if (text.trim().isEmpty()) return
+        val requiredQuota = requiredMessageQuota(
+            webSearch = webSearchEnabled.value,
+            thinking = groqThinkingEnabled.value,
+            imageGeneration = imageGenerationAvailable.value && imageGenerationEnabled.value
+        )
+        if (rejectInsufficientQuota("chat", requiredQuota)) return
 
         viewModelScope.launch {
             _isGeneratingChat.value = true
@@ -1317,7 +1369,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         PendingChatRequest(
                             notificationId = notificationId,
                             sessionId = sessionId,
-                            requestJson = requestJson
+                            requestJson = requestJson,
+                            userId = signedInUserId
                         )
                     )
                     val acceptedByServer = try {
@@ -1474,6 +1527,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 if (autoReadChatEnabled.value && generatedImageUrl == null) {
                     speakText(aiResponse, assistantMessage.id)
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Chat generation failed", e)
                 _chatActionError.value = GeminiApiClient.friendlyErrorMessage(e)
@@ -1603,15 +1658,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 persistLearningMessage(assistantMessage)
                 if (autoReadChatEnabled.value) speakText(aiResponse, assistantMessage.id)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Chat attachment analysis failed", e)
+                if (e is QuotaExceededException) onQuotaExceeded(e)
+                else _chatActionError.value = GeminiApiClient.friendlyErrorMessage(e)
             } finally {
                 _isGeneratingChat.value = false
+                refreshUsage()
             }
         }
     }
 
     fun sendVisionQuestion(imagePath: String, question: String) {
+        if (rejectInsufficientQuota("vision", requiredMessageQuota(vision = true))) return
         val sessionId = _currentSessionId.value ?: return
         val imageFile = File(imagePath)
         if (!imageFile.isFile || imageFile.length() !in 1..1_048_576) {
@@ -1655,11 +1716,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 persistLearningMessage(assistantMessage)
                 _currentMessages.value = _currentMessages.value + assistantMessage
                 if (autoReadChatEnabled.value) speakText(answer, assistantMessage.id)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Vision question failed", e)
-                _chatActionError.value = GeminiApiClient.friendlyErrorMessage(e)
+                if (e is QuotaExceededException) onQuotaExceeded(e)
+                else _chatActionError.value = GeminiApiClient.friendlyErrorMessage(e)
             } finally {
                 _isGeneratingChat.value = false
+                refreshUsage()
             }
         }
     }
@@ -1849,6 +1914,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     // 3. AI PERSONAS (with voice option)
     fun sendPersonaMessage(text: String, personaId: String = selectedPersonaId.value) {
         if (text.trim().isEmpty()) return
+        val requiredQuota = requiredMessageQuota(
+            webSearch = personaWebSearchEnabled(personaId),
+            thinking = personaThinkingEnabled(personaId)
+        )
+        if (rejectInsufficientQuota(if (personaId == "coder") "coder" else "chat", requiredQuota)) return
 
         // Auto-detect Study Mode requests
         val lowerText = text.lowercase()
@@ -1860,126 +1930,133 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         viewModelScope.launch {
-            val sessionId = ensurePersonaChatSession(personaId)
-            loadPersonaMessagesIfNeeded(sessionId)
-            val currentPersonaMsgs = _personaMessages.value[sessionId]?.toMutableList() ?: mutableListOf()
-
-            val userMsg = ChatMessage(
-                id = UUID.randomUUID().toString(),
-                sessionId = sessionId,
-                role = "user",
-                content = text,
-                timestamp = System.currentTimeMillis()
-            )
-            currentPersonaMsgs.add(userMsg)
-            repository.insertMessage(userMsg)
-
-            _personaMessages.value = _personaMessages.value + (sessionId to currentPersonaMsgs.toList())
-
             _isGeneratingPersona.value = true
+            try {
+                val sessionId = ensurePersonaChatSession(personaId)
+                loadPersonaMessagesIfNeeded(sessionId)
+                val currentPersonaMsgs = _personaMessages.value[sessionId]?.toMutableList() ?: mutableListOf()
 
-            // Specific Persona System Instruction
-            val personaInstruction = getPersonaInstruction(personaId)
-            var fullInstruction = "$personaInstruction\n\n$safetySystemInstruction"
+                val userMsg = ChatMessage(
+                    id = UUID.randomUUID().toString(),
+                    sessionId = sessionId,
+                    role = "user",
+                    content = text,
+                    timestamp = System.currentTimeMillis()
+                )
+                currentPersonaMsgs.add(userMsg)
+                repository.insertMessage(userMsg)
 
-            if (isStudyModeActive.value) {
-                fullInstruction += "\n\n[وضع المذاكرة نشط 📚]: يرجى تقديم الشرح والمساعدة بالتنسيق التالي بدقة ووضوح:\n1. الشرح خطوة بخطوة بطريقة بسيطة ومفهومة جداً.\n2. مثال عملي ملموس وممتع.\n3. سؤال اختبار سريع وسهل للمستخدم لتتأكد من استيعابه للمفهوم.\nحافظ على شخصية المساعد الودودة والمشجعة."
-            }
+                _personaMessages.value = _personaMessages.value + (sessionId to currentPersonaMsgs.toList())
 
-            // Sentiment Analysis and Late Night detection and Search integration
-            fullInstruction = buildAssistantSystemInstruction(
-                personaId,
-                fullInstruction + detectSentimentAndInjectInstruction(text, personaId)
-            )
+                // Specific Persona System Instruction
+                val personaInstruction = getPersonaInstruction(personaId)
+                var fullInstruction = "$personaInstruction\n\n$safetySystemInstruction"
 
-            var toolSources = emptyList<com.example.data.ChatSource>()
-            var toolThinkingSeconds: Int? = null
-            // The offline response identifies the persona but avoids guessing an answer.
-            val aiResponse = kotlinx.coroutines.withTimeoutOrNull(90_000) {
-                when {
-                    personaWebSearchEnabled(personaId) && personaThinkingEnabled(personaId) -> {
-                        _thinkingState.value = "searching+thinking"
-                        val result = GeminiApiClient.generateSearchThinkingResponse(
-                            history = currentPersonaMsgs,
-                            systemInstruction = fullInstruction
-                        )
-                        toolSources = result.sources
-                        toolThinkingSeconds = result.thinkingSeconds
-                        result.reply
-                    }
-                    personaWebSearchEnabled(personaId) -> {
-                        _thinkingState.value = "searching"
-                        val result = GeminiApiClient.generateWebSearchResponse(
-                            history = currentPersonaMsgs,
-                            systemInstruction = fullInstruction
-                        )
-                        toolSources = result.sources
-                        result.reply
-                    }
-                    personaThinkingEnabled(personaId) -> {
-                        _thinkingState.value = "thinking"
-                        val result = GeminiApiClient.generateThinkingResponse(
-                            history = currentPersonaMsgs,
-                            systemInstruction = fullInstruction
-                        )
-                        toolThinkingSeconds = result.thinkingSeconds
-                        result.reply
-                    }
-                    _socraticModeEnabled.value -> {
-                        val progress = SocraticProgress(originalQuestion = text)
-                        GeminiApiClient.generateSocraticChatResponse(
+                if (isStudyModeActive.value) {
+                    fullInstruction += "\n\n[وضع المذاكرة نشط 📚]: يرجى تقديم الشرح والمساعدة بالتنسيق التالي بدقة ووضوح:\n1. الشرح خطوة بخطوة بطريقة بسيطة ومفهومة جداً.\n2. مثال عملي ملموس وممتع.\n3. سؤال اختبار سريع وسهل للمستخدم لتتأكد من استيعابه للمفهوم.\nحافظ على شخصية المساعد الودودة والمشجعة."
+                }
+
+                // Sentiment Analysis and Late Night detection and Search integration
+                fullInstruction = buildAssistantSystemInstruction(
+                    personaId,
+                    fullInstruction + detectSentimentAndInjectInstruction(text, personaId)
+                )
+
+                var toolSources = emptyList<com.example.data.ChatSource>()
+                var toolThinkingSeconds: Int? = null
+                // The offline response identifies the persona but avoids guessing an answer.
+                val aiResponse = kotlinx.coroutines.withTimeoutOrNull(90_000) {
+                    when {
+                        personaWebSearchEnabled(personaId) && personaThinkingEnabled(personaId) -> {
+                            _thinkingState.value = "searching+thinking"
+                            val result = GeminiApiClient.generateSearchThinkingResponse(
+                                history = currentPersonaMsgs,
+                                systemInstruction = fullInstruction
+                            )
+                            toolSources = result.sources
+                            toolThinkingSeconds = result.thinkingSeconds
+                            result.reply
+                        }
+                        personaWebSearchEnabled(personaId) -> {
+                            _thinkingState.value = "searching"
+                            val result = GeminiApiClient.generateWebSearchResponse(
+                                history = currentPersonaMsgs,
+                                systemInstruction = fullInstruction
+                            )
+                            toolSources = result.sources
+                            result.reply
+                        }
+                        personaThinkingEnabled(personaId) -> {
+                            _thinkingState.value = "thinking"
+                            val result = GeminiApiClient.generateThinkingResponse(
+                                history = currentPersonaMsgs,
+                                systemInstruction = fullInstruction
+                            )
+                            toolThinkingSeconds = result.thinkingSeconds
+                            result.reply
+                        }
+                        _socraticModeEnabled.value -> {
+                            val progress = SocraticProgress(originalQuestion = text)
+                            GeminiApiClient.generateSocraticChatResponse(
+                                history = currentPersonaMsgs,
+                                systemInstruction = fullInstruction,
+                                progress = progress,
+                                useThinking = useThinkingMode.value
+                            )?.reply ?: "تعذر إنشاء خطوة تعليمية. تحقق من الاتصال وحاول مرة أخرى."
+                        }
+                        _educationalContentEnabled.value -> GeminiApiClient.generateRagChatResponse(
                             history = currentPersonaMsgs,
                             systemInstruction = fullInstruction,
-                            progress = progress,
                             useThinking = useThinkingMode.value
-                        )?.reply ?: "تعذر إنشاء خطوة تعليمية. تحقق من الاتصال وحاول مرة أخرى."
+                        )
+                        else -> GeminiApiClient.generateChatResponse(
+                            history = currentPersonaMsgs,
+                            systemInstruction = fullInstruction,
+                            useThinking = useThinkingMode.value,
+                            feature = if (personaId == "coder") "coder" else "chat"
+                        )
                     }
-                    _educationalContentEnabled.value -> GeminiApiClient.generateRagChatResponse(
-                        history = currentPersonaMsgs,
-                        systemInstruction = fullInstruction,
-                        useThinking = useThinkingMode.value
-                    )
-                    else -> GeminiApiClient.generateChatResponse(
-                        history = currentPersonaMsgs,
-                        systemInstruction = fullInstruction,
-                        useThinking = useThinkingMode.value,
-                        feature = if (personaId == "coder") "coder" else "chat"
-                    )
+                } ?: generateLocalFallbackResponse(text, personaId)
+
+                val modelMsg = ChatMessage(
+                    id = UUID.randomUUID().toString(),
+                    sessionId = sessionId,
+                    role = "model",
+                    content = aiResponse,
+                    timestamp = System.currentTimeMillis(),
+                    sources = toolSources,
+                    thinkingSeconds = toolThinkingSeconds
+                )
+                currentPersonaMsgs.add(modelMsg)
+                repository.insertMessage(modelMsg)
+                scheduleCloudConversationSummary(sessionId)
+                _personaMessages.value = _personaMessages.value + (sessionId to currentPersonaMsgs.toList())
+
+                // Gamification points reward
+                if (isStudyModeActive.value) {
+                    addPoints(15)
+                } else {
+                    addPoints(10)
                 }
-            } ?: generateLocalFallbackResponse(text, personaId)
 
-            val modelMsg = ChatMessage(
-                id = UUID.randomUUID().toString(),
-                sessionId = sessionId,
-                role = "model",
-                content = aiResponse,
-                timestamp = System.currentTimeMillis(),
-                sources = toolSources,
-                thinkingSeconds = toolThinkingSeconds
-            )
-            currentPersonaMsgs.add(modelMsg)
-            repository.insertMessage(modelMsg)
-            scheduleCloudConversationSummary(sessionId)
-            _personaMessages.value = _personaMessages.value + (sessionId to currentPersonaMsgs.toList())
+                // If it was a session-ending report, turn off study mode after generating it
+                if (lowerText.contains("إنهاء المذاكرة") || lowerText.contains("خلصت مذاكرة") || lowerText.contains("تقرير المذاكرة")) {
+                    isStudyModeActive.value = false
+                }
 
-            _isGeneratingPersona.value = false
-            _thinkingState.value = null
-            refreshUsage()
-
-            // Gamification points reward
-            if (isStudyModeActive.value) {
-                addPoints(15)
-            } else {
-                addPoints(10)
+                // Voice Speech response if enabled
+                if (personaAutoReadEnabled(personaId)) speakText(aiResponse, modelMsg.id, personaId)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Persona chat generation failed", e)
+                if (e is QuotaExceededException) onQuotaExceeded(e)
+                else _chatActionError.value = GeminiApiClient.friendlyErrorMessage(e)
+            } finally {
+                _isGeneratingPersona.value = false
+                _thinkingState.value = null
+                refreshUsage()
             }
-
-            // If it was a session-ending report, turn off study mode after generating it
-            if (lowerText.contains("إنهاء المذاكرة") || lowerText.contains("خلصت مذاكرة") || lowerText.contains("تقرير المذاكرة")) {
-                isStudyModeActive.value = false
-            }
-
-            // Voice Speech response if enabled
-            if (personaAutoReadEnabled(personaId)) speakText(aiResponse, modelMsg.id, personaId)
         }
     }
 
@@ -2150,6 +2227,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             Log.e(TAG, "Persona image is missing or exceeds the one-megabyte limit")
             return
         }
+        if (rejectInsufficientQuota("vision", requiredMessageQuota(vision = true))) return
         val prompt = question.trim().ifBlank {
             "حل المسألة الظاهرة في الصورة واشرحها خطوة بخطوة."
         }
@@ -2195,11 +2273,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 scheduleCloudConversationSummary(sessionId)
                 _personaMessages.value = _personaMessages.value + (sessionId to currentMessages.toList())
                 if (personaAutoReadEnabled(personaId)) speakText(reply, assistantMessage.id, personaId)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Persona vision request failed", e)
+                if (e is QuotaExceededException) onQuotaExceeded(e)
+                else _chatActionError.value = GeminiApiClient.friendlyErrorMessage(e)
             } finally {
                 _isGeneratingPersona.value = false
                 isAnalyzingImageOrDoc.value = false
+                refreshUsage()
             }
         }
     }
@@ -2223,6 +2306,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         val isImage = mimeType.startsWith("image/")
         val targetPersona = personaId
+        val feature = when {
+            isImage -> "vision"
+            targetPersona == "coder" -> "coder"
+            else -> "chat"
+        }
+        if (rejectInsufficientQuota(feature, if (isImage) requiredMessageQuota(vision = true) else 1)) return
         if (persistSelection) setDefaultPersona(targetPersona)
         
         viewModelScope.launch {
@@ -2270,11 +2359,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     base64Data = base64Data,
                     mimeType = mimeType,
                     useThinking = useThinkingMode.value,
-                    feature = when {
-                        isImage -> "vision"
-                        targetPersona == "coder" -> "coder"
-                        else -> "chat"
-                    }
+                    feature = feature
                 )
                 val modelMsg = ChatMessage(
                     id = UUID.randomUUID().toString(),
@@ -2289,11 +2374,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 _personaMessages.value = _personaMessages.value + (sessionId to currentPersonaMsgs.toList())
                 addPoints(25)
                 if (personaAutoReadEnabled(targetPersona)) speakText(aiResponse, modelMsg.id, targetPersona)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Persona attachment analysis failed", e)
+                if (e is QuotaExceededException) onQuotaExceeded(e)
+                else _chatActionError.value = GeminiApiClient.friendlyErrorMessage(e)
             } finally {
                 _isGeneratingPersona.value = false
                 isAnalyzingImageOrDoc.value = false
+                refreshUsage()
             }
         }
     }
@@ -3259,6 +3349,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun generateLocalFallbackResponse(prompt: String, personaId: String): String =
         assistantOfflineReply(personaId)
 
+    private fun resumePendingChatRequests(userId: String) {
+        viewModelScope.launch {
+            repository.getPendingChatRequests()
+                .filter { it.userId == userId }
+                .forEach { request ->
+                    NotificationScheduler.enqueueChatReply(
+                        context,
+                        request.sessionId,
+                        request.notificationId,
+                        userId
+                    )
+                }
+        }
+    }
+
     // Start auth and persona observers after every StateFlow referenced by them exists.
     init {
         viewModelScope.launch {
@@ -3266,6 +3371,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 when (authState) {
                     is AuthState.SignedIn -> {
                         val user = AuthManager.getCurrentUser(context) ?: return@collect
+                        refreshUsageForAccount()
+                        resumePendingChatRequests(user.uid)
                         _conversationSyncReady.value = false
                         _currentSessionId.value = null
                         _currentMessages.value = emptyList()
@@ -3287,6 +3394,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         ensureActiveChatSession()
                     }
                     AuthState.SignedOut -> {
+                        usageRefreshVersion += 1
+                        _usageState.value = UsageState()
+                        _quotaExceeded.value = null
+                        _chatActionError.value = null
                         _conversationSyncReady.value = false
                         _currentSessionId.value = null
                         _currentMessages.value = emptyList()

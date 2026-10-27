@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="theme-color" content="#111827">
+  <title>H2 Smart Hub | اختبار المحادثة</title>
+  <style>
+    :root{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#eef2ff;background:#0b1020;font-synthesis:none}
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 50% -20%,#2b2862 0,transparent 55%),#0b1020}
+    button,textarea{font:inherit}
+    .shell{width:min(920px,100%);min-height:100vh;margin:auto;padding:28px 20px;display:flex;flex-direction:column;gap:18px}
+    header,.panel,.notice{border:1px solid #29334b;border-radius:20px;background:#111a2dcc;box-shadow:0 18px 50px #0002}
+    header{padding:22px;display:flex;justify-content:space-between;align-items:center;gap:16px}
+    h1,h2,p{margin:0}
+    h1{font-size:clamp(21px,4vw,30px)}
+    h2{font-size:15px}
+    .brand{display:flex;align-items:center;gap:14px}
+    .mark{width:48px;height:48px;display:grid;place-items:center;border-radius:15px;background:#6556d8;font-weight:900}
+    .muted{color:#aab5cd;font-size:13px;margin-top:5px}
+    .status{font-size:12px;color:#aab5cd;text-align:left}
+    .notice{padding:14px 16px;color:#e8d9a8;font-size:13px;line-height:1.8}
+    .health{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+    .health article{padding:14px;border:1px solid #29334b;border-radius:14px;background:#111a2dcc}
+    .health strong{display:block;font-size:13px}
+    .health span{display:block;margin-top:7px;color:#aab5cd;font-size:12px}
+    .panel{flex:1;min-height:380px;padding:20px;display:flex;flex-direction:column}
+    .panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-bottom:14px;border-bottom:1px solid #29334b}
+    .messages{flex:1;display:flex;flex-direction:column;gap:12px;padding:18px 0;overflow:auto}
+    .empty{margin:auto;color:#aab5cd;text-align:center;line-height:1.9}
+    .message{max-width:min(80%,680px);padding:12px 15px;border-radius:16px;line-height:1.85;white-space:pre-wrap;overflow-wrap:anywhere}
+    .user{align-self:flex-start;background:#37317b}
+    .assistant{align-self:flex-end;background:#1e2b42}
+    form{border-top:1px solid #29334b;padding-top:14px}
+    textarea{width:100%;min-height:88px;resize:vertical;padding:13px;border:1px solid #394663;border-radius:14px;background:#0b1020;color:#eef2ff;line-height:1.7}
+    textarea:focus{outline:2px solid #8175f5;border-color:transparent}
+    .actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:10px}
+    button{border:0;border-radius:12px;padding:11px 20px;background:#6556d8;color:white;font-weight:750;cursor:pointer}
+    button:disabled{opacity:.55;cursor:wait}
+    .error{min-height:22px;color:#ffaaa5;font-size:13px}
+    footer{color:#8491aa;font-size:12px;text-align:center}
+    @media(max-width:600px){.shell{padding:14px 12px}.health{grid-template-columns:1fr}.health article{padding:11px}.panel{min-height:55vh;padding:14px}.message{max-width:92%}.status{max-width:130px}}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div class="brand">
+        <div class="mark" aria-hidden="true">H2</div>
+        <div>
+          <h1>اختبار محادثة Smart Hub</h1>
+          <p class="muted">واجهة ويب مباشرة لفحص اتصال الخادم والردود</p>
+        </div>
+      </div>
+      <div id="server-status" class="status" role="status">جارٍ فحص الخادم...</div>
+    </header>
+
+    <aside class="notice">
+      هذه واجهة اختبار مستقلة وليست تسجيل دخول لحسابك. تستخدم رصيدًا منفصلًا مرتبطًا بهذا المتصفح، ولا تحفظ نص المحادثة بعد تحديث الصفحة. أرسل فقط ما يناسب إرساله إلى خدمة الذكاء الاصطناعي.
+    </aside>
+
+    <section class="health" aria-label="حالة الخدمات">
+      <article><strong>الخادم</strong><span id="health-server">جارٍ الفحص...</span></article>
+      <article><strong>الذكاء الاصطناعي</strong><span id="health-ai">جارٍ الفحص...</span></article>
+      <article><strong>رصيد اختبار الويب</strong><span id="health-quota">جارٍ الفحص...</span></article>
+    </section>
+
+    <section class="panel" aria-label="محادثة الاختبار">
+      <div class="panel-head">
+        <h2>محادثة تجريبية</h2>
+        <span class="muted">لا تُرسل رسائل تلقائيًا</span>
+      </div>
+      <div id="messages" class="messages" aria-live="polite">
+        <p id="empty" class="empty">اكتب رسالة قصيرة لاختبار وصول الطلب وعودة الرد من الخادم.</p>
+      </div>
+      <form id="chat-form">
+        <label for="message" class="muted">رسالتك</label>
+        <textarea id="message" maxlength="4000" required placeholder="اكتب رسالة الاختبار هنا..."></textarea>
+        <div class="actions">
+          <span id="error" class="error" role="alert"></span>
+          <button id="send" type="submit">إرسال اختبار واحد</button>
+        </div>
+      </form>
+    </section>
+    <footer>الخادم لا يعرض بيانات الدخول أو مفاتيح الخدمات في هذه الصفحة.</footer>
+  </main>
+  <script>
+    const DEVICE_KEY = "h2-web-diagnostic-device-id";
+    const deviceId = localStorage.getItem(DEVICE_KEY) || `web-${crypto.randomUUID()}`;
+    localStorage.setItem(DEVICE_KEY, deviceId);
+    const history = [];
+    const form = document.getElementById("chat-form");
+    const input = document.getElementById("message");
+    const send = document.getElementById("send");
+    const error = document.getElementById("error");
+    const messages = document.getElementById("messages");
+    const empty = document.getElementById("empty");
+
+    function setServiceStatus(id, text, healthy) {
+      const node = document.getElementById(id);
+      node.textContent = text;
+      node.style.color = healthy ? "#86efac" : "#ffaaa5";
+    }
+
+    function addMessage(role, text) {
+      empty.hidden = true;
+      const node = document.createElement("div");
+      node.className = `message ${role === "user" ? "user" : "assistant"}`;
+      node.textContent = text;
+      messages.appendChild(node);
+      node.scrollIntoView({ block: "nearest" });
+    }
+
+    async function refreshHealth() {
+      try {
+        const healthResponse = await fetch("/health", { cache: "no-store" });
+        if (!healthResponse.ok) throw new Error(`تعذر فحص الخادم (${healthResponse.status}).`);
+        const health = await healthResponse.json();
+        setServiceStatus("health-server", health.status === "ok" ? "يعمل" : "غير متاح", health.status === "ok");
+        setServiceStatus("health-ai", health.geminiConfigured ? "مهيأ" : "غير مهيأ", health.geminiConfigured);
+        document.getElementById("server-status").textContent =
+          `الخادم ${health.deploymentCommit === "unknown" ? "متصل" : `متصل · ${health.deploymentCommit.slice(0, 7)}`}`;
+      } catch (reason) {
+        document.getElementById("server-status").textContent = "تعذر الاتصال بالخادم";
+        setServiceStatus("health-server", reason.message || "خطأ اتصال", false);
+        setServiceStatus("health-ai", "غير معروف", false);
+      }
+
+      try {
+        const usageResponse = await fetch(
+          `/api/subscription/usage?deviceId=${encodeURIComponent(deviceId)}`,
+          { cache: "no-store" }
+        );
+        if (!usageResponse.ok) throw new Error(`تعذر قراءة الرصيد (${usageResponse.status}).`);
+        const usage = await usageResponse.json();
+        const chat = usage.usage?.chat;
+        setServiceStatus(
+          "health-quota",
+          chat ? `${Math.max(0, chat.limit - chat.used)} من ${chat.limit} رسالة متاحة` : "تعذر قراءة الرصيد",
+          Boolean(chat)
+        );
+      } catch (reason) {
+        setServiceStatus("health-quota", reason.message || "تعذر قراءة الرصيد", false);
+      }
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const message = input.value.trim();
+      if (!message || send.disabled) return;
+      error.textContent = "";
+      send.disabled = true;
+      send.textContent = "جارٍ انتظار الرد...";
+      try {
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message,
+            history: history.slice(-20),
+            username: "Web diagnostic",
+            persona: "default",
+            deviceId
+          }),
+          signal: AbortSignal.timeout(90000)
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || `تعذر إكمال الطلب (${response.status}).`);
+        if (typeof data.reply !== "string" || !data.reply.trim()) {
+          throw new Error("استجابة الخادم لا تحتوي على رد.");
+        }
+        addMessage("user", message);
+        addMessage("assistant", data.reply);
+        history.push({ role: "user", text: message }, { role: "model", text: data.reply });
+        input.value = "";
+        await refreshHealth();
+      } catch (reason) {
+        error.textContent = reason.name === "TimeoutError"
+          ? "تأخر الرد أكثر من 90 ثانية. افحص اتصال الهاتف/الشبكة وحاول لاحقًا."
+          : reason.message || "تعذر الاتصال بالخادم.";
+      } finally {
+        send.disabled = false;
+        send.textContent = "إرسال اختبار واحد";
+      }
+    });
+
+    refreshHealth();
+  </script>
+</body>
+</html>

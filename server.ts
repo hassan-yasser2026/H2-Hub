@@ -693,16 +693,6 @@ app.post(
     return res.status(503).json({ error: "خدمة الذكاء الاصطناعي غير مهيأة على الخادم." });
   }
 
-  const deviceId = req.body?.deviceId ?? req.get("x-h2-device-id");
-  if (
-    typeof deviceId !== "string" ||
-    deviceId.length < 1 ||
-    deviceId.length > 255 ||
-    /[\u0000-\u001f\u007f]/u.test(deviceId)
-  ) {
-    return res.status(400).json({ error: "تعذر تحديد جهازك. حدّث التطبيق وحاول مرة أخرى." });
-  }
-
   const safeHistory = history.map((turn: { role: "user" | "model"; text: string }) => ({
     role: turn.role,
     text: turn.text,
@@ -721,6 +711,17 @@ app.post(
     await ensureSubscriptionTables();
     await ensureUsageTrackingTable();
     const identity = await verifyRequestIdentity(req);
+    const deviceId = identity.uid
+      ? `uid:${identity.uid}`
+      : req.body?.deviceId ?? req.get("x-h2-device-id");
+    if (
+      typeof deviceId !== "string" ||
+      deviceId.length < 1 ||
+      deviceId.length > 255 ||
+      /[\u0000-\u001f\u007f]/u.test(deviceId)
+    ) {
+      return res.status(400).json({ error: "تعذر تحديد حسابك. سجّل الدخول ثم حاول مرة أخرى." });
+    }
     if (!identity.uid) await assertAnonymousDeviceIsUnlinked(deviceId);
     client = await getDatabasePool().connect();
     const result = await enqueueAsyncChatIdempotently(client, payload, (transactionClient) =>
@@ -2722,18 +2723,11 @@ app.post("/api/generate-image", (req, res, next) => {
   next();
 }, imageGenerationRateLimit, async (req, res) => {
   const prompt = typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
-  const deviceId = typeof req.body?.deviceId === "string"
+  const requestedDeviceId = typeof req.body?.deviceId === "string"
     ? req.body.deviceId.trim()
     : (req.get("x-h2-device-id") ?? "").trim();
   if (!prompt || prompt.length > 1_000) {
     return res.status(400).json({ error: "اكتب وصفاً للصورة لا يتجاوز 1000 حرف." });
-  }
-  if (
-    !deviceId ||
-    deviceId.length > 255 ||
-    /[\u0000-\u001f\u007f]/u.test(deviceId)
-  ) {
-    return res.status(400).json({ error: "معرّف الجهاز غير صالح." });
   }
   if (containsProhibitedContent(prompt).isProhibited) {
     return res.status(400).json({ error: "تم حجب الوصف لعدم توافقه مع سياسة التطبيق." });
@@ -2745,8 +2739,17 @@ app.post("/api/generate-image", (req, res, next) => {
 
   let quota: Awaited<ReturnType<typeof reserveImageGenerationQuota>>;
   let identity: Awaited<ReturnType<typeof verifyRequestIdentity>>;
+  let deviceId: string;
   try {
     identity = await verifyRequestIdentity(req);
+    deviceId = identity.uid ? `uid:${identity.uid}` : requestedDeviceId;
+    if (
+      !deviceId ||
+      deviceId.length > 255 ||
+      /[\u0000-\u001f\u007f]/u.test(deviceId)
+    ) {
+      return res.status(400).json({ error: "تعذر تحديد حسابك. سجّل الدخول ثم حاول مرة أخرى." });
+    }
     if (!identity.uid) await assertAnonymousDeviceIsUnlinked(deviceId);
     quota = await reserveImageGenerationQuota(deviceId, identity.uid ?? undefined);
   } catch (error: unknown) {
@@ -3629,6 +3632,8 @@ Provide ONLY the raw JSON list. Do not surround with markdown codes.`;
     res.status(500).json({ error: "تعذر إعداد جدول اليوم حالياً. حاول مرة أخرى بعد قليل." });
   }
 });
+
+app.use(express.static(path.resolve(process.cwd(), "web")));
 
 app.use((_req, res) => {
   res.status(404).json({ error: "تعذر العثور على الخدمة المطلوبة. تحقق من التطبيق وحاول مرة أخرى." });
